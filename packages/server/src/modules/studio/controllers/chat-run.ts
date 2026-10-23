@@ -69,6 +69,22 @@ const DEFAULT_TIMEOUT_MS = 300_000
 const MAX_TIMEOUT_MS = 1_800_000
 const MAX_RECORDED_EVENTS = 1000
 
+export async function loopRecovery(ctx: Context) {
+  const body = (ctx.request.body || {}) as Record<string, unknown>
+  try {
+    if (Object.keys(body).some(key => !['session_id', 'profile', 'recovery'].includes(key))) throw new Error('Recovery fields rejected')
+    const server = getChatRunServer()
+    if (!server?.loopRecovery) { ctx.status = 503; ctx.body = { ok: false }; return }
+    const profile = String(ctx.state.profile?.name || 'default')
+    if (body.profile !== profile || !body.recovery || typeof body.recovery !== 'object' || Array.isArray(body.recovery)) throw new Error('Recovery binding required')
+    const result = await server.loopRecovery(ctx.get('x-webui-recovery-run'), ctx.state.user, String(body.session_id || ''), profile, body.recovery)
+    ctx.body = { ok: !result.stale, ...result }
+  } catch (error) {
+    ctx.status = 403
+    ctx.body = { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 export async function requestMobileLocation(ctx: Context) {
   const body = (ctx.request.body || {}) as Record<string, unknown>
   const sessionId = String(body.session_id || '').trim()

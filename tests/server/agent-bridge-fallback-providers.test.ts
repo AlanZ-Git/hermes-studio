@@ -28,6 +28,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+sys.path.insert(0, str(Path('packages/server/src/modules/hermes/services/bridge/python').resolve()))
 
 bridge_runtime = types.ModuleType("bridge_runtime")
 bridge_runtime.APPROVAL_TIMEOUT_MS = 1000
@@ -82,7 +83,7 @@ class AIAgent:
 run_agent.AIAgent = AIAgent
 sys.modules["run_agent"] = run_agent
 
-session = bridge_pool.AgentPool().get_or_create("session-1")
+session = bridge_pool.AgentPool().get_or_create("session-1", model_run_auth={"version":1,"owner_id":"fixture","profile":"default","run_marker":"run","token_path":"/tmp/fixture-source.json"})
 print(json.dumps({"fallback_model": session.agent.kwargs.get("fallback_model")}))
 `)
 

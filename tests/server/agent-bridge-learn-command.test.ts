@@ -27,6 +27,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+sys.path.insert(0, str(Path('packages/server/src/modules/hermes/services/bridge/python').resolve()))
 
 bridge_runtime = types.ModuleType("bridge_runtime")
 bridge_runtime.APPROVAL_TIMEOUT_MS = 1000
@@ -94,6 +95,7 @@ print(json.dumps(pool.dispatch_command("s", "/plan implement a parser", "work"))
 agent_pkg = types.ModuleType("agent")
 agent_pkg.__path__ = []
 sys.modules["agent"] = agent_pkg
+sys.modules["agent.plan_prompt"] = None
 pool = bridge_pool.AgentPool()
 print(json.dumps(pool.dispatch_command("s", "/plan task", "work")))
 `)
@@ -128,7 +130,7 @@ print(json.dumps(pool.dispatch_command("session-1", "/learn from docs", "default
 agent_pkg = types.ModuleType("agent")
 agent_pkg.__path__ = []
 sys.modules["agent"] = agent_pkg
-sys.modules.pop("agent.learn_prompt", None)
+sys.modules["agent.learn_prompt"] = None
 
 pool = bridge_pool.AgentPool()
 print(json.dumps(pool.dispatch_command("session-1", "/learn from docs", "default")))

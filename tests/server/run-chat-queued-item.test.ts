@@ -36,6 +36,7 @@ const sessionStoreMocks = vi.hoisted(() => ({
   clearSessionMessages: vi.fn(),
 }))
 const deleteMessageGroupsMock = vi.hoisted(() => vi.fn())
+const findUserByIdMock = vi.hoisted(() => vi.fn(() => ({ id: 1, username: 'fixture', role: 'super_admin', status: 'active' })))
 vi.mock('../../packages/server/src/modules/studio/repositories/session-message-deletion', () => ({
   deleteSessionMessageGroups: deleteMessageGroupsMock,
 }))
@@ -107,7 +108,7 @@ vi.mock('../../packages/server/src/modules/studio/public/runs/prompt', () => ({
 
 vi.mock('../../packages/server/src/modules/studio/repositories/session-store', () => ({
   clearSessionMessages: sessionStoreMocks.clearSessionMessages,
-  getSession: vi.fn(() => ({ id: 'session-1', profile: 'default', source: 'cli' })),
+  getSession: vi.fn(() => ({ id: 'session-1', profile: 'default', source: 'cli', user_id: '1' })),
   getSessionMetadata: vi.fn(() => ({
     id: 'session-1',
     profile: 'default',
@@ -139,6 +140,7 @@ vi.mock('../../packages/server/src/modules/studio/public/auth', () => ({
 
 vi.mock('../../packages/server/src/modules/studio/repositories/users-store', () => ({
   userCanAccessProfile: vi.fn(() => true),
+  findUserById: findUserByIdMock,
 }))
 
 function makeServerHarness() {
@@ -223,6 +225,24 @@ describe('ChatRunSocket queued bridge runs', () => {
     const finish = vi.spyOn((server as any).taskPlanRuns, 'finishSession').mockImplementation(() => {})
     ;(server as any).finishTaskPlanRun('session-1', event, payload)
     expect(finish).toHaveBeenCalledWith('session-1', expected)
+  })
+
+  it('rediscovers persistent notification routes after an idle poll without loading messages', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    const runtime = server as any
+    runtime.backgroundRecoveryNeeded = false
+    runtime.backgroundRecoveryPollAt = Date.now() - 1
+    expect(runtime.needsBackgroundPoll()).toBe(true)
+    const routes = [{ profile: 'default', session_ids: ['session-1'] }]
+    vi.spyOn(runtime, 'backgroundRecoveryRoutes').mockReturnValue(routes)
+    const poll = vi.fn(async () => ({ broker_id: 'fixture', sessions: [], notifications: [] }))
+    runtime.backgroundBridge = { backgroundPoll: poll }
+    await runtime.pollBackgroundWork()
+    expect(poll).toHaveBeenCalledWith(routes, { timeoutMs: 120_000 })
+    expect(runtime.backgroundRecoveryPollAt).toBeGreaterThan(Date.now())
+    expect(runtime.needsBackgroundPoll()).toBe(false)
   })
 
   it('drops a queued shared message when its execution-time authorization fails', async () => {
@@ -367,6 +387,18 @@ describe('ChatRunSocket queued bridge runs', () => {
     expect(server.sessionMap.get('session-1').queueInsertion).toMatchObject({
       queueId: 'b', phase: 'waiting_for_tool_batch',
     })
+  })
+
+  it('uses the persisted owner for an offline background socket, not an arbitrary room member', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io, socket } = makeServerHarness()
+    const server: any = new ChatRunSocket(io as any)
+    server.nsp.sockets.set('socket-1', { ...socket, data: { user: { id: 2, username: 'observer', role: 'super_admin' } } })
+    const background = server.socketForBackgroundRun('session-1')
+    expect(background.data.user).toEqual({ id: 1, username: 'fixture', role: 'super_admin' })
+    expect(background.connected).toBe(false)
+    findUserByIdMock.mockReturnValueOnce(null as any)
+    expect(() => server.socketForBackgroundRun('session-1')).toThrow(/owner/i)
   })
 
   it('acknowledges a late background completion instead of restarting a stopped session', async () => {

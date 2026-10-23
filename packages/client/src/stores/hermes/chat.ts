@@ -916,6 +916,7 @@ function mapHermesMessages(msgs: HermesMessage[], taskPlans: unknown[] = [], pre
   // Filter out assistant messages with no display content unless they carry tool call metadata
   // needed to name later tool result rows when resuming persisted history.
   const filteredMsgs = msgs.filter(m => {
+    if (m.display_role === 'internal') return false
     if (m.role === 'assistant') {
       return (m.tool_calls?.length || 0) > 0 || runtimePayloadText((m as any).content).trim() !== '' || !!m.run_usage
     }
@@ -1126,6 +1127,7 @@ function mapHermesMessages(msgs: HermesMessage[], taskPlans: unknown[] = [], pre
 
     // Normal user/assistant/command messages
     const displayRole = msg.display_role || msg.role
+    if (displayRole === 'internal') continue
     const displayContent = msg.display_content ?? msg.content
     result.push({
       id: String(msg.id),

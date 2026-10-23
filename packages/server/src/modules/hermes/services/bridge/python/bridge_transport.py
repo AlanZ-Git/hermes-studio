@@ -12,11 +12,13 @@ import sys
 import tempfile
 import threading
 import time
+import stat
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from bridge_runtime import _hidden_subprocess_kwargs, _json_line_bytes, _platform_text_encoding
+from bridge_model_run_auth import ModelRunAuth
 
 class WorkerProcess:
     STARTUP_TIMEOUT_SECONDS = 120
@@ -30,9 +32,31 @@ class WorkerProcess:
         self.agent_root = agent_root
         self.hermes_home = hermes_home
         self.process: subprocess.Popen[str] | None = None
-        self.last_used_at = time.time()
-        self.active_requests = 0
+        self.last_used_at = time.monotonic()
+        self._closed = False
+        self._ever_ready = False
+        self._endpoint_identity: tuple[int, int] | None = None
         self._lock = threading.RLock()
+        self.model_run_auth: ModelRunAuth | None = None
+
+    def bind_model_run_auth(self, binding: ModelRunAuth) -> None:
+        bound = ModelRunAuth.parse(binding, self.profile)
+        with self._lock:
+            if bound.worker_key() != self.key:
+                raise ValueError("model_run_auth worker key mismatch")
+            if self.model_run_auth is not None and self.model_run_auth != bound:
+                raise ValueError("model_run_auth worker binding is immutable")
+            if self.model_run_auth is None and self.running:
+                raise ValueError("cannot bind an already started unbound worker")
+            self.model_run_auth = bound
+
+    def _launch_env(self, parent_env: dict[str, str]) -> dict[str, str]:
+        env = dict(parent_env)
+        # Never inherit another worker's descriptor from the broker environment.
+        env.pop("HERMES_WEB_UI_MODEL_RUN_AUTH", None)
+        if self.model_run_auth is not None:
+            env["HERMES_WEB_UI_MODEL_RUN_AUTH"] = self.model_run_auth.serialized()
+        return env
 
     @property
     def running(self) -> bool:
@@ -44,8 +68,14 @@ class WorkerProcess:
 
     def start(self) -> None:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("worker retired")
             if self.running:
                 return
+            if self._ever_ready and self.model_run_auth is not None:
+                raise RuntimeError("bound worker ended; original run is unavailable")
+            if self.process is not None:
+                self._cleanup_process(self.process, graceful=False)
             args = [
                 sys.executable,
                 str(Path(__file__).with_name("hermes_bridge.py").resolve()),
@@ -60,7 +90,7 @@ class WorkerProcess:
                 args.extend(["--hermes-home", self.hermes_home])
 
             env = {
-                **os.environ,
+                **self._launch_env(os.environ),
                 "HERMES_AGENT_BRIDGE_ENDPOINT": self.endpoint,
                 "HERMES_AGENT_BRIDGE_WORKER_PROFILE": self.profile,
                 "HERMES_AGENT_BRIDGE_BROKER_PID": str(os.getpid()),
@@ -80,7 +110,13 @@ class WorkerProcess:
                 **_hidden_subprocess_kwargs(),
             )
             self._pipe_stderr()
-            self._wait_ready()
+            try:
+                self._wait_ready()
+                self._ever_ready = True
+            except Exception:
+                # Failed readiness is retryable, unlike explicit retirement.
+                self._cleanup_process(self.process, graceful=False)
+                raise
 
     def _pipe_stderr(self) -> None:
         proc = self.process
@@ -117,8 +153,8 @@ class WorkerProcess:
                 lines.put(None)
 
         threading.Thread(target=read_stdout, daemon=True, name=f"hermes-bridge-worker-stdout-{self.key}").start()
-        deadline = time.time() + self.STARTUP_TIMEOUT_SECONDS
-        while time.time() < deadline:
+        deadline = time.monotonic() + self.STARTUP_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
             if proc.poll() is not None:
                 raise RuntimeError(f"profile worker {self.key} exited before ready")
             try:
@@ -134,62 +170,100 @@ class WorkerProcess:
             try:
                 data = json.loads(text)
                 if data.get("event") == "ready":
+                    identity = data.get("socket_identity")
+                    if self.endpoint.startswith("ipc://"):
+                        if not isinstance(identity, list) or len(identity) != 2:
+                            raise RuntimeError("worker ready missing listener identity")
+                        owned = tuple(identity)
+                        if _socket_identity(self.endpoint) != owned:
+                            raise RuntimeError("worker listener replaced before ready")
+                        self._endpoint_identity = owned
                     ready_event.set()
                     return
             except Exception:
                 pass
-        self.stop()
         raise RuntimeError(f"profile worker {self.key} did not become ready within {self.STARTUP_TIMEOUT_SECONDS}s")
+
+    def _cleanup_process(self, proc: Any, *, graceful: bool) -> None:
+        if proc is None:
+            return
+        if (proc.poll() is None and graceful
+            and (not self.endpoint.startswith("ipc://") or
+                 self._endpoint_identity is not None and _socket_identity(self.endpoint) == self._endpoint_identity)):
+            try:
+                # Never call request(): it is an auto-start admission path.
+                _send_bridge_request(self.endpoint, {"action": "shutdown"}, self.SHUTDOWN_REQUEST_TIMEOUT_SECONDS)
+                proc.wait(timeout=3)
+            except Exception as exc:
+                print(f"[hermes-bridge-worker:{self.key}] graceful shutdown failed: {exc}", file=sys.stderr, flush=True)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+        else:
+            proc.wait(timeout=3)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+        if self.process is proc:
+            self.process = None
+        # Only this confirmed-dead child's ready listener may be reclaimed.
+        # Never touch an unknown/replacement inode, even during failed startup.
+        identity = self._endpoint_identity
+        if identity is not None and _socket_identity(self.endpoint) == identity:
+            try:
+                probe = _connect_bridge_socket(self.endpoint, 0.1)
+            except (ConnectionRefusedError, FileNotFoundError):
+                _unlink_owned_endpoint(self.endpoint, identity)
+            except OSError:
+                pass  # uncertainty is not ownership
+            else:
+                probe.close()  # a live listener is never stale
+        self._endpoint_identity = None
 
     def stop(self) -> None:
         with self._lock:
-            proc = self.process
-            self.process = None
-            if proc is None:
-                return
-            # Serialize endpoint cleanup with start(), including concurrent requests.
-            if proc.poll() is None:
-                try:
-                    # request() would start a replacement after self.process is cleared.
-                    _send_bridge_request(self.endpoint, {"action": "shutdown"}, self.SHUTDOWN_REQUEST_TIMEOUT_SECONDS)
-                except Exception as exc:
-                    print(f"[hermes-bridge-worker:{self.key}] graceful shutdown failed: {exc}", file=sys.stderr, flush=True)
-                if proc.poll() is None:
-                    proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=3)
-            if self.endpoint.startswith("ipc://"):
-                try:
-                    Path(self.endpoint.removeprefix("ipc://")).unlink(missing_ok=True)
-                except OSError:
-                    pass
+            self._closed = True
+            self._cleanup_process(self.process, graceful=True)
 
-    def request(self, req: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
-        passive = req.get("action") in {"status", "status_if_loaded", "background_poll", "list", "get_result", "get_output"}
+    def request(self, req: dict[str, Any], timeout: float | None = None, *, allow_start: bool = True) -> dict[str, Any]:
         with self._lock:
-            self.active_requests += 1
-        try:
-            self.start()
-            if not passive:
-                self.last_used_at = time.time()
+            if self._closed:
+                raise RuntimeError("worker retired")
+            if not self.running:
+                if not allow_start:
+                    raise RuntimeError("worker is not loaded")
+                self.start()
+            if req.get("action") not in MAINTENANCE_ACTIONS:
+                self.last_used_at = time.monotonic()
             request_timeout = timeout if timeout is not None and timeout > 0 else self.REQUEST_TIMEOUT_SECONDS
-            response = _send_bridge_request(self.endpoint, req, request_timeout)
-            sessions = response.get("sessions") or []
-            active = (
-                response.get("running") is True or response.get("status") == "running"
-                or bool(response.get("running_count"))
-                or bool(response.get("pending_count")) or bool(response.get("notifications"))
-                or any(isinstance(s, dict) and (s.get("running") or s.get("running_count")) for s in sessions)
-            )
-            if active:
-                self.last_used_at = time.time()
-            return response
-        finally:
-            with self._lock:
-                self.active_requests -= 1
+            return _send_bridge_request(self.endpoint, req, request_timeout)
+
+
+# Maintenance must neither refresh business idle nor resurrect an old generation.
+MAINTENANCE_ACTIONS = frozenset({
+    "ping", "list", "status", "get_history", "get_session_title", "get_result", "get_output",
+    "background_poll", "background_notification_complete", "background_notification_release",
+    "result_ack", "background_events_ack", "prepare_retire", "lifecycle_snapshot",
+})
+
+
+def _socket_identity(endpoint: str) -> tuple[int, int] | None:
+    if not endpoint.startswith("ipc://"):
+        return None
+    try:
+        info = Path(endpoint.removeprefix("ipc://")).lstat()
+        return (info.st_dev, info.st_ino) if stat.S_ISSOCK(info.st_mode) else None
+    except FileNotFoundError:
+        return None
+
+
+def _unlink_owned_endpoint(endpoint: str, identity: tuple[int, int] | None) -> None:
+    if identity is not None and _socket_identity(endpoint) == identity:
+        Path(endpoint.removeprefix("ipc://")).unlink(missing_ok=True)
 
 
 # Unix-domain socket paths are limited by sun_path (macOS/BSD: 104 bytes,
@@ -212,6 +286,7 @@ def _worker_endpoint(key: str, namespace: str | None = None) -> str:
             if os.name == "nt"
             else posixpath.join(tempfile.gettempdir(), "hermes-agent-bridge-workers", f"{safe}.sock")
         )
+
         # A deep temp dir can push the socket path past the platform's sun_path
         # limit; the worker then fails to bind and exits before it can report
         # ready (surfaced as "profile worker ... exited before ready"). Fall
@@ -374,12 +449,12 @@ def _make_listen_socket(endpoint: str) -> socket.socket:
             raise RuntimeError("ipc:// endpoints require Unix domain socket support; use tcp://host:port on this platform")
         sock_path = Path(endpoint.removeprefix("ipc://"))
         sock_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            sock_path.unlink(missing_ok=True)
-        except OSError:
-            pass
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(sock_path))
+        try:
+            server.bind(str(sock_path))
+        except Exception:
+            server.close()
+            raise
         return server
 
     parsed = urlparse(endpoint)

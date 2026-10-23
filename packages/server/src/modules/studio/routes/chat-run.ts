@@ -13,6 +13,7 @@ chatRunRoutes.post('/api/studio/session-tasks/update', sessionTasksCtrl.updateSe
 chatRunRoutes.post('/api/studio/clarifications/request', requestClarification)
 
 chatRunRoutes.post('/api/studio/chat-run/runs', ctrl.runOnce)
+chatRunRoutes.post('/api/studio/chat-run/loop-recovery', ctrl.loopRecovery)
 chatRunRoutes.post('/api/studio/mobile-calendar/request', ctrl.requestMobileCalendar)
 chatRunRoutes.post('/api/studio/mobile-location/request', ctrl.requestMobileLocation)
 chatRunRoutes.post('/api/studio/mobile-health/request', ctrl.requestMobileHealth)

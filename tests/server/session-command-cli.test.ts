@@ -84,6 +84,8 @@ describe('CLI-style session commands', () => {
     expect(parseSessionCommand('/compact')?.name).toBe('compress')
     expect(parseSessionCommand('/compact focus on auth')?.rawName).toBe('compact')
     expect(parseSessionCommand('/context')?.name).toBe('context')
+    expect(parseSessionCommand('/loop 5m inspect')?.name).toBe('loop')
+    expect(parseSessionCommand('/proactive 5m inspect')?.name).toBe('loop')
   })
 
   it('emits context usage for /context', async () => {

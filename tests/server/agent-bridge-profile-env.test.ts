@@ -468,10 +468,10 @@ tools_pkg.__path__ = []
 sys.modules["tools"] = tools_pkg
 
 mcp_tool = types.ModuleType("tools.mcp_tool")
-def discover_mcp_tools():
+def register_mcp_servers(config):
     events.append({"event": "discover", "home": os.environ.get("HERMES_HOME")})
     return ["mcp_anysearch_search"]
-mcp_tool.discover_mcp_tools = discover_mcp_tools
+mcp_tool.register_mcp_servers = register_mcp_servers
 sys.modules["tools.mcp_tool"] = mcp_tool
 sys.modules["tools.mcp_tool_discovery"] = mcp_tool
 
@@ -501,7 +501,8 @@ bridge._load_service_tier = lambda: None
 
 pool = bridge.AgentPool()
 pool._db = FakeDbHolder()
-session = pool.get_or_create("session-1", profile="work")
+binding = {"version":1,"owner_id":"fixture","profile":"work","run_marker":"run","token_path":os.path.join(root,"source.json")}
+session = pool.get_or_create("session-1", profile="work", model_run_auth=binding)
 
 print(json.dumps({
     "events": events,
@@ -513,7 +514,7 @@ print(json.dumps({
     expect(result).toEqual({
       events: [
         { event: 'discover', home: expectedProfileHome },
-        { event: 'agent', home: expectedProfileHome, enabled_toolsets: ['mcp-anysearch'] },
+        { event: 'agent', home: expectedProfileHome, enabled_toolsets: ['mcp-anysearch', 'webui-session-api'] },
       ],
       mcp_tool_count: 1,
       restored_home: tempDir,
@@ -582,9 +583,13 @@ bridge._load_service_tier = lambda: None
 
 pool = bridge.AgentPool()
 pool._db = FakeDbHolder()
-record = pool.start_chat("session-1", "hi", profile="default")
+binding = {"version":1,"owner_id":"fixture","profile":"default","run_marker":"run","token_path":os.path.join(root,"source.json")}
+pool._close_model_run_auth = lambda *_args: None
+bridge._discover_bridge_mcp_tools = lambda *_args: []
+bridge._install_execute_code_approval_memory_patch = lambda: None
+record = pool.start_chat("session-1", "hi", profile="default", model_run_auth=binding)
 deadline = time.time() + 2
-while record.status == "running" and time.time() < deadline:
+while not pool.get_output(record.run_id)["done"] and time.time() < deadline:
     time.sleep(0.01)
 
 output = pool.get_output(record.run_id)
@@ -650,6 +655,7 @@ approval.set_current_session_key = set_current_session_key
 approval.register_gateway_notify = register_gateway_notify
 approval.reset_current_session_key = reset_current_session_key
 approval.unregister_gateway_notify = unregister_gateway_notify
+approval.check_execute_code_guard = lambda *args, **kwargs: None
 sys.modules["tools.approval"] = approval
 
 terminal_tool = types.ModuleType("tools.terminal_tool")
@@ -690,9 +696,12 @@ bridge._load_service_tier = lambda: None
 
 pool = bridge.AgentPool()
 pool._db = FakeDbHolder()
-record = pool.start_chat("session-allowlist", "hi", profile="default")
+binding = {"version":1,"owner_id":"fixture","profile":"default","run_marker":"run","token_path":os.path.join(root,"source.json")}
+pool._close_model_run_auth = lambda *_args: None
+bridge._discover_bridge_mcp_tools = lambda *_args: []
+record = pool.start_chat("session-allowlist", "hi", profile="default", model_run_auth=binding)
 deadline = time.time() + 2
-while record.status == "running" and time.time() < deadline:
+while not pool.get_output(record.run_id)["done"] and time.time() < deadline:
     time.sleep(0.01)
 
 print(json.dumps({

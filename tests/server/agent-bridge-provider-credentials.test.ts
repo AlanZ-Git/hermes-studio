@@ -51,6 +51,9 @@ session = bridge_pool.AgentSession(
 pool = object.__new__(bridge_pool.AgentPool)
 pool._lock = threading.RLock()
 pool._sessions = {"session-1": session}
+from bridge_model_run_auth import ModelRunAuth
+binding = {"version":1,"owner_id":"fixture","profile":"research","run_marker":"run","token_path":"/tmp/fixture-source.json"}
+session.model_run_auth = ModelRunAuth.parse(binding)
 
 calls = []
 bridge_pool._refresh_worker_profile_env = lambda: calls.append("refresh-env")
@@ -77,6 +80,7 @@ resolved = pool.get_or_create(
     profile="research",
     model="claude-opus-4-6",
     provider="anthropic",
+    model_run_auth=binding,
 )
 print(json.dumps({
     "same_session": resolved is session,
@@ -123,7 +127,7 @@ def resolve_runtime(model, provider):
     }
 
 bridge_server._resolve_runtime = resolve_runtime
-server = object.__new__(bridge_server.BridgeServer)
+server = bridge_server.BridgeServer("tcp://127.0.0.1:0")
 response = server.handle({
     "action": "provider_credentials",
     "provider": "xai-oauth",
@@ -179,7 +183,7 @@ bridge_server._ensure_agent_imports = lambda: None
 bridge_server._resolve_runtime = lambda *_args: (_ for _ in ()).throw(
     AssertionError("generic resolver must not handle MiniMax credentials")
 )
-server = object.__new__(bridge_server.BridgeServer)
+server = bridge_server.BridgeServer("tcp://127.0.0.1:0")
 response = server.handle({
     "action": "provider_credentials",
     "provider": "minimax-oauth",

@@ -28,6 +28,8 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+sys.path.insert(0, str(Path('packages/server/src/modules/hermes/services/bridge/python').resolve()))
+binding = {"version":1,"owner_id":"fixture","profile":"default","run_marker":"run","token_path":"/tmp/fixture-source.json"}
 
 config = {
     "model": "gpt-5.6-luna",
@@ -133,9 +135,9 @@ pool._db = types.SimpleNamespace(
 describe('AgentBridgeClient.chat reasoning_effort forwarding', () => {
   it('uses Hermes model-aware reasoning for fresh AgentPool sessions', () => {
     const result = runPython(`${reasoningHarness}
-luna = pool.get_or_create("luna", model="gpt-5.6-luna")
-sol = pool.get_or_create("sol", model="gpt-5.6-sol")
-orbit = pool.get_or_create("orbit", model="gpt-5.6-orbit")
+luna = pool.get_or_create("luna", model="gpt-5.6-luna", model_run_auth=binding)
+sol = pool.get_or_create("sol", model="gpt-5.6-sol", model_run_auth=binding)
+orbit = pool.get_or_create("orbit", model="gpt-5.6-orbit", model_run_auth=binding)
 print(json.dumps({
     "luna": luna.agent.reasoning_config,
     "sol": sol.agent.reasoning_config,
@@ -156,7 +158,7 @@ print(json.dumps({
 
   it('refreshes model-aware reasoning for a loaded session switched from Luna to Sol', () => {
     const result = runPython(`${reasoningHarness}
-session = pool.get_or_create("switched", model="gpt-5.6-luna")
+session = pool.get_or_create("switched", model="gpt-5.6-luna", model_run_auth=binding)
 before = dict(session.agent.reasoning_config)
 pool.switch_session_model("switched", "gpt-5.6-sol", "openai", "default")
 print(json.dumps({
@@ -199,7 +201,7 @@ print(json.dumps({"caught": caught}))
 
   it('restores the model-aware default after explicit run overrides succeed or fail', () => {
     const result = runPython(`${reasoningHarness}
-session = pool.get_or_create("override", model="gpt-5.6-luna")
+session = pool.get_or_create("override", model="gpt-5.6-luna", model_run_auth=binding)
 pool._enter_exec_ask_scope = lambda: None
 pool._exit_exec_ask_scope = lambda: None
 pool._install_approval_dispatcher_for_current_thread = lambda *_args: None
@@ -210,6 +212,13 @@ pool._prepend_pending_model_switch_note = lambda _session, message: message
 pool._sync_result_tail_to_session_db = lambda *_args: None
 pool._result_from_agent_messages_for_sync = lambda *_args: None
 pool._apply_pending_session_model_switch = lambda *_args: None
+pool._reset_boundary_run = lambda *_args: None
+pool.has_active_background_for_session = lambda *_args: False
+# This test isolates reasoning restoration, not MCP transport shutdown. Never
+# fall through to an installed Core when the fixture module is intentionally partial.
+mcp = types.ModuleType("tools.mcp_tool_lifecycle")
+mcp.shutdown_mcp_servers = lambda: None
+sys.modules["tools.mcp_tool_lifecycle"] = mcp
 
 default_before = dict(session.agent.reasoning_config)
 session.running = True

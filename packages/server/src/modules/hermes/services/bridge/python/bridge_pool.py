@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from bridge_model_run_auth import ModelRunAuth
 
 from bridge_runtime import (
     APPROVAL_TIMEOUT_MS,
@@ -153,6 +154,9 @@ class RunRecord:
     ended_at: float | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    acknowledged: tuple[int, int] | None = None
+    # Internal terminal state is not public until the entire run cleanup exits.
+    finalizing: bool = False
     deltas: list[str] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     worker_thread: threading.Thread | None = field(default=None, repr=False)
@@ -192,14 +196,38 @@ class AgentPool:
         self._approval_request_generations: dict[str, tuple[str, str]] = {}
         self._gateway_approval_requests: dict[str, tuple[str, str, str]] = {}
         self._gateway_approval_pattern_keys: dict[str, list[str]] = {}
+        self._gateway_approval_meta: dict[str, dict[str, Any]] = {}
         self._compression_requests: dict[str, queue.Queue[dict[str, Any]]] = {}
         self._background_notification_claims: dict[tuple[str, str], dict[str, Any]] = {}
+        self._notification_lock = threading.RLock()
+        self._notifications_closed = False
         self._suppressed_background_delegations: set[str] = set()
         self._clarify_requests: dict[str, queue.Queue[str]] = {}
         self._run_context = threading.local()
         self._approval_handlers: dict[str, Callable[..., str]] = {}
         self._exec_ask_depth = 0
         self._exec_ask_previous: str | None = None
+        raw_binding = os.environ.get("HERMES_WEB_UI_MODEL_RUN_AUTH")
+        self._model_run_auth = ModelRunAuth.parse(json.loads(raw_binding)) if raw_binding else None
+        self._model_run_auth_closed = False
+        self._model_run_chat_started = False
+        self._retired = False
+        self._run_threads: set[threading.Thread] = set()
+
+    def _close_model_run_auth(self, expected: ModelRunAuth | None) -> None:
+        with self._lock:
+            if expected is None or self._model_run_auth != expected or self._model_run_auth_closed:
+                return
+            self._model_run_auth_closed = True
+        # Registry globals are safe here only because the broker gives every
+        # complete descriptor its own process. Never reset them in a shared worker.
+        try:
+            from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+        except ModuleNotFoundError as exc:
+            if exc.name != "tools.mcp_tool_lifecycle":
+                raise
+            from tools.mcp_tool import shutdown_mcp_servers
+        shutdown_mcp_servers()
 
     def _install_usage_hook(self) -> None:
         """Observe exact per-request model usage without requiring a user plugin."""
@@ -396,7 +424,17 @@ class AgentPool:
         model: str | None = None,
         provider: str | None = None,
         background_delegation_enabled: bool | None = None,
+        model_run_auth: Any = None,
     ) -> AgentSession:
+        # This explicit descriptor is required even for a cached session.
+        binding = ModelRunAuth.parse(model_run_auth, profile or "default")
+        with self._lock:
+            if getattr(self, "_model_run_auth_closed", False):
+                raise ValueError("model_run_auth run has ended")
+            current = getattr(self, "_model_run_auth", None)
+            if current is not None and current != binding:
+                raise ValueError("model_run_auth immutable worker binding mismatch")
+            self._model_run_auth = binding
         requested_model = str(model or "").strip()
         requested_provider = str(provider or "").strip()
         # A profile worker is long-lived while Studio may rotate OAuth access
@@ -482,12 +520,16 @@ class AgentPool:
             with _profile_env(profile):
                 _refresh_worker_profile_env()
                 _refresh_approval_allowlist()
-                discovered_mcp_tools = _discover_bridge_mcp_tools()
+                discovered_mcp_tools = _discover_bridge_mcp_tools(binding, session_id)
                 cfg = _load_cfg()
                 resolved_model = requested_model or _resolve_model(cfg)
                 runtime = _resolve_runtime(resolved_model, requested_provider or None)
                 agent_cfg = cfg.get("agent") or {}
                 prompt = str(agent_cfg.get("system_prompt", "") or "").strip() or None
+                prompt = (prompt or "") + "\nFor user-requested WebUI loop controls, prefer the webui-session-api generic API tools. They are limited to this session/profile; no loop is started automatically. Other configured Studio tool policy is unchanged."
+                enabled_toolsets = ["webui-session-api"] if binding.run_marker.startswith("recovery_v1_") else _load_enabled_toolsets()
+                if enabled_toolsets is not None:
+                    enabled_toolsets = list(dict.fromkeys([*enabled_toolsets, "webui-session-api"]))
 
                 agent = AIAgent(
                     model=resolved_model,
@@ -504,7 +546,7 @@ class AgentPool:
                     verbose_logging=False,
                     reasoning_config=_load_reasoning_config(resolved_model),
                     service_tier=_load_service_tier(),
-                    enabled_toolsets=_load_enabled_toolsets(),
+                    enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=_load_disabled_toolsets(),
                     platform=_bridge_platform(),
                     session_id=session_id,
@@ -520,7 +562,21 @@ class AgentPool:
                     tool_complete_callback=self._tool_complete_callback(session_id),
                     clarify_callback=self._clarify_callback(session_id),
                 )
+                if binding.run_marker.startswith("recovery_v1_"):
+                    # Core validates model calls against valid_tool_names before dispatch.
+                    from tools.mcp_tool_schema import mcp_prefixed_tool_name
+                    permitted = {mcp_prefixed_tool_name("webui-session-api", name) for name in ("ekko_studio_api_openapi_get", "ekko_studio_api_request")}
+                    from tools.registry import registry
+                    # Bypass progressive disclosure assembly only for this
+                    # restricted recovery worker; no global/Profile policy edit.
+                    agent.tools = registry.get_definitions(permitted, quiet=True)
+                    agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+                    agent._skip_mcp_refresh = True
+                    agent.enabled_toolsets = ["webui-session-api"]
+                    if not agent.tools:
+                        raise RuntimeError("Recovery restricted API unavailable")
                 agent.compression_enabled = False
+                agent._hermes_bridge_model_run_auth = binding
                 self._install_compression_hook(agent, session_id)
                 self._install_prepersist_dedup_hook(agent)
                 mcp_tool_names = self._mcp_tool_names(self._agent_tool_names(getattr(agent, "tools", None) or []))
@@ -531,6 +587,7 @@ class AgentPool:
                     history=[],
                     config={
                         "requested_session_id": session_id,
+                        "model_run_auth": binding.descriptor(),
                         "profile": profile or "default",
                         "model": resolved_model,
                         # Keep the user-facing provider selector (for example
@@ -851,6 +908,7 @@ class AgentPool:
             request_id = uuid.uuid4().hex
             response_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
             with self._lock:
+                response_queue._bridge_session_id = session_id
                 self._compression_requests[request_id] = response_queue
             self._append_event(session_id, {
                 "event": "bridge.compression.requested",
@@ -978,6 +1036,7 @@ class AgentPool:
         provider: str | None = None,
         workspace: str | None = None,
         background_delegation_enabled: bool | None = None,
+        model_run_auth: Any = None,
     ) -> dict[str, Any]:
         session = self.get_or_create(
             session_id,
@@ -985,8 +1044,10 @@ class AgentPool:
             model=model,
             provider=provider,
             background_delegation_enabled=background_delegation_enabled,
+            model_run_auth=model_run_auth,
         )
         session_cwd_bound = _bind_session_workspace_cwd(session.session_id, workspace)
+        # Never construct or borrow a token for an independent estimate.
         try:
             context_info = self._estimate_context_info(session.agent, messages or [], instructions)
         finally:
@@ -1043,12 +1104,13 @@ class AgentPool:
             if session and str(event.get("event") or "").startswith("subagent."):
                 event = self._record_background_event(session, event)
             run_id = session.current_run_id if session else None
-            if run_id and run_id in self._runs:
+            if run_id and run_id in self._runs and self._runs[run_id].status == "running":
                 self._runs[run_id].events.append(_jsonable(event))
             elif session and str(event.get("event") or "").startswith("subagent."):
                 session.background_events.append(_jsonable(event))
-                if len(session.background_events) > self.MAX_BACKGROUND_EVENTS_PER_SESSION:
-                    del session.background_events[:-self.MAX_BACKGROUND_EVENTS_PER_SESSION]
+                # UI telemetry keeps the historical bounded ring semantics.
+                # Durable completion claims/results live in separate protected lanes.
+                del session.background_events[:-self.MAX_BACKGROUND_EVENTS_PER_SESSION]
 
     def _record_background_event(
         self,
@@ -1113,6 +1175,12 @@ class AgentPool:
         return payload
 
     def poll_background(self, recover_session_ids: list[Any] | None = None) -> dict[str, Any]:
+        with self._notification_lock:
+            if self._notifications_closed:
+                return {"sessions": [], "notifications": [], "pending_count": 0}
+            return self._poll_background(recover_session_ids)
+
+    def _poll_background(self, recover_session_ids: list[Any] | None = None) -> dict[str, Any]:
         """Drain worker-level UI telemetry and claim owned async completions."""
         with self._lock:
             loaded_session_ids = set(self._sessions)
@@ -1123,8 +1191,10 @@ class AgentPool:
             )
             session_payloads = []
             for session in self._sessions.values():
+                # Enforce the ring at serialization too, including callback producers.
+                del session.background_events[:-self.MAX_BACKGROUND_EVENTS_PER_SESSION]
                 events = list(session.background_events)
-                session.background_events.clear()
+                # Retain this bounded batch until consumer ACK; no claim is stored here.
                 tasks = list(session.background_tasks.values())
                 if events or any(task.get("status") == "running" for task in tasks):
                     session_payloads.append({
@@ -1137,6 +1207,7 @@ class AgentPool:
         notifications: list[dict[str, Any]] = []
         pending_notification_count = 0
         if loaded_session_ids:
+            notifications.extend(self._claim_kanban_notifications(loaded_session_ids))
             try:
                 from tools.async_delegation import claim_event_delivery, complete_completion_delivery
                 from tools.process_registry import format_process_notification, process_registry
@@ -1202,31 +1273,280 @@ class AgentPool:
                     flush=True,
                 )
 
+        with self._lock:
+            terminal_sessions = {
+                record.session_id for record in self._runs.values()
+                if record.status in {"complete", "error", "interrupted"}
+            }
+            sessions = list(self._sessions.values())
+        for session in sessions:
+            # Estimates and the start_chat reservation gap are idle, not ended.
+            # Only a recorded terminal chat can retire its original generation.
+            if session.session_id in terminal_sessions and not session.running and not self.has_active_background_for_session(session.session_id):
+                self._close_model_run_auth(getattr(session.agent, "_hermes_bridge_model_run_auth", None))
         return {
             "sessions": session_payloads,
             "notifications": notifications,
             "pending_count": pending_notification_count,
         }
 
+    def _claim_kanban_notifications(self, loaded_session_ids: set[str]) -> list[dict[str, Any]]:
+        with self._notification_lock:
+            if self._notifications_closed:
+                return []
+            return self._claim_kanban_notifications_locked(loaded_session_ids)
+
+    def _claim_kanban_notifications_locked(self, loaded_session_ids: set[str]) -> list[dict[str, Any]]:
+        """Claim TUI-style Kanban subscriptions owned by loaded Web UI sessions."""
+        try:
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_db_connect as kbc
+            from hermes_cli import kanban_db_notify as notify
+        except Exception:
+            return []
+
+        terminal_kinds = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "block_loop_detected",
+            "review_requested", "changes_requested",
+        )
+        notifications: list[dict[str, Any]] = []
+        try:
+            boards = kb.list_boards(include_archived=False)
+        except Exception:
+            try:
+                boards = [kb.read_board_metadata(kb.DEFAULT_BOARD)]
+            except Exception:
+                return []
+
+        seen_db_paths: set[str] = set()
+        for board_meta in boards:
+            slug = (board_meta or {}).get("slug") or kb.DEFAULT_BOARD
+            db_path = (board_meta or {}).get("db_path")
+            try:
+                resolved = str(Path(db_path).expanduser().resolve()) if db_path else str(kb.kanban_db_path(slug).resolve())
+            except Exception:
+                resolved = f"slug:{slug}"
+            if resolved in seen_db_paths:
+                continue
+            seen_db_paths.add(resolved)
+
+            if not any(
+                notify.count_notify_subs(db_path=Path(resolved), platform="tui", chat_id=session_id)
+                for session_id in loaded_session_ids
+            ):
+                continue
+            try:
+                conn = kbc.connect(db_path=Path(resolved))
+            except Exception:
+                continue
+            try:
+                for sub in notify.list_notify_subs(conn):
+                    session_id = str(sub.get("chat_id") or "")
+                    if (sub.get("platform") or "").lower() != "tui" or session_id not in loaded_session_ids:
+                        continue
+                    # Hold only one unsettled range per subscription. Otherwise a
+                    # later range could ACK before a failed earlier range rewinds.
+                    ident = (resolved, sub['task_id'], sub['platform'], session_id, sub.get('thread_id') or '')
+                    with self._lock:
+                        if any(c.get('subscription_key') == ident for c in self._background_notification_claims.values()):
+                            continue
+                    task = kb.get_task(conn, sub["task_id"])
+                    policy = getattr(task, "notification_policy", "direct") if task else "direct"
+                    if policy == "silent":
+                        continue
+                    if policy == "final_only":
+                        old_cursor, state = notify.claim_final_only_graph_state(
+                            conn, root_id=sub['task_id'], platform=sub['platform'],
+                            chat_id=session_id, thread_id=sub.get('thread_id') or '',
+                        )
+                        if not state.get('claimed'):
+                            continue
+                        new_cursor = int(state.get('cursor') or old_cursor)
+                        if state.get('all_terminal') and state.get('changed'):
+                            events = [kb.Event(id=new_cursor, task_id=sub['task_id'], kind='completed',
+                                payload={'summary': f"{int(state.get('descendant_count') or 0)} descendants completed"}, created_at=0)]
+                        else:
+                            payload = dict(state.get('blocking_payload') or {})
+                            payload['reason'] = f"{int(state.get('blocking_count') or 0)} descendant task(s) need human action: {payload.get('reason') or 'human action required'}"
+                            events = [kb.Event(id=int(state['blocking_event_id']), task_id=sub['task_id'],
+                                kind='blocked', payload=payload, created_at=0)]
+                    else:
+                        old_cursor, new_cursor, events = notify.claim_unseen_events_for_sub(
+                            conn, task_id=sub['task_id'], platform=sub['platform'], chat_id=session_id,
+                            thread_id=sub.get('thread_id') or '', kinds=terminal_kinds,
+                        )
+                    if not events:
+                        continue
+                    task = kb.get_task(conn, sub["task_id"])
+                    messages = [self._format_kanban_notification(slug, task, event) for event in events]
+                    message = "\n".join(text for text in messages if text)
+                    if not message:
+                        notify.rewind_notify_cursor(
+                            conn,
+                            task_id=sub["task_id"], platform=sub["platform"],
+                            chat_id=session_id, thread_id=sub.get("thread_id") or "",
+                            claimed_cursor=new_cursor, old_cursor=old_cursor,
+                        )
+                        continue
+                    delivery_id = f"kanban:{slug}:{sub['task_id']}:{new_cursor}"
+                    claim_id = uuid.uuid4().hex
+                    claim = {
+                        "notification_kind": "kanban",
+                        "board": slug,
+                        "db_path": resolved,
+                        "db_identity": (Path(resolved).stat().st_dev, Path(resolved).stat().st_ino),
+                        "subscription_key": ident,
+                        "task_id": sub["task_id"],
+                        "platform": sub["platform"],
+                        "chat_id": session_id,
+                        "thread_id": sub.get("thread_id") or "",
+                        "old_cursor": old_cursor,
+                        "new_cursor": new_cursor,
+                        "final_status": getattr(task, "status", "") == "archived",
+                    }
+                    with self._lock:
+                        self._background_notification_claims[(delivery_id, claim_id)] = claim
+                    last_event = events[-1]
+                    notifications.append({
+                        "notification_kind": "kanban",
+                        "delegation_id": delivery_id,
+                        "session_id": session_id,
+                        "claim_id": claim_id,
+                        "status": getattr(task, "status", None),
+                        "message": message,
+                        "event": {
+                            "type": "kanban",
+                            "board": slug,
+                            "task_id": sub["task_id"],
+                            "event_id": getattr(last_event, "id", new_cursor),
+                            "kind": getattr(last_event, "kind", "status"),
+                        },
+                        "board": slug,
+                        "task_id": sub["task_id"],
+                        "event_id": getattr(last_event, "id", new_cursor),
+                    })
+            finally:
+                conn.close()
+        return notifications
+
+    @staticmethod
+    def _format_kanban_notification(board: str, task: Any, event: Any) -> str:
+        task_id = str(getattr(event, "task_id", "") or getattr(task, "id", ""))
+        title = str(getattr(task, "title", "") or "")
+        kind = str(getattr(event, "kind", "status") or "status")
+        payload = getattr(event, "payload", {}) or {}
+        board_tag = "" if board == "default" else f"[{board}] "
+        label = f"Kanban {board_tag}{task_id}"
+        if title:
+            label += f" ({title})"
+        if kind == "completed":
+            summary = str(payload.get("summary") or payload.get("result") or "completed")
+            return f"✅ {label} completed: {summary}"
+        if kind == "blocked":
+            return f"⛔ {label} blocked: {payload.get('reason') or ''}".rstrip()
+        if kind == "review_requested":
+            return f"🔎 {label} requested review"
+        return f"🔄 {label} → {getattr(task, 'status', '') or kind}"
+
     def complete_background_notification(self, delegation_id: str, claim_id: str) -> dict[str, Any]:
+        with self._notification_lock:
+            return self._complete_background_notification(delegation_id, claim_id)
+
+    def _complete_background_notification(self, delegation_id: str, claim_id: str) -> dict[str, Any]:
+        with self._lock:
+            claim = self._background_notification_claims.get((delegation_id, claim_id))
+        if claim and claim.get("notification_kind") == "kanban":
+            completed = True
+            if claim.get("final_status"):
+                try:
+                    from hermes_cli import kanban_db as kb
+                    conn = self._open_kanban_claim_db(claim)
+                    try:
+                        with kb.write_txn(conn):
+                            task = kb.get_task(conn, claim['task_id'])
+                            latest = conn.execute('SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?', (claim['task_id'],)).fetchone()[0]
+                            if task and task.status == 'archived' and latest <= claim['new_cursor']:
+                                conn.execute('DELETE FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND last_event_id=?',
+                                    (claim['task_id'], claim['platform'], claim['chat_id'], claim['thread_id'], claim['new_cursor']))
+                    finally:
+                        conn.close()
+                except Exception:
+                    completed = False
+            if completed:
+                with self._lock:
+                    self._background_notification_claims.pop((delegation_id, claim_id), None)
+            return {"delegation_id": delegation_id, "completed": completed}
+
+        if delegation_id.startswith('kanban:'):
+            return {"delegation_id": delegation_id, "completed": False}
+
         from tools.async_delegation import complete_completion_delivery
 
         completed = complete_completion_delivery(delegation_id, claim_id)
-        with self._lock:
-            self._background_notification_claims.pop((delegation_id, claim_id), None)
+        if completed:
+            with self._lock:
+                self._background_notification_claims.pop((delegation_id, claim_id), None)
         return {"delegation_id": delegation_id, "completed": bool(completed)}
 
-    def release_background_notification(self, delegation_id: str, claim_id: str) -> dict[str, Any]:
+    def release_background_notification(
+        self, delegation_id: str, claim_id: str, *, requeue: bool = True
+    ) -> dict[str, Any]:
+        with self._notification_lock:
+            return self._release_background_notification(delegation_id, claim_id, requeue=requeue)
+
+    def _release_background_notification(
+        self, delegation_id: str, claim_id: str, *, requeue: bool = True
+    ) -> dict[str, Any]:
+        with self._lock:
+            claim = self._background_notification_claims.get((delegation_id, claim_id))
+        if claim and claim.get("notification_kind") == "kanban":
+            released = False
+            try:
+                from hermes_cli import kanban_db_notify as notify
+                conn = self._open_kanban_claim_db(claim)
+                try:
+                    released = bool(notify.rewind_notify_cursor(
+                        conn,
+                        task_id=claim["task_id"], platform=claim["platform"],
+                        chat_id=claim["chat_id"], thread_id=claim["thread_id"],
+                        claimed_cursor=claim["new_cursor"], old_cursor=claim["old_cursor"],
+                    ))
+                finally:
+                    conn.close()
+            except Exception:
+                released = False
+            if released:
+                with self._lock:
+                    self._background_notification_claims.pop((delegation_id, claim_id), None)
+            return {"delegation_id": delegation_id, "released": released}
+
+        if delegation_id.startswith('kanban:'):
+            return {"delegation_id": delegation_id, "released": False}
+
         from tools.async_delegation import release_completion_delivery
 
         released = release_completion_delivery(delegation_id, claim_id)
         with self._lock:
-            event = self._background_notification_claims.pop((delegation_id, claim_id), None)
-        if released and event is not None:
+            event = self._background_notification_claims.pop((delegation_id, claim_id), None) if released else None
+        if released and requeue and event is not None:
             from tools.process_registry import process_registry
 
             process_registry.completion_queue.put(event)
         return {"delegation_id": delegation_id, "released": bool(released)}
+
+    @staticmethod
+    def _open_kanban_claim_db(claim: dict[str, Any]):
+        import sqlite3
+
+        path = Path(claim['db_path'])
+        stat = path.stat()
+        if (stat.st_dev, stat.st_ino) != tuple(claim['db_identity']):
+            raise RuntimeError('Kanban claim database identity changed')
+        # Do not re-resolve a board slug or create/migrate a missing database.
+        conn = sqlite3.connect(path.as_uri() + '?mode=rw', uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def _status_callback(self, session_id: str):
         def callback(kind, text=None):
@@ -1401,41 +1721,58 @@ class AgentPool:
 
         return callback
 
+    def _append_approval_event(self, session_id: str, run_id: str, event: dict[str, Any]) -> None:
+        # Never route a late terminal event through the session's newer current run.
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or run.status != "running":
+                raise RuntimeError("approval has no active event destination")
+            run.events.append(_jsonable({**event, "session_id": session_id, "run_id": run_id,
+                "profile": os.environ.get("HERMES_AGENT_BRIDGE_WORKER_PROFILE", "default")}))
+
     def _approval_callback(self, session_id: str):
-        def callback(command: str, description: str, *, allow_permanent: bool = True) -> str:
+        def callback(command: str, description: str, *, allow_permanent: bool = True,
+                     allow_session: bool = True, smart_denied: bool = False) -> str:
+            from tools.approval_context import _get_approval_timeout
+            timeout = max(float(_get_approval_timeout()), 0.0)
+            deadline = time.monotonic() + timeout
             approval_id = uuid.uuid4().hex
             response_queue: queue.Queue[str] = queue.Queue(maxsize=1)
+            choices = ["once"] + (["session"] if allow_session and not smart_denied else [])
+            if allow_permanent and allow_session and not smart_denied:
+                choices.append("always")
+            choices.append("deny")
+            response_queue._bridge_choices = choices
+            response_queue._bridge_deadline = deadline
             with self._lock:
-                run_id = str(self._sessions.get(session_id).current_run_id or "") if self._sessions.get(session_id) else ""
+                session = self._sessions.get(session_id)
+                run_id = str(session.current_run_id or "") if session else ""
+                if not run_id or run_id not in self._runs:
+                    raise RuntimeError("approval has no active run")
                 self._approval_requests[approval_id] = response_queue
                 self._approval_request_generations[approval_id] = (session_id, run_id)
-            choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
-            self._append_event(session_id, {
-                "event": "approval.requested",
-                "run_id": run_id,
-                "approval_id": approval_id,
-                "command": str(command or ""),
-                "description": str(description or ""),
-                "choices": choices,
-                "allow_permanent": bool(allow_permanent),
-                "timeout_ms": APPROVAL_TIMEOUT_MS,
-            })
+                self._append_approval_event(session_id, run_id, {
+                    "event": "approval.requested", "approval_id": approval_id,
+                    "command": str(command or ""), "description": str(description or ""),
+                    "choices": choices, "allow_session": "session" in choices,
+                    "allow_permanent": "always" in choices, "smart_denied": bool(smart_denied),
+                    "timeout_ms": int(timeout * 1000), "deadline_ms": int((time.time()+timeout)*1000),
+                })
             try:
-                choice = response_queue.get(timeout=APPROVAL_TIMEOUT_SECONDS)
+                choice = response_queue.get(timeout=max(deadline-time.monotonic(), 0.0))
             except queue.Empty:
-                choice = "deny"
+                choice = "timeout"
             finally:
                 with self._lock:
                     self._approval_requests.pop(approval_id, None)
                     self._approval_request_generations.pop(approval_id, None)
-            self._append_event(session_id, {
-                "event": "approval.resolved",
-                "run_id": run_id,
-                "approval_id": approval_id,
-                "choice": choice,
+            outcome = getattr(response_queue, "_bridge_outcome", None) or (
+                "timeout" if choice == "timeout" else "denied" if choice == "deny" else "approved")
+            self._append_approval_event(session_id, run_id, {
+                "event": "approval.resolved", "approval_id": approval_id,
+                "choice": choice, "resolved": outcome in {"approved", "denied"}, "outcome": outcome,
             })
             return choice
-
         return callback
 
     def _clarify_callback(self, session_id: str):
@@ -1508,6 +1845,7 @@ class AgentPool:
         clarify_id = uuid.uuid4().hex
         response_queue: queue.Queue[str] = queue.Queue(maxsize=1)
         with self._lock:
+            response_queue._bridge_session_id = session_id
             self._clarify_requests[clarify_id] = response_queue
         outcome = "submitted"
         try:
@@ -1582,28 +1920,67 @@ class AgentPool:
             else:
                 os.environ["HERMES_EXEC_ASK"] = previous
 
-    def _gateway_approval_notify(self, session_id: str):
-        def callback(approval_data: dict[str, Any]) -> None:
-            approval_id = uuid.uuid4().hex
-            choices = ["once", "session", "always", "deny"]
-            pattern_keys = _approval_pattern_keys(approval_data)
-            request_id = str(approval_data.get("request_id") or "").strip()
-            with self._lock:
-                run_id = str(self._sessions.get(session_id).current_run_id or "") if self._sessions.get(session_id) else ""
-                self._gateway_approval_requests[approval_id] = (session_id, run_id, request_id)
-                self._gateway_approval_pattern_keys[approval_id] = pattern_keys
-            self._append_event(session_id, {
-                "event": "approval.requested",
-                "run_id": run_id,
-                "approval_id": approval_id,
-                "command": str(approval_data.get("command") or ""),
-                "description": str(approval_data.get("description") or ""),
-                "pattern_keys": pattern_keys,
-                "choices": choices,
-                "allow_permanent": True,
-                "timeout_ms": 300_000,
+    def _settle_gateway_approval(self, approval_id: str, reason: str) -> None:
+        with self._lock:
+            generation = self._gateway_approval_requests.pop(approval_id, None)
+            self._gateway_approval_pattern_keys.pop(approval_id, None)
+            meta = self._gateway_approval_meta.pop(approval_id, None)
+            if generation is None or meta is None:
+                return
+            session_id, run_id, request_id = generation
+            choice = meta["entry"].result
+            outcome = meta.get("terminal_outcome") or (
+                ("denied" if choice == "deny" else "approved" if choice in {"once", "session", "always"} else "unanswered")
+                if reason == "answered" else reason)
+            self._append_approval_event(session_id, run_id, {
+                "event": "approval.resolved", "approval_id": approval_id, "request_id": request_id,
+                "choice": choice, "resolved": outcome in {"approved", "denied"}, "outcome": outcome,
             })
 
+    def _gateway_approval_notify(self, session_id: str):
+        def callback(approval_data: dict[str, Any]) -> None:
+            from tools import approval
+            approval_id = uuid.uuid4().hex
+            request_id = str(approval_data.get("request_id") or "").strip()
+            smart_denied = bool(approval_data.get("smart_denied", False))
+            allow_session = bool(approval_data.get("allow_session", False)) and not smart_denied
+            allow_permanent = bool(approval_data.get("allow_permanent", False)) and allow_session
+            choices = ["once"] + (["session"] if allow_session else []) + (["always"] if allow_permanent else []) + ["deny"]
+            # Look up the real entry, releasing the non-reentrant Core lock before registering settle.
+            # Core invokes settle outside its lock; pool -> register(Core) has no inverse nesting.
+            with approval._lock:
+                entry = next((e for e in approval._gateway_queues.get(session_id, [])
+                              if e.data.get("request_id") == request_id), None)
+                if entry is None:
+                    raise RuntimeError("approval request is no longer pending")
+            # Core uses a non-reentrant Lock; register_gateway_settle acquires it itself.
+            with self._lock:
+                session = self._sessions.get(session_id)
+                run_id = str(session.current_run_id or "") if session else ""
+                if not run_id or run_id not in self._runs:
+                    raise RuntimeError("approval has no active run")
+                self._gateway_approval_requests[approval_id] = (session_id, run_id, request_id)
+                self._gateway_approval_pattern_keys[approval_id] = _approval_pattern_keys(approval_data)
+                self._gateway_approval_meta[approval_id] = {
+                    "choices": choices, "deadline": entry.deadline, "entry": entry,
+                }
+                if not approval.register_gateway_settle(session_id, request_id,
+                        lambda reason: self._settle_gateway_approval(approval_id, reason)):
+                    self._settle_gateway_approval(approval_id, "stale")
+                    raise RuntimeError("approval request is no longer pending")
+                remaining = max(entry.deadline - time.monotonic(), 0.0)
+                if remaining <= 0:
+                    # No expired actionable prompt; Core owns the timeout terminal.
+                    return
+                self._append_approval_event(session_id, run_id, {
+                    "event": "approval.requested", "approval_id": approval_id, "request_id": request_id,
+                    "command": str(approval_data.get("command") or ""),
+                    "description": str(approval_data.get("description") or ""),
+                    "pattern_keys": _approval_pattern_keys(approval_data), "choices": choices,
+                    "allow_session": allow_session, "allow_permanent": allow_permanent,
+                    "smart_denied": smart_denied, "timeout_ms": entry.data["timeout_ms"],
+                    "deadline_ms": entry.data["deadline_ms"], "remaining_ms": int(remaining*1000),
+                })
         return callback
 
     def _prepersist_user_message(
@@ -1763,13 +2140,19 @@ class AgentPool:
         source: str | None = None,
         reasoning_effort: str | None = None,
         background_delegation_enabled: bool | None = None,
+        model_run_auth: Any = None,
     ) -> RunRecord:
+        with self._lock:
+            if getattr(self, "_model_run_chat_started", False):
+                raise ValueError("model_run_auth chat already started; reconnect with get_output")
+            self._model_run_chat_started = True
         session = self.get_or_create(
             session_id,
             profile=profile,
             model=model,
             provider=provider,
             background_delegation_enabled=background_delegation_enabled,
+            model_run_auth=model_run_auth,
         )
         # Install after agent construction so any runtime plugin initialization
         # has completed. Rechecking on every run also recovers from a forced
@@ -1785,7 +2168,7 @@ class AgentPool:
             if session.running:
                 raise RuntimeError(f"session {session_id} is already running")
             run_id = uuid.uuid4().hex
-            record = RunRecord(run_id=run_id, session_id=session_id)
+            record = RunRecord(run_id=run_id, session_id=session_id, finalizing=True)
             with self._lock:
                 self._runs[run_id] = record
             session.running = True
@@ -1813,8 +2196,9 @@ class AgentPool:
             daemon=True,
             name=f"hermes-bridge-run-{run_id[:8]}",
         )
-        # Status readers take the same session lock, so they cannot mistake a
-        # registered thread which has not started yet for a dead worker.
+        thread._bridge_session_id = session.session_id
+        with self._lock:
+            self._run_threads.add(thread)
         with session.lock:
             record.worker_thread = thread
             try:
@@ -1825,14 +2209,33 @@ class AgentPool:
         return record
 
     def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, workspace: str | None = None, source: str | None = None, reasoning_effort: str | None = None) -> None:
+        # One publication boundary, including profile/context/auth cleanup. The
+        # body may stage terminal fields, but readers and ACK share this seal.
+        with self._lock:
+            record.finalizing = True
         try:
-            self._run_chat_inner(session, record, message, storage_message, instructions, conversation_history, profile, force_compress, workspace, source, reasoning_effort)
+            self._run_chat_body(session, record, message, storage_message, instructions, conversation_history, profile, force_compress, workspace, source, reasoning_effort)
         except BaseException as exc:
-            # Includes setup failures outside the inner try and SystemExit from
-            # agent/tool code. These terminate this run, not the bridge worker.
-            self._fail_unexpected_run(session, record, exc)
+            # Preserve staged business fields/traceback; cleanup is a separate
+            # failure, but still an error for existing status/error consumers.
+            with session.lock, self._lock:
+                record.status = "error"
+                if record.error is None:
+                    record.error = f"{type(exc).__name__}: {exc}"
+                result = dict(record.result) if isinstance(record.result, dict) else {}
+                result.setdefault("error", record.error)
+                result.setdefault("traceback", traceback.format_exc())
+                result["cleanup_error"] = str(exc)
+                result["cleanup_traceback"] = traceback.format_exc()
+                record.result = result
+                record.ended_at = time.time()
+                session.running = False
+                session.current_run_id = None
         finally:
-            self._fail_unexpected_run(session, record, RuntimeError("Hermes run worker exited without a terminal result"))
+            with session.lock, self._lock:
+                if record.status == "running":
+                    self._fail_unexpected_run(session, record, RuntimeError("Hermes run worker exited without a terminal result"))
+                record.finalizing = False
 
     def _fail_unexpected_run(self, session: AgentSession | None, record: RunRecord, exc: BaseException) -> None:
         with session.lock if session else self._lock:
@@ -1840,6 +2243,7 @@ class AgentPool:
                 return
             record.error = f"{type(exc).__name__}: {exc}"
             record.result = {"error": record.error, "failed": True}
+            record.finalizing = False
             record.ended_at = time.time()
             record.status = "error"
             if session is not None and session.current_run_id == record.run_id:
@@ -1848,19 +2252,28 @@ class AgentPool:
                 session.current_run_id = None
                 session.last_used_at = time.time()
 
+
     def _check_run_worker(self, record: RunRecord) -> None:
+        # Do not take the session lock for a live finalizer: output readers must
+        # remain responsive while cleanup owns that lock.
+        if record.worker_thread is None or record.worker_thread.is_alive():
+            return
         with self._lock:
             session = self._sessions.get(record.session_id)
         with session.lock if session else self._lock:
             if record.status == "running" and record.worker_thread is not None and not record.worker_thread.is_alive():
                 self._fail_unexpected_run(session, record, RuntimeError("Hermes run worker exited without a terminal result"))
 
-    def _run_chat_inner(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, workspace: str | None = None, source: str | None = None, reasoning_effort: str | None = None) -> None:
+
+    def _run_chat_body(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, workspace: str | None = None, source: str | None = None, reasoning_effort: str | None = None) -> None:
         with _profile_env(profile):
             _refresh_approval_allowlist()
             _install_execute_code_approval_memory_patch()
             def stream_callback(delta: str) -> None:
                 with self._lock:
+                    # A retained/asynchronous callback cannot reopen a sealed log.
+                    if record.status != "running":
+                        return
                     text = str(delta)
                     # Keep `deltas` for the aggregated `output`/resume snapshot,
                     # AND record each text chunk as an ordered event in the SAME
@@ -1996,16 +2409,16 @@ class AgentPool:
                     try:
                         from agent.title_generator import maybe_auto_title
 
-                        def title_callback(title: str) -> None:
+                        def title_callback(title: str, source: str | None = None) -> None:
                             cleaned = str(title or "").strip()
                             if not cleaned:
                                 return
                             with self._lock:
-                                record.events.append(_jsonable({
-                                    "event": "session.title.updated",
-                                    "session_id": session.session_id,
-                                    "title": cleaned,
-                                }))
+                                event = {"event": "session.title.updated", "session_id": session.session_id, "title": cleaned}
+                                if record.status == "running":
+                                    record.events.append(_jsonable(event))
+                                # Terminal titles are already persisted in SessionDB and
+                                # consumed by get_session_title/P6n, not a reopened run log.
 
                         maybe_auto_title(
                             title_db,
@@ -2119,9 +2532,12 @@ class AgentPool:
                     self._exit_exec_ask_scope()
                 if session_cwd_bound:
                     _clear_session_workspace_cwd()
+                if not self.has_active_background_for_session(session.session_id):
+                    self._close_model_run_auth(getattr(session.agent, "_hermes_bridge_model_run_auth", None))
 
     @staticmethod
     def _background_delegation_ids_for_session(session_id: str) -> list[str]:
+        # Background children keep the parent's original binding/expiry.
         try:
             from tools.async_delegation import list_async_delegations
 
@@ -2205,8 +2621,8 @@ class AgentPool:
                 recorded = self._record_background_event(session, event)
                 session.background_events.append(_jsonable(recorded))
                 interrupted += 1
-            if len(session.background_events) > self.MAX_BACKGROUND_EVENTS_PER_SESSION:
-                del session.background_events[:-self.MAX_BACKGROUND_EVENTS_PER_SESSION]
+            del session.background_events[:-self.MAX_BACKGROUND_EVENTS_PER_SESSION]
+            # Bounded UI telemetry is independent of durable completion claims.
             return interrupted
 
     def _stop_session_processes(self, session_id: str) -> int:
@@ -2267,46 +2683,38 @@ class AgentPool:
     def _cancel_pending_approvals_for_generation(self, session_id: str, run_id: str) -> int:
         if not session_id or not run_id:
             return 0
-        terminal_queues: list[queue.Queue[str]] = []
-        gateway_approvals: list[tuple[str, str, list[str]]] = []
         with self._lock:
-            for approval_id, approval_generation in list(self._approval_request_generations.items()):
-                if approval_generation != (session_id, run_id):
+            terminal_ids = [aid for aid, gen in self._approval_request_generations.items()
+                            if gen == (session_id, run_id)]
+            terminal_queues = []
+            for aid in terminal_ids:
+                q = self._approval_requests.pop(aid, None)
+                self._approval_request_generations.pop(aid, None)
+                if q is not None:
+                    q._bridge_outcome = "interrupted"
+                    terminal_queues.append(q)
+            gateway_ids = [aid for aid, gen in self._gateway_approval_requests.items()
+                           if gen[:2] == (session_id, run_id)]
+            cancelled = 0
+            from tools.approval import resolve_gateway_approval
+            for aid in gateway_ids:
+                meta = self._gateway_approval_meta[aid]
+                if "accepted_choice" in meta or meta.get("terminal_outcome") == "interrupted":
                     continue
-                response_queue = self._approval_requests.pop(approval_id, None)
-                self._approval_request_generations.pop(approval_id, None)
-                if response_queue is not None:
-                    terminal_queues.append(response_queue)
-            for approval_id, approval_generation in list(self._gateway_approval_requests.items()):
-                if approval_generation[:2] != (session_id, run_id):
-                    continue
-                self._gateway_approval_requests.pop(approval_id, None)
-                gateway_approvals.append((
-                    approval_id,
-                    approval_generation[2],
-                    self._gateway_approval_pattern_keys.pop(approval_id, []),
-                ))
-        for response_queue in terminal_queues:
+                request_id = self._gateway_approval_requests[aid][2]
+                # Set the cause before wakeup, while settle is excluded by pool lock.
+                meta["terminal_outcome"] = "interrupted"
+                if resolve_gateway_approval(session_id, "deny", request_id=request_id) > 0:
+                    cancelled += 1
+                else:
+                    # Another surface consumed it: leave its genuine Core settle intact.
+                    meta.pop("terminal_outcome", None)
+        for q in terminal_queues:
             try:
-                response_queue.put_nowait("deny")
+                q.put_nowait("deny")
             except queue.Full:
                 pass
-        for approval_id, request_id, _pattern_keys in gateway_approvals:
-            try:
-                from tools.approval import resolve_gateway_approval
-
-                if request_id:
-                    resolve_gateway_approval(session_id, "deny", request_id=request_id)
-            except Exception:
-                pass
-            self._append_event(session_id, {
-                "event": "approval.resolved",
-                "run_id": run_id,
-                "approval_id": approval_id,
-                "choice": "deny",
-                "reason": "Session interrupted",
-            })
-        return len(terminal_queues) + len(gateway_approvals)
+        return len(terminal_queues) + cancelled
 
     def cancel_boundary_interrupt(self, session_id: str, expected_run_id: str | None = None) -> dict[str, Any]:
         with self._lock:
@@ -2421,45 +2829,72 @@ class AgentPool:
         accepted = bool(session.agent.steer(text))
         return {"status": "queued" if accepted else "rejected", "accepted": accepted, "text": text}
 
-    def respond_approval(self, approval_id: str, choice: str) -> dict[str, Any]:
+    def respond_approval(self, approval_id: str, choice: str, *,
+                         session_id: str = "", profile: str = "", run_id: str | None = None) -> dict[str, Any]:
         cleaned = str(choice or "deny").strip().lower()
-        if cleaned not in {"once", "session", "always", "deny"}:
-            cleaned = "deny"
+        reply = {"approval_id": approval_id, "resolved": False, "choice": cleaned, "outcome": "stale"}
+        bound_session, bound_run = session_id, run_id
+        # Profile is owned by this isolated bridge worker, not client payload or process-global active UI profile.
+        worker_profile = os.environ.get("HERMES_AGENT_BRIDGE_WORKER_PROFILE", "default")
+        if not bound_session or not profile or profile != worker_profile:
+            return {**reply, "outcome": "binding_mismatch"}
+        # Real start_chat/run completion writers hold session.lock then pool._lock.
+        # Match that order; never acquire session.lock while holding pool._lock.
         with self._lock:
-            response_queue = self._approval_requests.pop(approval_id, None)
-            if response_queue is not None:
-                self._approval_request_generations.pop(approval_id, None)
+            generation = (self._approval_request_generations.get(approval_id)
+                          or self._gateway_approval_requests.get(approval_id))
+            session = self._sessions.get(generation[0]) if generation else None
+        if session is None:
+            return reply
+        with session.lock, self._lock:
+            current_generation = (self._approval_request_generations.get(approval_id)
+                                  or self._gateway_approval_requests.get(approval_id))
+            if current_generation is None:
+                return reply
+            if (current_generation[0] != bound_session
+                    or (bound_run is not None and current_generation[1] != bound_run)):
+                return {**reply, "outcome": "binding_mismatch"}
+            # Omitted client run_id is safe: existing checks below require the pending
+            # generation to equal the live session.current_run_id under the writer locks.
+            response_queue = self._approval_requests.get(approval_id)
+            generation = self._approval_request_generations.get(approval_id)
+            if response_queue is not None and generation is not None:
+                session_id, run_id = generation
+                session = self._sessions.get(session_id)
+                if not session or session.current_run_id != run_id or run_id not in self._runs:
+                    return reply
+                if time.monotonic() >= response_queue._bridge_deadline:
+                    return reply
+                if cleaned not in response_queue._bridge_choices:
+                    return {**reply, "outcome": "invalid_scope"}
                 try:
                     response_queue.put_nowait(cleaned)
                 except queue.Full:
-                    pass
-        if response_queue is None:
-            with self._lock:
-                gateway_generation = self._gateway_approval_requests.pop(approval_id, None)
-                pattern_keys = self._gateway_approval_pattern_keys.pop(approval_id, [])
-            if gateway_generation is None:
-                return {"approval_id": approval_id, "resolved": False, "choice": cleaned}
-            gateway_session_id, gateway_run_id, gateway_request_id = gateway_generation
-            try:
-                from tools.approval import resolve_gateway_approval
-
-                resolved = bool(gateway_request_id) and resolve_gateway_approval(
-                    gateway_session_id,
-                    cleaned,
-                    request_id=gateway_request_id,
-                ) > 0
-            except Exception:
-                resolved = False
+                    return reply
+                self._approval_requests.pop(approval_id, None)
+                self._approval_request_generations.pop(approval_id, None)
+                return {**reply, "resolved": True, "outcome": "denied" if cleaned == "deny" else "approved"}
+            generation = self._gateway_approval_requests.get(approval_id)
+            meta = self._gateway_approval_meta.get(approval_id)
+            if generation is None or meta is None:
+                return reply
+            session_id, run_id, request_id = generation
+            session = self._sessions.get(session_id)
+            if not session or session.current_run_id != run_id or run_id not in self._runs:
+                return reply
+            if time.monotonic() >= meta["deadline"]:
+                return reply
+            if cleaned not in meta["choices"]:
+                return {**reply, "outcome": "invalid_scope"}
+            # Core notify and settle run OUTSIDE Core._lock (verified wait/resolver).
+            # Keep session -> pool through consumption, matching real generation writers.
+            from tools.approval import resolve_gateway_approval
+            resolved = resolve_gateway_approval(session_id, cleaned, request_id=request_id) > 0
             if resolved:
-                _persist_execute_code_approval_choice(gateway_session_id, pattern_keys, cleaned)
-            self._append_event(gateway_session_id, {
-                "event": "approval.resolved",
-                "run_id": gateway_run_id,
-                "approval_id": approval_id,
-                "choice": cleaned,
-            })
-            return {"approval_id": approval_id, "resolved": resolved, "choice": cleaned}
-        return {"approval_id": approval_id, "resolved": True, "choice": cleaned}
+                meta["accepted_choice"] = cleaned
+            # Core alone emits the terminal event; a zero count is not a terminal cause.
+            return {**reply, "resolved": resolved,
+                    "outcome": ("denied" if cleaned == "deny" else "approved") if resolved else "stale"}
 
     def respond_clarify(self, clarify_id: str, response: str) -> dict[str, Any]:
         with self._lock:
@@ -2517,6 +2952,8 @@ class AgentPool:
                     "session_id": session_id, "command": name, "handled": True,
                     "type": "plan", "message": build_plan_prompt(arg),
                 }
+            if name in {"loop", "proactive"}:
+                return self._dispatch_loop_command(session_id, arg, profile)
             if name == "goal":
                 return self._dispatch_goal_command(session_id, arg)
             if name == "subgoal":
@@ -2653,6 +3090,15 @@ class AgentPool:
             "handled": False,
             "message": f"not a supported bridge command: /{name}",
         }
+
+    def _dispatch_loop_command(self, session_id: str, arg: str, profile: str | None) -> dict[str, Any]:
+        from bridge_loops import LoopStore
+        return LoopStore(os.environ['HERMES_HOME']).command(session_id, arg, str(profile or 'default'))
+
+    def loop_operation(self, req: dict[str, Any]) -> dict[str, Any]:
+        from bridge_loops import LoopStore
+        with _profile_env(req.get('profile')):
+            return LoopStore(os.environ['HERMES_HOME']).operation(req)
 
     def _goal_max_turns_from_config(self) -> int:
         try:
@@ -2870,54 +3316,207 @@ class AgentPool:
                 "clear_goal_continuations": True,
             }
 
-    def get_result(self, run_id: str) -> dict[str, Any]:
+    def acknowledge_result(self, run_id: str, cursor: Any, event_cursor: Any) -> dict[str, Any]:
         with self._lock:
             record = self._runs.get(run_id)
-        if record is None:
-            raise KeyError(f"unknown run: {run_id}")
-        self._check_run_worker(record)
-        return {
-            "run_id": record.run_id,
-            "session_id": record.session_id,
-            "status": record.status,
-            "started_at": record.started_at,
-            "ended_at": record.ended_at,
-            "output": "".join(record.deltas),
-            "deltas": list(record.deltas),
-            "events": list(record.events),
-            "result": record.result,
-            "error": record.error,
+            if record is None:
+                raise KeyError(f"unknown run: {run_id}")
+            expected = (len(record.deltas), len(record.events))
+            if record.finalizing or record.status == "running" or (cursor, event_cursor) != expected:
+                return {"acknowledged": False}
+            record.acknowledged = expected
+            return {"acknowledged": True}
+
+    def acknowledge_background_events(self, session_id: str, sequence: Any) -> dict[str, Any]:
+        if not isinstance(sequence, int) or sequence < 0:
+            raise ValueError("invalid background event sequence")
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is not None:
+                session.background_events[:] = [event for event in session.background_events
+                    if int(event.get("background_seq") or 0) > sequence]
+        return {"acknowledged": True}
+
+    def _retention_counts_locked(self) -> dict[str, int]:
+        """Shared drain predicate; caller owns notification + pool locks.
+
+        Do not prune threads, drain queues, import registries, or invoke progress
+        callbacks here. Diagnostic reads must leave the retirement inputs intact.
+        """
+        counts = {
+            "run_or_finalizing": sum(t.is_alive() for t in self._run_threads)
+                + sum(s.running for s in self._sessions.values()),
+            "unconsumed_result": sum(
+                r.finalizing or r.status == "running"
+                or r.acknowledged != (len(r.deltas), len(r.events))
+                for r in self._runs.values()),
+            "pending_interaction": sum(map(len, (self._approval_requests,
+                self._gateway_approval_requests, self._clarify_requests, self._compression_requests))),
+            "notification_claim": len(self._background_notification_claims),
+            "background_events": sum(len(s.background_events) for s in self._sessions.values()),
         }
+        try:
+            registry = sys.modules.get("tools.async_delegation")
+            if registry is not None:
+                # list_async_delegations samples arbitrary progress callbacks.
+                # Only stored statuses are relevant to the drain decision.
+                with registry._records_lock:
+                    counts["background_work"] = sum(
+                        str(r.get("status") or "").lower() in {"running", "stalling", "finalizing"}
+                        for r in registry._records.values())
+            registry = sys.modules.get("tools.process_registry")
+            if registry is not None:
+                registry = registry.process_registry
+                with registry._lock:
+                    counts["tool_process"] = len(registry._running)
+                counts["completion_queue"] = int(not registry.completion_queue.empty())
+        except Exception:
+            counts["registry_unknown"] = 1
+        return {reason: int(count) for reason, count in counts.items() if count}
+
+    def lifecycle_snapshot(self) -> dict[str, Any]:
+        with self._notification_lock, self._lock:
+            counts = {} if self._retired else self._retention_counts_locked()
+            return {"retired": self._retired, "reasons": list(counts), "counts": counts}
+
+    def prepare_retire(self, *, retire: bool = True) -> dict[str, Any]:
+        # BridgeServer serializes request admission. Notification lock excludes
+        # claim/release; pool lock excludes callbacks. No session lock is taken:
+        # live run threads are checked before mutable session state is examined.
+        with self._notification_lock, self._lock:
+            if self._retired:
+                return {"retired": True, "reasons": []}
+            reasons = list(self._retention_counts_locked())
+            # Preserve the existing maintenance cleanup, never on the read path.
+            self._run_threads = {thread for thread in self._run_threads if thread.is_alive()}
+            if reasons:
+                return {"retired": False, "reasons": reasons}
+            if retire:
+                self._retired = True
+                self._notifications_closed = True
+            return {"retired": True, "reasons": []}
+
+    def gc_idle_sessions(self, cutoff: float) -> int:
+        """Evict settled caches only; never use cancellation or close run identity."""
+        with self._notification_lock, self._lock:
+            protected: set[str] = set()
+            route_fields = ("session_key", "origin_ui_session_id", "parent_session_id", "chat_id")
+            def protect(record: dict[str, Any]) -> bool:
+                owners = {str(record.get(key) or "") for key in route_fields} - {""}
+                protected.update(owners)
+                return bool(owners)
+            # Unknown ownership fails closed, but a different session's active
+            # thread/interaction/claim must not pin all settled shared caches.
+            for thread in self._run_threads:
+                if thread.is_alive():
+                    owner = getattr(thread, "_bridge_session_id", None)
+                    if not owner:
+                        return 0
+                    protected.add(owner)
+            for request_id in self._approval_requests:
+                owner = self._approval_request_generations.get(request_id)
+                if not owner:
+                    return 0
+                protected.add(owner[0])
+            protected.update(item[0] for item in self._gateway_approval_requests.values())
+            for response in (*self._clarify_requests.values(), *self._compression_requests.values()):
+                owner = getattr(response, "_bridge_session_id", None)
+                if not owner:
+                    return 0
+                protected.add(owner)
+            for claim in self._background_notification_claims.values():
+                if not protect(claim):
+                    return 0
+            try:
+                if "tools.async_delegation" in sys.modules:
+                    from tools.async_delegation import list_async_delegations
+                    for record in list_async_delegations():
+                        if str(record.get("status") or "").lower() in {"running", "stalling", "finalizing"}:
+                            if not protect(record):
+                                return 0
+                if "tools.process_registry" in sys.modules:
+                    from tools.process_registry import process_registry
+                    with process_registry._lock:
+                        for process in process_registry._running.values():
+                            if not protect(vars(process)):
+                                return 0
+                    # Queue ownership can change while callbacks enqueue. No
+                    # destructive dequeue/peek is needed for a cache optimization.
+                    if not process_registry.completion_queue.empty():
+                        return 0
+            except Exception:
+                return 0
+            stale = []
+            for sid, session in self._sessions.items():
+                if (sid in protected or session.running or session.last_used_at >= cutoff
+                    or session.background_events
+                    or any(str(task.get("status") or "").lower() in {"running", "stalling", "finalizing"}
+                           for task in session.background_tasks.values())
+                    or getattr(session.agent, "_hermes_bridge_model_run_auth", None) is not None):
+                    continue
+                records = [r for r in self._runs.values() if r.session_id == sid]
+                if any(r.finalizing or r.status == "running" or r.acknowledged != (len(r.deltas), len(r.events)) for r in records):
+                    continue
+                stale.append(sid)
+            for sid in stale:
+                self._destroy_session(sid)  # cache-only: no interrupt, release or auth close
+            return len(stale)
+
+    def get_result(self, run_id: str) -> dict[str, Any]:
+        # Snapshot and publication share the callback/ACK lock, not session.lock:
+        # a blocked finalizer must leave polling responsive and nonterminal.
+        with self._lock:
+            record = self._runs.get(run_id)
+        if record is not None:
+            self._check_run_worker(record)
+        with self._lock:
+            record = self._runs.get(run_id)
+            if record is None:
+                raise KeyError(f"unknown run: {run_id}")
+            done = not record.finalizing and record.status != "running"
+            return {
+                "run_id": record.run_id,
+                "session_id": record.session_id,
+                "status": record.status if done else "running",
+                "started_at": record.started_at,
+                "ended_at": record.ended_at if done else None,
+                "output": "".join(record.deltas),
+                "deltas": list(record.deltas),
+                "events": list(record.events),
+                "result": record.result if done else None,
+                "error": record.error if done else None,
+            }
 
     def get_output(self, run_id: str, cursor: int = 0, event_cursor: int = 0) -> dict[str, Any]:
         with self._lock:
             record = self._runs.get(run_id)
-        if record is None:
-            raise KeyError(f"unknown run: {run_id}")
-        self._check_run_worker(record)
-        # Read status first. If the worker finishes while deltas are copied,
-        # report running once more so the next poll can include the final tail.
-        status = record.status
-        cursor = max(0, int(cursor or 0))
-        deltas = list(record.deltas)
-        next_cursor = len(deltas)
-        event_cursor = max(0, int(event_cursor or 0))
-        events = list(record.events)
-        new_events = _jsonable(events[event_cursor:])
-        next_event_cursor = len(events)
-        return {
-            "run_id": record.run_id,
-            "session_id": record.session_id,
-            "status": status,
-            "delta": "".join(deltas[cursor:]),
-            "cursor": next_cursor,
-            "output": "".join(deltas),
-            "done": status != "running",
-            "result": record.result if status != "running" else None,
-            "error": record.error,
-            "events": new_events,
-            "event_cursor": next_event_cursor,
-        }
+        if record is not None:
+            self._check_run_worker(record)
+        with self._lock:
+            record = self._runs.get(run_id)
+            if record is None:
+                raise KeyError(f"unknown run: {run_id}")
+            cursor = max(0, int(cursor or 0))
+            deltas = list(record.deltas)
+            next_cursor = len(deltas)
+            event_cursor = max(0, int(event_cursor or 0))
+            events = list(record.events)
+            new_events = _jsonable(events[event_cursor:])
+            next_event_cursor = len(events)
+            done = not record.finalizing and record.status != "running"
+            return {
+                "run_id": record.run_id,
+                "session_id": record.session_id,
+                "status": record.status if done else "running",
+                "delta": "".join(deltas[cursor:]),
+                "cursor": next_cursor,
+                "output": "".join(deltas),
+                "done": done,
+                "result": record.result if done else None,
+                "error": record.error if done else None,
+                "events": new_events,
+                "event_cursor": next_event_cursor,
+            }
 
     def destroy(self, session_id: str) -> dict[str, Any]:
         background_delegation_ids = self._background_delegation_ids_for_session(session_id)
@@ -2943,6 +3542,7 @@ class AgentPool:
                 session.agent.interrupt("Session destroyed")
             except Exception:
                 pass
+        self._close_model_run_auth(getattr(session.agent, "_hermes_bridge_model_run_auth", None))
         return {
             "session_id": session_id,
             "destroyed": True,
@@ -2960,6 +3560,11 @@ class AgentPool:
         return {"destroyed": len(destroyed)}
 
     def shutdown(self) -> dict[str, Any]:
+        with self._notification_lock:
+            self._notifications_closed = True
+            return self._shutdown()
+
+    def _shutdown(self) -> dict[str, Any]:
         """Bounded worker cleanup for parent runs, delegations, and tool processes."""
         with self._lock:
             sessions = list(self._sessions.values())
@@ -3008,17 +3613,15 @@ class AgentPool:
 
         released_claims = 0
         if claimed_notifications:
-            try:
-                from tools.async_delegation import release_completion_delivery
-
-                for delegation_id, claim_id in claimed_notifications:
-                    if release_completion_delivery(delegation_id, claim_id):
+            for delegation_id, claim_id in claimed_notifications:
+                try:
+                    result = self.release_background_notification(
+                        delegation_id, claim_id, requeue=False
+                    )
+                    if result.get("released"):
                         released_claims += 1
-            except Exception:
-                pass
-            with self._lock:
-                for key in claimed_notifications:
-                    self._background_notification_claims.pop(key, None)
+                except Exception:
+                    pass
 
         return {
             "interrupted_sessions": interrupted_sessions,
@@ -3045,6 +3648,7 @@ class AgentPool:
                 "session_id": session_id,
                 "exists": True,
                 "running": session.running,
+                "model_run_background_active": self.has_active_background_for_session(session_id),
                 "current_run_id": session.current_run_id,
                 "boundary_interrupt": {
                     "supported": session.boundary_supported,

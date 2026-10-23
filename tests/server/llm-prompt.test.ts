@@ -1,6 +1,18 @@
 import { studioMcpCapabilities } from '../../packages/server/src/modules/studio/public/runs/mcp-capabilities'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { getSystemPrompt } from '../../packages/server/src/modules/studio/public/runs/prompt'
+
+afterEach(() => vi.unstubAllEnvs())
+
+it('honors the installed MCP guidance opt-out without removing user or output instructions', () => {
+  vi.stubEnv('HERMES_WEB_UI_DISABLE_MCP_GUIDANCE', 'true')
+  const prompt = getSystemPrompt('keep user instructions', {
+    mcpCapabilities: studioMcpCapabilities({ 'ekko-studio-api': { command: 'studio' } }),
+  })
+  expect(prompt).toContain('keep user instructions')
+  expect(prompt).toContain('# 输出格式规范')
+  expect(prompt).not.toContain('ekko_studio_api_openapi_get')
+})
 
 describe('LLM prompt', () => {
   it('includes Hermes MCP usage guidance for enabled toolsets without runtime profile or resource URI values', () => {

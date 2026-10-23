@@ -40,6 +40,9 @@ def run_on_loop(fn, timeout):
 
 if sys.argv[1] == "split":
     loop = types.ModuleType("tools.mcp_tool_loop")
+    lifecycle = types.ModuleType("tools.mcp_tool_lifecycle")
+    lifecycle.shutdown_mcp_servers = lambda: calls.append("close-run")
+    sys.modules[lifecycle.__name__] = lifecycle
     loop._run_on_mcp_loop = run_on_loop
     sys.modules[loop.__name__] = loop
     discovery = types.ModuleType("tools.mcp_tool_discovery")
@@ -48,12 +51,14 @@ if sys.argv[1] == "split":
     sys.modules[discovery.__name__] = discovery
     # Access to deprecated aliases must never be attempted on split runtimes.
     def reject_alias(name):
-        if name in ("discover_mcp_tools", "register_mcp_servers", "_run_on_mcp_loop"):
+        if name in ("discover_mcp_tools", "register_mcp_servers", "_run_on_mcp_loop", "shutdown_mcp_servers"):
             raise AssertionError("deprecated core alias: " + name)
         raise AttributeError(name)
     core.__getattr__ = reject_alias
 else:
     sys.modules["tools.mcp_tool_loop"] = None
+    sys.modules["tools.mcp_tool_lifecycle"] = None
+    core.shutdown_mcp_servers = lambda: calls.append("close-run")
     sys.modules["tools.mcp_tool_discovery"] = None
     core._run_on_mcp_loop = run_on_loop
     core.discover_mcp_tools = discover
@@ -77,7 +82,22 @@ core._servers["probe"] = Task()
 stopped = server._shutdown_all_mcp_servers()
 import bridge_runtime
 bridge_runtime._ensure_agent_imports = lambda: None
-discovered = bridge_runtime._discover_bridge_mcp_tools()
+from bridge_model_run_auth import ModelRunAuth
+binding = ModelRunAuth.parse({"version":1,"owner_id":"fixture","profile":"default","run_marker":"run","token_path":"/tmp/fixture-source.json"})
+bridge_runtime._load_cfg = lambda: {"mcp_servers": {"probe": {"command": "node"}}}
+def discover_bound(configs):
+    assert configs["probe"]["command"] == "node"
+    calls.append("discover-bound")
+    return ["mcp_probe_read"]
+if sys.argv[1] == "split":
+    discovery.register_mcp_servers = discover_bound
+else:
+    core.register_mcp_servers = discover_bound
+discovered = bridge_runtime._discover_bridge_mcp_tools(model_run_auth=binding)
+pool = bridge.AgentPool()
+pool._model_run_auth = binding
+pool._close_model_run_auth(binding)
+pool._close_model_run_auth(binding)
 print(json.dumps({"listed": listed["ok"], "reloaded": reloaded,
                   "stopped": stopped, "remaining": len(core._servers),
                   "discovered": discovered, "calls": calls}))
@@ -88,7 +108,7 @@ print(json.dumps({"listed": listed["ok"], "reloaded": reloaded,
       stopped: 1,
       remaining: 0,
       discovered: ['mcp_probe_read'],
-      calls: ['register', 'discover', 'loop', 'shutdown', 'discover'],
+      calls: ['register', 'discover', 'loop', 'shutdown', 'discover-bound', 'close-run'],
     })
   })
 })

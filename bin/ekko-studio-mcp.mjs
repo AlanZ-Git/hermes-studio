@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { parseModelRunBinding, readBoundModelRunToken } from './model-run-source.mjs'
 import { browserIntent, matchBrowserSnapshot, verifyBrowserResult } from './browser/jev.mjs'
 import { validateBrowserArguments } from './browser/arguments.mjs'
 import { browserOutput } from './browser/output.mjs'
@@ -44,6 +45,10 @@ function readPackageVersion() {
 }
 
 const VERSION = readPackageVersion()
+const MODEL_RUN_BINDING = parseModelRunBinding(process.env.HERMES_WEB_UI_MODEL_RUN_AUTH)
+if (!MODEL_RUN_BINDING && process.env.HERMES_WEB_UI_REQUIRE_MODEL_RUN_AUTH === '1') {
+  throw new Error('Managed MCP requires model run binding')
+}
 
 function printHelp() {
   process.stdout.write(`${DISPLAY_COMMAND} v${VERSION}
@@ -109,6 +114,10 @@ function readProfileToken(profile) {
 }
 
 function readToken(tokenOverride, allowTokenFile = true, profile = '') {
+  if (MODEL_RUN_BINDING) return readBoundModelRunToken(MODEL_RUN_BINDING, profile)
+  // Coding-agent managed launches still use their current profile credential.
+  // Hermes bridge launches require an immutable descriptor before reaching here.
+  if (process.env.HERMES_WEB_UI_MANAGED_MCP === '1') return readProfileToken(profile)
   const explicit = tokenOverride || process.env.HERMES_WEB_UI_TOKEN || process.env.AUTH_TOKEN
   if (explicit) return explicit.trim()
   if (!allowTokenFile) return ''
@@ -247,9 +256,18 @@ async function requestEnvelope(path, options = {}) {
   // select a restricted group-plan credential without changing process state.
   const contextId = ['/api/studio/task-plans/update', '/api/studio/session-tasks/list', '/api/studio/session-tasks/update'].includes(path)
     ? String(options.body?.context_id || '') : undefined
-  const runCredential = readRunCredential(profile, contextId)
-  const token = runCredential?.token || readToken(options.token, options.allowTokenFile !== false, profile)
+  const publicDocument = (options.method || 'GET') === 'GET' && new URL(path, baseUrl()).pathname === '/api/openapi.json'
+  // Validate a bound source before any network request or context lookup. A
+  // rejected source never falls through to shared profile/static credentials.
+  if (MODEL_RUN_BINDING && !publicDocument) readBoundModelRunToken(MODEL_RUN_BINDING, profile)
+  const runCredential = publicDocument ? null : readRunCredential(profile, contextId)
+  const token = publicDocument ? '' : runCredential?.token || readToken(options.token, options.allowTokenFile !== false, profile)
   const method = options.method || 'GET'
+  if (MODEL_RUN_BINDING?.run_marker.startsWith('recovery_v1_')) {
+    const target = new URL(path, baseUrl())
+    if (!publicDocument && (target.pathname !== '/api/studio/chat-run/loop-recovery' || method !== 'POST'
+      || options.body?.profile !== MODEL_RUN_BINDING.profile)) throw new Error('Recovery API scope rejected')
+  }
   const body = method === 'GET' || method === 'HEAD' ? undefined : options.body
   const headers = {
     ...normalizePublicHeaders(options.headers),
@@ -257,6 +275,7 @@ async function requestEnvelope(path, options = {}) {
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...(profile ? { 'X-Hermes-Profile': profile } : {}),
     ...(runCredential ? { 'X-Studio-Run-Context': runCredential.context_id } : {}),
+    ...(MODEL_RUN_BINDING?.run_marker.startsWith('recovery_v1_') ? { 'X-Webui-Recovery-Run': MODEL_RUN_BINDING.run_marker } : {}),
   }
   const fetchRequest = path === '/api/studio/mobile-calendar/request' || path === '/api/studio/mobile-health/request' || path === '/api/studio/clarifications/request' ? fetchMobileConsent : fetch
   const response = await fetchRequest(`${baseUrl()}${appendQuery(path, options.query)}`, {
@@ -1838,6 +1857,9 @@ async function callTool(name, args = {}, signal) {
 }
 
 async function callToolInner(name, args = {}, signal) {
+  if (MODEL_RUN_BINDING && resolveToolName(name) !== 'ekko_studio_api_openapi_get') {
+    readBoundModelRunToken(MODEL_RUN_BINDING, args.profile || defaultProfile())
+  }
   if (!isToolCallable(name)) {
     return errorText(`Tool is not available in the active '${ACTIVE_TOOLSET}' MCP toolset: ${name}`)
   }

@@ -105,6 +105,7 @@ vi.mock('../../packages/server/src/modules/studio/public/profile-config', () => 
 
 vi.mock('../../packages/server/src/modules/studio/public/auth', () => ({
   issueModelRunJwt: vi.fn(async () => 'model-run-token'),
+  authenticateUserToken: vi.fn(async () => ({ id: 1, username: 'fixture', role: 'super_admin' })),
 }))
 
 const PREVIOUS_TURN: Partial<HermesMessageRow>[] = [
@@ -141,7 +142,7 @@ function makeBridge(events: Record<string, unknown>[] = []) {
 function makeSockets() {
   const emitter = { emit: vi.fn(), except: vi.fn(() => ({ emit: vi.fn() })) }
   const nsp = { adapter: { rooms: new Map([['session:session-1', new Set(['socket-1'])]]) }, to: vi.fn(() => emitter) }
-  const socket = { connected: true, emit: vi.fn(), join: vi.fn(), to: vi.fn(() => emitter), data: {} }
+  const socket = { connected: true, emit: vi.fn(), join: vi.fn(), to: vi.fn(() => emitter), data: { user: { id: 1, username: 'fixture', role: 'super_admin' } } }
   // Test doubles implement only the socket.io members these run paths touch.
   return { nsp: nsp as unknown as Namespace, socket: socket as unknown as Socket }
 }

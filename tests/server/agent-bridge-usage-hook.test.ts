@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+sys.path.insert(0, str(Path('packages/server/src/modules/hermes/services/bridge/python').resolve()))
 
 bridge_runtime = types.ModuleType("bridge_runtime")
 bridge_runtime.APPROVAL_TIMEOUT_MS = 1000
@@ -107,6 +108,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+sys.path.insert(0, str(Path('packages/server/src/modules/hermes/services/bridge/python').resolve()))
 
 bridge_runtime = types.ModuleType("bridge_runtime")
 bridge_runtime.APPROVAL_TIMEOUT_MS = 1000

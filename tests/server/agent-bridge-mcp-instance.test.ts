@@ -102,6 +102,13 @@ with tempfile.TemporaryDirectory() as home:
     # The same stale shared config first reproduces 409, then succeeds through the bridge hook.
     def call():
         env = module._build_safe_env(stale)
+        # Independent source is required by managed MCP even for this routing fixture.
+        binding = {'version': 1, 'owner_id': 'fixture', 'profile': env['HERMES_WEB_UI_PROFILE'],
+                   'run_marker': 'fixture-run', 'token_path': str(Path(home) / 'run-source.json')}
+        source = Path(binding['token_path'])
+        source.write_text(json.dumps({'binding': binding, 'active': True, 'token': 'synthetic'}))
+        source.chmod(0o600)
+        env['HERMES_WEB_UI_MODEL_RUN_AUTH'] = json.dumps(binding)
         child = subprocess.Popen([sys.argv[2], 'bin/ekko-studio-mcp.mjs', 'plan'], env=env,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         request = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {

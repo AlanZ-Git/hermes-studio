@@ -100,6 +100,7 @@ export interface QueuedRun {
   reasoningEffort?: string
   backgroundDelegationId?: string
   backgroundClaimId?: string
+  backgroundNotificationKind?: 'kanban'
   /** Internal-only origin history for a background callback. Never accepted from socket input. */
   backgroundContinuationContext?: BackgroundContinuationContext
   autonomous?: boolean
@@ -134,6 +135,7 @@ export interface QueueInsertionControl {
 }
 
 export interface SessionState {
+  modelRunAuth?: import('../../services/chat-run/model-run-source').ModelRunAuth
   /** Manual Hermes compression also holds history against message deletion. */
   isCompressing?: boolean
   /** Explicit Stop suppresses automatic wakeups until the next user run. */

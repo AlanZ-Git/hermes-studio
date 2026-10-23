@@ -80,6 +80,15 @@ with tempfile.TemporaryDirectory(prefix='bridge-bootstrap-') as temp:
     (root / '.env').write_text('BRIDGE_BASE_SECRET=base\n')
     (profile_home / '.env').write_text('BRIDGE_PROFILE_SECRET=work\n')
     (root / 'run_agent.py').write_text('import hermes_bootstrap\nraise RuntimeError("fixture agent import reached")\n')
+    # Startup diagnostics must not discover a host installation or run provider
+    # availability checks outside this synthetic bootstrap fixture.
+    (root / 'model_tools.py').write_text('def get_tool_definitions(**kwargs): return []\n')
+    (root / 'hermes_cli').mkdir()
+    (root / 'hermes_cli' / '__init__.py').write_text('')
+    (root / 'hermes_cli' / 'config.py').write_text('def load_config(): return {}\n')
+    (root / 'agent').mkdir()
+    (root / 'agent' / '__init__.py').write_text('')
+    (root / 'agent' / 'prompt_builder.py').write_text('PLATFORM_HINTS = {}\n')
     (root / 'hermes_bootstrap.py').write_text('''import os, sys
 from pathlib import Path
 if os.environ.get('BRIDGE_TEST_REEXEC') != '1':
@@ -114,7 +123,9 @@ Path(os.environ['BRIDGE_TEST_MARKER']).write_text(json.dumps({
         threading.Thread(target=read_stdout, daemon=True).start()
         def request(action):
             with socket.create_connection(('127.0.0.1', port), timeout=3) as conn:
-                conn.sendall((json.dumps({'action': action, 'message': 'probe', 'messages': []}) + '\n').encode())
+                profile = 'work' if sys.argv[1] == 'profile-worker' else 'default'
+                binding = {'version': 1, 'owner_id': 'fixture', 'profile': profile, 'run_marker': 'run', 'token_path': str(root / 'source.json')}
+                conn.sendall((json.dumps({'action': action, 'profile': profile, 'message': 'probe', 'messages': [], 'model_run_auth': binding}) + '\n').encode())
                 with conn.makefile('rb') as wire:
                     return json.loads(wire.readline())
         try:

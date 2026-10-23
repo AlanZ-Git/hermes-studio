@@ -49,8 +49,9 @@ import { resolveBridgeRunModelConfig, type RunModelGroup } from './model-config'
 import { filterBridgeToolCallMarkupDelta, flushPendingToolCallMarkup } from './bridge-delta'
 import { markAbortCompleted } from './abort'
 import { buildOutboundRunEvent } from './resume-payload'
-import { writeModelRunProfileToken } from './model-run-prompt'
+import { createModelRunSource, closeModelRunSource, readModelRunSource, type ModelRunAuth } from './model-run-source'
 import type { AuthenticatedUser } from '../../public/auth'
+import type { LoopRunHooks } from './loop-runtime'
 import { ensureHermesRunWorkspace } from './workspace'
 import { observeRunChatPetEvent } from '../../public/pet-events'
 import { completeWorkspaceRunCheckpoint, startWorkspaceRunCheckpoint } from './workspace-diff-tracker'
@@ -415,7 +416,10 @@ async function ensureBridgeFixedContext(args: {
   refresh?: boolean
   backgroundDelegationEnabled?: boolean
   isCurrent?: () => boolean
+  modelRunAuth?: ModelRunAuth
 }): Promise<number | undefined> {
+  if (!args.modelRunAuth) return getCachedBridgeContextOverhead(args.state)
+  await readModelRunSource(args.modelRunAuth)
   const cached = bridgeContextMatches(args.state, args)
     ? getCachedBridgeContextOverhead(args.state)
     : undefined
@@ -429,6 +433,7 @@ async function ensureBridgeFixedContext(args: {
       args.profile,
       {
         model: args.model ?? undefined,
+        model_run_auth: args.modelRunAuth,
         provider: args.provider ?? undefined,
         workspace: args.workspace ?? undefined,
         ...(args.backgroundDelegationEnabled !== undefined
@@ -465,7 +470,7 @@ async function ensureBridgeFixedContext(args: {
 export async function handleBridgeRun(
   nsp: ReturnType<Server['of']>,
   socket: Socket,
-  data: { task_plan_context_id?: string; input: string | ContentBlock[]; display_input?: string | ContentBlock[] | null; display_role?: 'user' | 'command'; storage_message?: string; session_id?: string; model?: string; provider?: string; model_groups?: RunModelGroup[]; instructions?: string; workspace?: string | null; category_id?: number | null; source?: string; session_source?: 'global_agent' | 'workflow' | 'group_chat'; queue_id?: string; peerExcludeSocketId?: string; reasoning_effort?: string; push_enabled?: boolean; background_delegation_enabled?: boolean; one_shot_model?: boolean; background_delegation_id?: string; background_claim_id?: string; autonomous?: boolean; onEvent?: (event: string, payload: any) => void },
+  data: LoopRunHooks & { task_plan_context_id?: string; input: string | ContentBlock[]; display_input?: string | ContentBlock[] | null; display_role?: 'user' | 'command'; storage_message?: string; session_id?: string; model?: string; provider?: string; model_groups?: RunModelGroup[]; instructions?: string; workspace?: string | null; category_id?: number | null; source?: string; session_source?: 'global_agent' | 'workflow' | 'group_chat'; queue_id?: string; peerExcludeSocketId?: string; reasoning_effort?: string; push_enabled?: boolean; background_delegation_enabled?: boolean; one_shot_model?: boolean; background_delegation_id?: string; background_claim_id?: string; autonomous?: boolean; onEvent?: (event: string, payload: any) => void },
   profile: string,
   sessionMap: Map<string, SessionState>,
   bridge: AgentBridgeClient,
@@ -485,6 +490,7 @@ export async function handleBridgeRun(
     return
   }
   const socketUser = socket.data.user as AuthenticatedUser | undefined
+  if (socketUser?.id == null) throw new Error('Bridge run requires authenticated owner')
   const callbackContext = data.background_delegation_id
     && backgroundContinuationContext?.runtime === 'hermes'
     && backgroundContinuationContext.delegationId === data.background_delegation_id
@@ -548,7 +554,7 @@ export async function handleBridgeRun(
     if (selectedProvider && sessionRow.provider !== selectedProvider) updates.provider = selectedProvider
     if (Object.keys(updates).length > 0) updateSession(session_id, updates)
   }
-  await writeModelRunProfileToken(socketUser, profile)
+
   const runPrompt = [
     'When calling Hermes Web UI endpoints from tools or skills, include the current Hermes profile as the X-Hermes-Profile header if the endpoint supports profile-scoped behavior.',
   ].filter(Boolean).join('\n')
@@ -556,7 +562,7 @@ export async function handleBridgeRun(
     fullInstructions = `\n${runPrompt}\n${fullInstructions}`
   }
 
-  const runMarker = `cli_run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+  const runMarker = `${data.recoveryRegister ? 'recovery_v1_' : 'cli_run_'}${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
   const now = Math.floor(Date.now() / 1000)
   let state = sessionMap.get(session_id)
   if (!state) {
@@ -684,7 +690,7 @@ export async function handleBridgeRun(
     })
   }
 
-  if (data.background_delegation_id && !callbackContext) {
+  if (data.background_delegation_id && !callbackContext && data.background_notification_kind !== 'kanban') {
     const error = `Background callback ${data.background_delegation_id} cannot continue because its origin context is unavailable.`
     bridgeLogger.error({ sessionId: session_id, delegationId: data.background_delegation_id }, error)
     if (data.background_claim_id) {
@@ -727,8 +733,25 @@ export async function handleBridgeRun(
   let backgroundNotificationAccepted = false
 
   state.bridgeRunPollMarker = runMarker
+  let modelRunAuth: ModelRunAuth | undefined
   // Inside the run's failure cleanup: a pre-run error (e.g. context window too small) must settle this run.
   try {
+    data.loopAuthorize?.()
+    if (!shouldPersistUserMessage && data.background_notification_kind === 'kanban') {
+      const id = addMessage({ session_id, role: 'user', content: actualInputStr,
+        display_role: 'internal', display_content: '', run_marker: runMarker, timestamp: now })
+      if (id == null) throw new Error('Cannot persist Kanban notification input')
+      state.messages.push({ id, session_id, role: 'user', content: actualInputStr,
+        display_role: 'internal', display_content: '', runMarker, run_marker: runMarker, timestamp: now })
+    }
+    modelRunAuth = await createModelRunSource(socketUser, profile, runMarker)
+    state.modelRunAuth = modelRunAuth
+    data.recoveryRegister?.(modelRunAuth)
+    await ensureBridgeFixedContext({
+      modelRunAuth, sessionId: session_id, profile, model: resolvedModel,
+      provider: resolvedProvider, workspace, instructions: fullInstructions,
+      state, bridge, backgroundDelegationEnabled,
+    })
     const history = callbackContext
       ? structuredClone(callbackContext.messages)
       : await buildCompressedHistory(
@@ -740,6 +763,7 @@ export async function handleBridgeRun(
         { model: resolvedModel, provider: resolvedProvider },
         async (_messages, localMessageTokens) => {
           const fixedContextTokens = await ensureBridgeFixedContext({
+            modelRunAuth,
             sessionId: session_id,
             profile,
             model: resolvedModel,
@@ -807,6 +831,10 @@ export async function handleBridgeRun(
       hasInstructions: Boolean(fullInstructions),
       multimodalInput: isContentBlockArray(input),
     }, '[chat-run-socket] starting CLI bridge run')
+    await data.loopBeforeDispatch?.()
+    if (sessionMap.get(session_id) !== state || state.activeRunMarker !== runMarker) return
+    data.loopAuthorize?.()
+    data.loopDispatchConfirmed?.()
     const started = await bridge.chat(
       session_id,
       bridgeInput as AgentBridgeMessage,
@@ -815,6 +843,7 @@ export async function handleBridgeRun(
       profile,
       {
         ...(bridgeStorageInput !== undefined ? { storage_message: bridgeStorageInput } : {}),
+        model_run_auth: modelRunAuth,
         ...(resolvedModel ? { model: resolvedModel } : {}),
         ...(resolvedProvider ? { provider: resolvedProvider } : {}),
         ...(workspace ? { workspace } : {}),
@@ -878,6 +907,7 @@ export async function handleBridgeRun(
       shouldContinue: () => sessionMap.get(session_id) === state && state.activeRunMarker === runMarker,
     })) {
       if (state.activeRunMarker !== runMarker) break
+      data.loopProof?.(chunk)
       lastChunk = chunk
       await applyBridgeChunkAsync(
         nsp,
@@ -1010,6 +1040,16 @@ export async function handleBridgeRun(
     }
   } finally {
     if (state.bridgeRunPollMarker === runMarker) state.bridgeRunPollMarker = undefined
+    if (modelRunAuth) {
+      // Query this generation, never the mutable latest session route. An unknown
+      // transport outcome is not proof that its background work has ended.
+      const status = await Promise.resolve().then(() => bridge.request({
+        action: 'status', session_id, profile, model_run_auth: modelRunAuth,
+      })).catch(() => null)
+      if (status && status.model_run_background_active === false && status.running === false) {
+        await closeModelRunSource(modelRunAuth)
+      }
+    }
   }
 }
 
@@ -1219,6 +1259,7 @@ async function refreshFinalContextUsage(args: {
     const finalMessageTokens = finalMessageUsage.inputTokens + finalMessageUsage.outputTokens
     if (args.isCurrent && !args.isCurrent()) return undefined
     await ensureBridgeFixedContext({
+      modelRunAuth: args.state.modelRunAuth,
       sessionId: args.sessionId,
       profile: args.profile,
       model: args.model,

@@ -820,6 +820,9 @@ export function connectChatRun(requestedProfile?: string | null, transport: Chat
   const namespace = transport === 'global-agent' ? '/global-agent' : '/chat-run'
   chatRunSocket = io(socketEndpoint(baseUrl, namespace).url, {
     path: socketEndpoint(baseUrl, namespace).path,
+    // A Manager caches the Engine.IO handshake query across namespaces.
+    // Profile-specific sockets must never inherit another profile's transport.
+    forceNew: true,
     auth: { token },
     query: { profile },
     transports: ['websocket', 'polling'],

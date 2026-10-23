@@ -11,6 +11,14 @@ const getGlobalEkkoAgentMock = vi.fn()
 const createModelClientMock = vi.fn()
 const resolveModelProviderConfigsMock = vi.fn()
 const resolveEkkoProviderRuntimeConfigMock = vi.fn()
+const compressionBinding = { version: 1, owner_id: '1', profile: 'default', run_marker: 'synthetic-summary', token_path: '/tmp/synthetic-summary/source.json' }
+const createCompressionSourceMock = vi.fn(async () => compressionBinding)
+const closeCompressionSourceMock = vi.fn(async () => undefined)
+
+vi.mock('../../packages/server/src/modules/studio/services/chat-run/model-run-source', () => ({
+  createCompressionModelRunSource: createCompressionSourceMock,
+  closeModelRunSource: closeCompressionSourceMock,
+}))
 
 vi.mock('../../packages/server/src/modules/studio/public/logging', () => ({
   logger: {
@@ -68,6 +76,8 @@ describe('ChatContextCompressor', () => {
     saveCompressionSnapshotMock.mockReset()
     deleteCompressionSnapshotMock.mockReset()
     bridgeRequestMock.mockReset()
+    createCompressionSourceMock.mockClear()
+    closeCompressionSourceMock.mockClear()
     bridgeDestroyMock.mockReset()
     ekkoRuntimeOptionsMock.mockReset()
     ekkoRuntimeRunMock.mockReset()
@@ -110,6 +120,23 @@ describe('ChatContextCompressor', () => {
 
   afterEach(() => {
     global.fetch = originalFetch
+  })
+
+  it('keeps the shared summarization timeout at ten minutes', async () => {
+    const { DEFAULT_COMPRESSION_CONFIG } = await import('../../packages/server/src/modules/studio/services/context-compressor')
+    expect(DEFAULT_COMPRESSION_CONFIG.summarizationTimeoutMs).toBe(600_000)
+  })
+
+  it.each([
+    { final_response: 'API call failed after 3 retries: Request timed out.' },
+    { final_response: 'summary-looking text', failed: true },
+    { final_response: 'summary-looking text', error: 'provider failed' },
+  ])('rejects a failed Hermes summary payload without treating its text as a summary: %j', async payload => {
+    const { callSummarizer } = await import('../../packages/server/src/modules/studio/services/context-compressor')
+    bridgeRequestMock.mockResolvedValue({ status: 'complete', result: payload })
+    await expect(callSummarizer('', undefined, 'Summarize.', [], 12_000, undefined, { profile: 'fixture' }))
+      .rejects.toThrow(/summari.*fail|invalid.*summari/i)
+    expect(closeCompressionSourceMock).toHaveBeenCalledTimes(1)
   })
 
   it('uses a fresh prompt-isolated, tool-free, skill-free Ekko agent for summarization', async () => {
@@ -193,7 +220,7 @@ describe('ChatContextCompressor', () => {
 
     expect(result).toBe('hermes fallback summary')
     expect(ekkoRuntimeRunMock).toHaveBeenCalledTimes(1)
-    expect(bridgeRequestMock).toHaveBeenCalledTimes(1)
+    expect(bridgeRequestMock).toHaveBeenCalledTimes(2)
   })
 
   it.each([false, true])('reports manual summarizer failure without replacing the snapshot (incremental=%s)', async incremental => {
@@ -338,7 +365,7 @@ describe('ChatContextCompressor', () => {
     expect(saveCompressionSnapshotMock).toHaveBeenCalledWith('s1', 'compressed summary', 6, 10)
   })
 
-  it('routes summarization through the provided worker key and destroys only the temporary agent session', async () => {
+  it('binds summarization to its own owner generation and destroys only that temporary agent session', async () => {
     const { ChatContextCompressor } = await import('../../packages/server/src/modules/studio/services/context-compressor')
     const compressor = new ChatContextCompressor({
       config: { headMessageCount: 0, tailMessageCount: 1, summaryBudget: 1000 },
@@ -362,7 +389,7 @@ describe('ChatContextCompressor', () => {
     expect(bridgeRequestMock).toHaveBeenCalledWith(expect.objectContaining({
       action: 'chat',
       profile: 'default',
-      worker_key: 'default:compression:s1',
+      model_run_auth: compressionBinding,
       message: 'Generate the context checkpoint summary now.',
       wait: true,
     }), expect.any(Object))
@@ -373,11 +400,12 @@ describe('ChatContextCompressor', () => {
     }))
     const compressSessionId = bridgeRequestMock.mock.calls[0][0].session_id
     expect(String(compressSessionId)).toMatch(/^compress_/)
-    expect(bridgeDestroyMock).toHaveBeenCalledWith(
-      compressSessionId,
-      'default',
-      'default:compression:s1',
-    )
+    expect(request).not.toHaveProperty('worker_key')
+    expect(createCompressionSourceMock).toHaveBeenCalledWith('s1', 'default', compressSessionId)
+    expect(bridgeRequestMock).toHaveBeenCalledWith({
+      action: 'destroy', session_id: compressSessionId, profile: 'default', model_run_auth: compressionBinding,
+    })
+    expect(closeCompressionSourceMock).toHaveBeenCalledWith(compressionBinding)
   })
 
   it('does not pre-prune tool results before sending them to the summarizer', async () => {
@@ -508,7 +536,7 @@ describe('ChatContextCompressor', () => {
     const result = await compressor.compress(messages, 'http://upstream', undefined, 's1')
 
     expect(deleteCompressionSnapshotMock).not.toHaveBeenCalled()
-    expect(bridgeRequestMock).toHaveBeenCalledTimes(1)
+    expect(bridgeRequestMock).toHaveBeenCalledTimes(2)
     expect(result.messages.map(m => m.content)).toEqual([
       'message 0',
       'message 1',
@@ -535,7 +563,7 @@ describe('ChatContextCompressor', () => {
 
     const result = await compressor.compress(messages, 'http://upstream', undefined, 's1')
 
-    expect(bridgeRequestMock).toHaveBeenCalledTimes(1)
+    expect(bridgeRequestMock).toHaveBeenCalledTimes(2)
     expect(result.messages.map(m => m.content)).toEqual([
       `${SUMMARY_PREFIX}\n\ncompressed all messages`,
     ])
@@ -661,7 +689,7 @@ describe('ChatContextCompressor', () => {
 
     const result = await compressor.compress(messages, 'http://upstream', undefined, 's1')
 
-    expect(bridgeRequestMock).toHaveBeenCalledTimes(1)
+    expect(bridgeRequestMock).toHaveBeenCalledTimes(2)
     const request = bridgeRequestMock.mock.calls[0][0]
     expect(request.message).toBe('Generate the context checkpoint summary now.')
     expect(request.conversation_history.slice(0, 3)).toEqual([

@@ -175,11 +175,11 @@ function parseHistoryMoaToolPayload(toolName: string | null, value: unknown): { 
 }
 
 function mapHistoryMessages(messages: HermesMessage[]): Session['messages'] {
-  return messages.map(m => {
+  return messages.filter(m => m.display_role !== 'internal').map(m => {
     const displayRole = isHistoryMoaToolDisplay(m) ? 'tool' : (m.display_role || m.role)
     const msg: Session['messages'][number] = {
       id: String(m.id),
-      role: displayRole === 'moa' ? 'system' : displayRole,
+      role: displayRole === 'moa' || displayRole === 'internal' ? 'system' : displayRole,
       content: m.content || '',
       timestamp: m.timestamp * 1000,
       reasoning: m.reasoning || undefined,

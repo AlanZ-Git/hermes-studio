@@ -144,7 +144,7 @@ export interface HermesMessage {
   session_id: string
   role: 'user' | 'assistant' | 'system' | 'tool' | 'command' | 'moa'
   content: string
-  display_role?: 'user' | 'assistant' | 'system' | 'tool' | 'command' | null
+  display_role?: 'user' | 'assistant' | 'system' | 'tool' | 'command' | 'internal' | null
   display_content?: string | null
   tool_call_id: string | null
   tool_calls: any[] | null

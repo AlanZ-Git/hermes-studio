@@ -34,7 +34,7 @@ import type { Server, Socket } from 'socket.io'
 import { randomUUID } from 'crypto'
 import { logger } from '../public/logging'
 import { getSystemPrompt } from '../public/runs/prompt'
-import { clearSessionMessages, deleteSession, getSession, getSessionMetadata, listSessions, updateMessageDisplayContent } from '../repositories/session-store'
+import { clearSessionMessages, deleteSession, getSession, getSessionDetail, getSessionMetadata, listRecoverySessionMetadata, updateMessageDisplayContent } from '../repositories/session-store'
 import { deleteSessionMessageGroups } from '../repositories/session-message-deletion'
 import { listWorkspaceRunChangesForAssistantMessages } from '../repositories/workspace-run-changes-store'
 import { getSessionCategory } from '../repositories/session-category-store'
@@ -63,6 +63,7 @@ import { loadSessionStateFromDb, resolveRunSource } from '../services/chat-run/l
 import { getSessionContextOverhead, refreshContextUsageAfterDeletion } from '../services/chat-run/context-usage'
 import { handleSessionCommand, isSessionCommand, parseSessionCommand } from '../services/chat-run/session-command'
 import { contentBlocksToString } from '../services/chat-run/content-blocks'
+import { LoopRuntime, type LoopRunHooks } from '../services/chat-run/loop-runtime'
 import {
   buildAppResumeMessagePage,
   buildOutboundRunEvent,
@@ -80,7 +81,7 @@ import type {
   SessionState,
 } from '../services/chat-run/types'
 import { authenticateUserToken, inspectAppUserToken, isAuthEnabled, type AuthenticatedUser } from '../public/auth'
-import { userCanAccessProfile } from '../repositories/users-store'
+import { findUserById, userCanAccessProfile } from '../repositories/users-store'
 import { observeRunChatPetEvent } from '../public/pet-events'
 import { observeChatRunWebhookEvent, type ChatRunWebhookAgent } from '../services/webhooks'
 import { getAgentStatusSnapshot } from '../public/agent-status-registry'
@@ -443,6 +444,7 @@ export class ChatRunSocket {
   private backgroundPollTimer?: NodeJS.Timeout
   private backgroundPollInFlight = false
   private backgroundRecoveryNeeded = true
+  private backgroundRecoveryPollAt = 0
   private backgroundBrokerId?: string
   private backgroundPollRetryAt = 0
   private backgroundActivityGraceUntil = 0
@@ -732,7 +734,7 @@ export class ChatRunSocket {
     this.closing = false
     this.nsp.use(this.authMiddleware.bind(this))
     this.nsp.on('connection', this.onConnection.bind(this))
-    this.backgroundPollTimer = setInterval(() => void this.pollBackgroundWork(), 500)
+    this.backgroundPollTimer = setInterval(() => { void this.pollBackgroundWork(); void this.loopRuntime.poll() }, 500)
     this.backgroundPollTimer.unref?.()
     void this.pollBackgroundWork()
     logger.info('[chat-run-socket] Socket.IO ready at /chat-run')
@@ -1554,7 +1556,7 @@ export class ChatRunSocket {
 
   private async handleRun(
     socket: Socket,
-    data: {
+    data: LoopRunHooks & {
       input: string | ContentBlock[]
       display_input?: string | ContentBlock[] | null
       display_role?: 'user' | 'command'
@@ -1926,23 +1928,70 @@ export class ChatRunSocket {
   }
 
   private socketForBackgroundRun(sessionId: string): Socket {
-    const room = this.nsp.adapter.rooms.get(`session:${sessionId}`)
-    if (room) {
-      for (const socketId of room) {
-        const socket = this.nsp.sockets.get(socketId)
-        if (socket) return socket
-      }
-    }
+    const row = getSession(sessionId)
+    const stored = row?.user_id ? findUserById(row.user_id) : null
+    if (!stored || stored.status !== 'active') throw new Error('Background session owner unavailable')
+    const owner: AuthenticatedUser = { id: stored.id, username: stored.username, role: stored.role }
+    if (!this.canAccessProfile(owner, row?.profile || 'default')) throw new Error('Background profile access denied')
     return {
       id: `background-run-${sessionId}`,
       connected: false,
-      data: {},
+      data: { user: owner },
       join: () => {},
       emit: (event: string, payload: any) => this.nsp.to(`session:${sessionId}`).emit(event, payload),
       to: (roomName: string) => ({
         emit: (event: string, payload: any) => this.nsp.to(roomName).emit(event, payload),
       }),
     } as unknown as Socket
+  }
+
+  private readonly loopRuntime = new LoopRuntime({
+    sessionMap: this.sessionMap,
+    request: payload => this.backgroundBridge.request(payload),
+    profiles: () => ['default', ...listProfileNamesFromDisk()],
+    owner: row => this.socketForBackgroundRun(row.id).data.user,
+    socket: sessionId => this.socketForBackgroundRun(sessionId),
+    run: (socket, data, profile) => this.handleRun(socket, data as any, profile),
+    command: async (row, state, input, hooks) => {
+      const command = parseSessionCommand(input)
+      if (!command || !['status', 'usage', 'context', 'title', 'skill', 'bundles', 'learn', 'plan'].includes(command.name)) {
+        throw new Error('Scheduled command requires supported non-destructive WebUI dispatch')
+      }
+      hooks.loopAuthorize?.()
+      await hooks.loopBeforeDispatch?.()
+      hooks.loopDispatchConfirmed?.()
+      const socket = this.socketForBackgroundRun(row.id)
+      const queueId = `loop-command-${crypto.randomUUID()}`
+      let result: Record<string, unknown> | undefined
+      await handleSessionCommand(row.id, command, {
+        nsp: this.nsp, socket, sessionMap: this.sessionMap, bridge: this.bridge,
+        profile: row.profile || 'default', model: row.model || undefined, provider: row.provider || undefined,
+        queueId, loopCommandResult: value => { result = value },
+        runQueuedItem: () => { throw new Error('Unexpected untracked command run') },
+      })
+      const queued = state.queue.filter(item => item.queue_id === queueId)
+      state.queue = state.queue.filter(item => item.queue_id !== queueId)
+      if (queued.length) {
+        if (queued.length !== 1) throw new Error('Unexpected scheduled command queue count')
+        const item = queued[0]
+        await this.handleRun(socket, { ...hooks, session_id: row.id, source: 'cli',
+          input: item.input, display_input: item.displayInput, display_role: item.displayRole,
+          storage_message: item.storageMessage, model: item.model, provider: item.provider,
+          instructions: item.instructions, autonomous: true, background_delegation_enabled: false }, row.profile || 'default')
+        return { model: true }
+      }
+      if (!result || result.ok === false || result.started) throw new Error(String(result?.message || 'Command did not complete'))
+      const last = state.messages.at(-1)
+      const saved = getSessionDetail(row.id)?.messages.find(message => message.id === last?.id && message.role === 'command')
+      if (!saved || saved.content !== result.message) throw new Error('Loop command persistence readback failed')
+      return { response: '' }
+    },
+    emit: (sessionId, event, payload) => this.nsp.to(`session:${sessionId}`).emit(event, payload),
+    closing: () => this.closing,
+  })
+
+  async loopRecovery(marker: string, user: AuthenticatedUser | undefined, sessionId: string, profile: string, recovery: Record<string, unknown>) {
+    return this.loopRuntime.recoveryOperation(marker, user, sessionId, profile, recovery)
   }
 
   private async scheduleBackgroundNotification(notification: AgentBridgeBackgroundNotification) {
@@ -1974,6 +2023,14 @@ export class ChatRunSocket {
       return
     }
 
+    if (notification.profile !== (session.profile || 'default')) {
+      await releaseClaim()
+      return
+    }
+    try { this.socketForBackgroundRun(sessionId) } catch {
+      await releaseClaim()
+      return
+    }
     const state = await this.sessionStateForBackground(sessionId)
     if (!state) {
       await releaseClaim()
@@ -2023,6 +2080,7 @@ export class ChatRunSocket {
       source: resolveRunSource(session.source || undefined, sessionId),
       backgroundDelegationId: delegationId,
       backgroundClaimId: claimId,
+      backgroundNotificationKind: (notification as any).notification_kind === 'kanban' ? 'kanban' : undefined,
       autonomous: true,
     }
 
@@ -2041,6 +2099,7 @@ export class ChatRunSocket {
   private needsBackgroundPoll(): boolean {
     if (this.closing) return false
     if (this.backgroundRecoveryNeeded) return true
+    if (Date.now() >= this.backgroundRecoveryPollAt) return true
     if (Date.now() < this.backgroundActivityGraceUntil) return true
     for (const state of this.sessionMap.values()) {
       if (Object.values(state.backgroundDelegations || {})
@@ -2054,8 +2113,7 @@ export class ChatRunSocket {
   private backgroundRecoveryRoutes() {
     const cutoff = Math.floor(Date.now() / 1000) - 8 * 24 * 60 * 60
     const sessionsByProfile = new Map<string, string[]>()
-    for (const session of listSessions(undefined, undefined, 10_000)) {
-      if (session.last_active < cutoff) continue
+    for (const session of listRecoverySessionMetadata(cutoff)) {
       if (!isHermesWorkerBackedSession(session)) continue
       const profile = session.profile || 'default'
       const ids = sessionsByProfile.get(profile) || []
@@ -2069,7 +2127,9 @@ export class ChatRunSocket {
     if (this.closing || this.backgroundPollInFlight || Date.now() < this.backgroundPollRetryAt || !this.needsBackgroundPoll()) return
     this.backgroundPollInFlight = true
     try {
-      const recovering = this.backgroundRecoveryNeeded
+      // Kanban work can complete after all foreground workers have retired.
+      // Periodically rediscover bounded metadata routes, never message previews.
+      const recovering = this.backgroundRecoveryNeeded || Date.now() >= this.backgroundRecoveryPollAt
       const routes = recovering ? this.backgroundRecoveryRoutes() : undefined
       const result = await this.backgroundBridge.backgroundPoll(routes, { timeoutMs: recovering ? 120_000 : 1000 })
       if (this.closing) {
@@ -2086,6 +2146,7 @@ export class ChatRunSocket {
       const brokerChanged = Boolean(this.backgroundBrokerId && result.broker_id && result.broker_id !== this.backgroundBrokerId)
       if (result.broker_id) this.backgroundBrokerId = result.broker_id
       this.backgroundRecoveryNeeded = brokerChanged && !recovering
+      if (recovering) this.backgroundRecoveryPollAt = Date.now() + 30_000
       this.backgroundPollRetryAt = 0
       if ((result.pending_count || 0) > 0) {
         this.backgroundActivityGraceUntil = Date.now() + 310_000
@@ -2094,7 +2155,11 @@ export class ChatRunSocket {
         const sessionId = String(poll.session_id || '').trim()
         if (!sessionId) continue
         const state = await this.sessionStateForBackground(sessionId)
-        if (state) this.applyBackgroundSessionPoll(poll, state)
+        if (state) {
+          this.applyBackgroundSessionPoll(poll, state)
+          const sequence = Math.max(0, ...(poll.events || []).map((event: Record<string, unknown>) => Number(event.background_seq) || 0))
+          if (sequence && (poll as any).worker_key) await this.backgroundBridge.request({ action: 'background_events_ack', session_id: sessionId, profile: poll.profile, worker_key: (poll as any).worker_key, sequence })
+        }
       }
       for (const notification of result.notifications || []) {
         await this.scheduleBackgroundNotification(notification)
@@ -2595,6 +2660,7 @@ export class ChatRunSocket {
       reasoning_effort: next.reasoningEffort,
       background_delegation_id: next.backgroundDelegationId,
       background_claim_id: next.backgroundClaimId,
+      background_notification_kind: next.backgroundNotificationKind,
       autonomous: next.autonomous,
     }, runProfile, skipUserMessage, backgroundContinuationContext, next.pushTargetId)
   }
@@ -3292,6 +3358,7 @@ export class ChatRunSocket {
   async close() {
     if (this.closing) return
     this.closing = true
+    this.loopRuntime.close()
     this.stopUsageUpdates()
     for (const sessionId of this.sessionMap.keys()) this.finishTaskPlanRun(sessionId, 'abort.completed')
     if (this.backgroundPollTimer) {

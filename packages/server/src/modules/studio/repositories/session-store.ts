@@ -578,6 +578,18 @@ export function setSessionPushEnabled(id: string, enabled: boolean): boolean {
   return result.changes > 0
 }
 
+/** Recovery discovery must not load message previews for thousands of sessions. */
+export function listRecoverySessionMetadata(cutoff: number, limit = 10_000): HermesSessionRow[] {
+  if (!isSqliteAvailable()) return []
+  const rows = getDb()!.prepare(`
+    SELECT s.* FROM ${SESSIONS_TABLE} s
+    WHERE s.last_active >= ?
+    ORDER BY s.last_active DESC, s.id DESC
+    LIMIT ?
+  `).all(cutoff, limit) as Record<string, unknown>[]
+  return rows.map(mapSessionRow)
+}
+
 export function listSessions(
   profile?: string,
   source?: string,

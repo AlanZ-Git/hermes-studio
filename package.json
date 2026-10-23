@@ -9,7 +9,7 @@
   "homepage": "https://ekkostudio.xyz",
   "license": "BSL-1.1",
   "engines": {
-    "node": ">=23.0.0"
+    "node": ">=24.22.1"
   },
   "keywords": [
     "ekko-studio",

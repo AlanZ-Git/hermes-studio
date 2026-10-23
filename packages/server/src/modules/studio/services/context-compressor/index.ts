@@ -28,6 +28,7 @@ import {
   type PrimaryAgentBridgeRunResult as AgentBridgeRunResult,
 } from '../../public/chat-agent-runtime'
 import { logger } from '../../public/logging'
+import { createCompressionModelRunSource, closeModelRunSource } from '../chat-run/model-run-source'
 import { truncateToolResultForContext } from '../chat-run/tool-result-context'
 import { estimateUsageTokensFromMessages } from '../chat-run/usage'
 import {
@@ -52,7 +53,7 @@ export interface CompressionConfig {
   headMessageCount: number
   /** Number of recent messages to keep verbatim (default: 10) */
   tailMessageCount: number
-  /** Timeout for LLM summarization call (default: 300_000ms) */
+  /** Timeout for each primary/fallback summarization call (default: 600_000ms) */
   summarizationTimeoutMs: number
 }
 
@@ -61,7 +62,7 @@ export const DEFAULT_COMPRESSION_CONFIG: CompressionConfig = {
   summaryBudget: 8_000,
   headMessageCount: 0,
   tailMessageCount: 10,
-  summarizationTimeoutMs: 300_000,
+  summarizationTimeoutMs: 600_000,
 }
 
 export interface CompressedResult {
@@ -674,29 +675,28 @@ async function callHermesSummarizer(
 
   const bridge = createPrimaryAgentBridge({ timeoutMs: timeoutMs + 15_000 })
   const sessionId = `compress_${Date.now().toString(36)}_${randomUUID().replace(/-/g, '').slice(0, 12)}`
-  const workerKey = options.workerKey || `${profile}:compression:${sessionId}`
+  const binding = await createCompressionModelRunSource(options.sessionId, profile, sessionId)
   const message = SUMMARIZER_TRIGGER_MESSAGE
 
-  await writeSummarizerDebugDump({
-    writtenAt: new Date().toISOString(),
-    sessionId,
-    workerKey,
-    engine: 'hermes-agent',
-    profile,
-    model: options.model || null,
-    provider: options.provider || null,
-    message,
-    convHistory,
-  })
-
   try {
+    await writeSummarizerDebugDump({
+      writtenAt: new Date().toISOString(),
+      sessionId,
+      engine: 'hermes-agent',
+      profile,
+      model: options.model || null,
+      provider: options.provider || null,
+      message,
+      convHistory,
+    })
+
     const result = await bridge.request({
       action: 'chat',
       session_id: sessionId,
       message,
       conversation_history: convHistory,
       profile,
-      worker_key: workerKey,
+      model_run_auth: binding,
       source: 'api_server',
       wait: true,
       timeout: Math.ceil(timeoutMs / 1000),
@@ -709,15 +709,25 @@ async function callHermesSummarizer(
     }
 
     const payload = result.result as any
+    if (payload?.failed || payload?.error || payload?.interrupted) {
+      throw new Error('Summarization bridge payload failed')
+    }
     const output = String(
       payload?.final_response ||
       result.output ||
       '',
     ).trim()
     if (!output) throw new Error('Empty summarization response')
+    if (/^API call failed(?: after \d+ retries)?:/i.test(output)) {
+      throw new Error('Invalid summarization response: provider failure text')
+    }
     return output
   } finally {
-    await bridge.destroy(sessionId, profile, workerKey).catch(() => undefined)
+    try {
+      await bridge.request({ action: 'destroy', session_id: sessionId, profile, model_run_auth: binding })
+    } finally {
+      await closeModelRunSource(binding)
+    }
   }
 }
 
@@ -904,7 +914,8 @@ export class ChatContextCompressor {
       const prompt = buildIncrementalPrompt(previousSummary, contentToSummarize, this.config.summaryBudget)
 
       const t0 = Date.now()
-      summary = await callSummarizer(upstream, apiKey, prompt, [], this.config.summarizationTimeoutMs, previousSummary, summarizer)
+      const summaryOptions = { ...(typeof summarizer === 'string' ? { profile: summarizer } : summarizer), sessionId }
+      summary = await callSummarizer(upstream, apiKey, prompt, [], this.config.summarizationTimeoutMs, previousSummary, summaryOptions)
       logger.info('[context-compressor] incremental-llm done in %dms, %d chars', Date.now() - t0, summary.length)
     } catch (err: any) {
       if (force || resummarize) throw err
@@ -1021,7 +1032,8 @@ export class ChatContextCompressor {
     let summary: string | null = null
     try {
       const t0 = Date.now()
-      summary = await callSummarizer(upstream, apiKey, prompt, [], this.config.summarizationTimeoutMs, undefined, summarizer)
+      const summaryOptions = { ...(typeof summarizer === 'string' ? { profile: summarizer } : summarizer), sessionId }
+      summary = await callSummarizer(upstream, apiKey, prompt, [], this.config.summarizationTimeoutMs, undefined, summaryOptions)
       logger.info('[context-compressor] full-llm done in %dms, %d chars', Date.now() - t0, summary.length)
     } catch (err: any) {
       if (typeof summarizer === 'object' && summarizer.force) throw err

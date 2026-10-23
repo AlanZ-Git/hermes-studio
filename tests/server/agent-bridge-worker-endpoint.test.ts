@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 
 function runPython(script: string): any {
   try {
-    const output = execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', script], {
+    const output = execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', `import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path('packages/server/src/modules/hermes/services/bridge/python').resolve()))\n${script}`], {
       cwd: process.cwd(),
       encoding: 'utf-8',
       stdio: 'pipe',

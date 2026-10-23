@@ -42,6 +42,7 @@ export interface AgentBridgeRequestOptions {
 }
 
 export interface AgentBridgeChatOptions {
+  model_run_auth?: { version: 1; owner_id: string; profile: string; run_marker: string; token_path: string }
   force_compress?: boolean
   /** Agent-session creation policy. False keeps delegate_task available but
    * makes background=true fall back to synchronous execution. */
@@ -508,6 +509,7 @@ export class AgentBridgeClient {
   ): Promise<AgentBridgeChatStarted> {
     return this.request<AgentBridgeChatStarted>({
       action: 'chat',
+      ...(options.model_run_auth ? { model_run_auth: options.model_run_auth } : {}),
       session_id: sessionId,
       message,
       ...(options.storage_message !== undefined ? { storage_message: options.storage_message } : {}),
@@ -534,10 +536,11 @@ export class AgentBridgeClient {
     messages: unknown[],
     instructions?: string,
     profile?: string,
-    options: Pick<AgentBridgeChatOptions, 'model' | 'provider' | 'workspace' | 'background_delegation_enabled'> = {},
+    options: Pick<AgentBridgeChatOptions, 'model' | 'provider' | 'workspace' | 'background_delegation_enabled' | 'model_run_auth'> = {},
   ): Promise<AgentBridgeContextEstimate> {
     return this.request<AgentBridgeContextEstimate>({
       action: 'context_estimate',
+      ...(options.model_run_auth ? { model_run_auth: options.model_run_auth } : {}),
       session_id: sessionId,
       messages,
       ...(instructions ? { instructions } : {}),

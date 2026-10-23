@@ -131,6 +131,7 @@ vi.mock('../../packages/server/src/modules/studio/public/profile-config', () => 
 
 vi.mock('../../packages/server/src/modules/studio/public/auth', () => ({
   issueModelRunJwt: issueModelRunJwtMock,
+  authenticateUserToken: vi.fn(async () => ({ id: 1, username: 'fixture', role: 'super_admin' })),
 }))
 
 function makeSocket() {
@@ -139,7 +140,7 @@ function makeSocket() {
     emit: vi.fn(),
     join: vi.fn(),
     to: vi.fn(() => ({ emit: vi.fn() })),
-    data: {},
+    data: { user: { id: 1, username: 'fixture', role: 'super_admin' } },
   } as any
 }
 
@@ -590,11 +591,12 @@ describe('bridge run final context usage', () => {
       [],
       expect.not.stringContaining('[Current Hermes profile:'),
       'default',
-      {
+      expect.objectContaining({
         model: 'gpt-test',
         provider: 'openai',
         workspace: bridgeWorkspace(),
-      },
+        model_run_auth: expect.objectContaining({ version: 1, owner_id: '1', profile: 'default' }),
+      }),
     )
     expect(bridge.chat).toHaveBeenCalledWith(
       'session-1',
@@ -1032,7 +1034,7 @@ describe('bridge run final context usage', () => {
     }))
   })
 
-  it('stores a super admin model-run token for the profile without adding it to bridge instructions', async () => {
+  it('stores an independently bound super admin model-run source without adding it to bridge instructions', async () => {
     const emit = vi.fn()
     const nsp = makeNamespace(emit)
     const socket = makeSocket()
@@ -1068,7 +1070,10 @@ describe('bridge run final context usage', () => {
 
     const instructions = bridge.contextEstimate.mock.calls[0][2]
     expect(issueModelRunJwtMock).toHaveBeenCalledWith({ id: 1, username: 'admin', role: 'super_admin' })
-    expect(readFileSync(join(process.env.HERMES_WEB_UI_HOME || '', 'profiles', 'default', '.model-run-token'), 'utf-8').trim()).toBe('model-run-token')
+    const binding = bridge.chat.mock.calls[0][5].model_run_auth
+    expect(binding).toMatchObject({ version: 1, owner_id: '1', profile: 'default', run_marker: expect.any(String) })
+    expect(JSON.parse(readFileSync(binding.token_path, 'utf8'))).toEqual({ binding, token: 'model-run-token', active: true })
+    expect(bridge.contextEstimate.mock.calls[0][4].model_run_auth).toEqual(binding)
     expect(instructions).not.toContain('[Current Hermes profile:')
     expect(instructions).not.toContain('Current working directory')
     expect(instructions).not.toContain('pass the current Hermes profile as the profile argument')
@@ -1077,6 +1082,25 @@ describe('bridge run final context usage', () => {
     expect(instructions).not.toContain('token argument')
     expect(instructions).not.toContain('list_mcp_resources')
     expect(instructions).not.toContain('mcp__hermes-studio__')
+  })
+
+  it('marks loop dispatch uncertain before awaiting a bridge chat response', async () => {
+    const emit = vi.fn()
+    const state = makeState()
+    const order: string[] = []
+    const bridge = {
+      contextEstimate: vi.fn().mockResolvedValue({ token_count: 10, fixed_context_tokens: 5 }),
+      chat: vi.fn(async () => { order.push('chat'); throw new Error('response lost after send') }),
+    } as any
+    const { handleBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
+    await handleBridgeRun(makeNamespace(emit), makeSocket(), {
+      session_id: 'session-1', input: 'inspect once',
+      loopBeforeDispatch: async () => { order.push('inject') },
+      loopDispatchConfirmed: () => { order.push('dispatch-uncertain') },
+    }, 'default', new Map([['session-1', state]]), bridge, false, vi.fn(), vi.fn())
+    expect(order).toEqual(['inject', 'dispatch-uncertain', 'chat'])
+    expect(bridge.chat).toHaveBeenCalledOnce()
+    expect(emit).toHaveBeenCalledWith('run.failed', expect.objectContaining({ error: 'response lost after send' }))
   })
 
   it('creates global-agent bridge sessions with source global_agent', async () => {
@@ -1489,7 +1513,7 @@ describe('bridge run final context usage', () => {
     }))
   })
 
-  it('uses cached fixed context instead of bridge estimate when available', async () => {
+  it('uses streamed fixed context at completion after the authenticated preflight estimate', async () => {
     const emit = vi.fn()
     const nsp = makeNamespace(emit)
     const socket = makeSocket()
@@ -1527,7 +1551,8 @@ describe('bridge run final context usage', () => {
       vi.fn(),
     )
 
-    expect(bridge.contextEstimate).not.toHaveBeenCalled()
+    expect(bridge.contextEstimate).toHaveBeenCalledTimes(1)
+    expect(bridge.contextEstimate.mock.calls[0][4].model_run_auth).toEqual(bridge.chat.mock.calls[0][5].model_run_auth)
     expect(updateMessageContextTokenUsageMock).toHaveBeenCalledWith(
       'session-1',
       state,
@@ -2217,6 +2242,42 @@ describe('bridge run final context usage', () => {
       content: 'later B/C conversation',
     }))
     expect(state.backgroundContinuationContexts['delegation-1']).toBeUndefined()
+  })
+
+  it('persists hidden Kanban input before dispatch and retains earlier notification history', async () => {
+    const state = makeState()
+    const emit = vi.fn()
+    const input = 'Synthetic Kanban completion: task finished'
+    const previous = [
+      { role: 'user', content: 'Original request' },
+      { role: 'user', content: 'Earlier hidden notification' },
+      { role: 'assistant', content: 'Earlier notification answer' },
+    ]
+    addMessageMock.mockReturnValueOnce(101)
+    buildCompressedHistoryMock.mockResolvedValueOnce(previous)
+    const bridge = {
+      contextEstimate: vi.fn().mockResolvedValue({ token_count: 100 }),
+      chat: vi.fn().mockImplementation(async () => {
+        expect(addMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+          role: 'user', content: input, display_role: 'internal', display_content: '',
+        }))
+        expect(state.messages).toContainEqual(expect.objectContaining({ id: 101, content: input, display_role: 'internal' }))
+        return { run_id: 'notify-run', status: 'started' }
+      }),
+      completeBackgroundNotification: vi.fn().mockResolvedValue({ completed: true }),
+      streamOutput: vi.fn(async function* () {
+        yield { run_id: 'notify-run', done: true, status: 'complete', output: 'Notification answer' }
+      }),
+    } as any
+    const { handleBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
+    await handleBridgeRun(makeNamespace(emit), makeSocket(), {
+      input, display_input: null, session_id: 'session-1',
+      background_delegation_id: 'kanban:default:synthetic:10', background_claim_id: 'claim',
+      background_notification_kind: 'kanban', autonomous: true,
+    }, 'default', new Map([['session-1', state]]), bridge, true, vi.fn(), vi.fn())
+    expect(bridge.chat).toHaveBeenCalledWith('session-1', input, previous, expect.any(String), 'default', expect.any(Object))
+    expect(bridge.completeBackgroundNotification).toHaveBeenCalled()
+    expect(buildCompressedHistoryMock).toHaveBeenCalled()
   })
 
   it('rejects a recovered Hermes callback when its process-local origin history is gone', async () => {

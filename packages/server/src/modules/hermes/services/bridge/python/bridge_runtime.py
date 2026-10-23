@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import errno
 import importlib.util
 import json
@@ -16,6 +17,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
+from bridge_model_run_auth import ModelRunAuth
 
 DEFAULT_ENDPOINT = "tcp://127.0.0.1:18765" if os.name == "nt" else "ipc:///tmp/hermes-agent-bridge.sock"
 DEFAULT_AGENT_ROOT = "~/.hermes/hermes-agent"
@@ -647,6 +649,8 @@ def _refresh_worker_profile_env() -> None:
     os.environ["HERMES_HOME"] = str(profile_home)
     values = _read_dotenv(profile_home / ".env")
     for key, value in values.items():
+        if key == "HERMES_WEB_UI_MODEL_RUN_AUTH":
+            continue  # trusted per-worker launch descriptor cannot be a profile override
         os.environ[key] = value
     _refresh_terminal_env()
 
@@ -741,36 +745,14 @@ def _refresh_approval_allowlist() -> None:
 
 
 def _install_execute_code_approval_memory_patch() -> None:
-    """Let bridge-scoped execute_code approvals honor session/permanent choices.
-
-    Hermes Agent intentionally treats execute_code approvals as one-shot in
-    gateway/ask mode.  Web UI keeps HERMES_EXEC_ASK enabled so dangerous
-    terminal commands still require approval, but users expect the visible
-    Session/Always choices to suppress later execute_code prompts as well.  Keep
-    this compatibility layer in the bridge so the upstream runtime stays
-    untouched.
-    """
-    try:
-        import tools.approval as approval
-
-        original = getattr(approval, "check_execute_code_guard", None)
-        if not callable(original) or getattr(original, "_hermes_web_ui_memory_patch", False):
-            return
-
-        def patched_check_execute_code_guard(code: str, env_type: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
-            try:
-                session_key = approval.get_current_session_key(default="")
-                if session_key and approval.is_approved(session_key, "execute_code"):
-                    return {"approved": True, "message": None}
-            except Exception:
-                pass
-            return original(code, env_type, *args, **kwargs)
-
-        setattr(patched_check_execute_code_guard, "_hermes_web_ui_memory_patch", True)
-        setattr(patched_check_execute_code_guard, "_hermes_web_ui_original", original)
-        approval.check_execute_code_guard = patched_check_execute_code_guard
-    except Exception:
-        pass
+    """Core owns memory and unattended floors; retire the legacy early bypass."""
+    import tools.approval as approval
+    guard = approval.check_execute_code_guard
+    if getattr(guard, "_hermes_web_ui_memory_patch", False):
+        original = getattr(guard, "_hermes_web_ui_original", None)
+        if not callable(original):
+            raise RuntimeError("legacy approval wrapper has no original guard")
+        approval.check_execute_code_guard = original
 
 
 def _approval_pattern_keys(approval_data: dict[str, Any]) -> list[str]:
@@ -785,21 +767,8 @@ def _approval_pattern_keys(approval_data: dict[str, Any]) -> list[str]:
 
 
 def _persist_execute_code_approval_choice(session_id: str, pattern_keys: list[str], choice: str) -> None:
-    if "execute_code" not in pattern_keys or choice not in {"session", "always"}:
-        return
-    try:
-        from tools.approval import approve_permanent, approve_session, load_permanent_allowlist, save_permanent_allowlist
-        import tools.approval as approval
-
-        approve_session(session_id, "execute_code")
-        if choice == "always":
-            approve_permanent("execute_code")
-            permanent = getattr(approval, "_permanent_approved", None)
-            patterns = set(permanent) if isinstance(permanent, set) else set(load_permanent_allowlist())
-            patterns.add("execute_code")
-            save_permanent_allowlist(patterns)
-    except Exception:
-        pass
+    """Compatibility entrypoint: persistence belongs solely to the Core caller."""
+    return None
 
 
 def _resolve_model(cfg: dict[str, Any]) -> str:
@@ -881,25 +850,78 @@ def _load_enabled_toolsets() -> list[str] | None:
         return None
 
 
-def _discover_bridge_mcp_tools() -> list[str]:
+def _bound_bridge_mcp_configs(cfg: dict[str, Any], binding: ModelRunAuth, session_id: str | None = None) -> dict[str, Any]:
+    recovery_run = binding.run_marker.startswith("recovery_v1_")
+    servers = {} if recovery_run else copy.deepcopy(cfg.get("mcp_servers") or {})
+    if not isinstance(servers, dict):
+        raise ValueError("mcp_servers must be a mapping")
+    names = {
+        "ekko-studio-api", "ekko-studio-browser", "ekko-studio-devices", "ekko-studio-use", "ekko-studio-plan",
+        "hermes-studio-api", "hermes-studio-browser", "hermes-studio-devices", "hermes-studio-use",
+        "hermes-studio-mcp", "hermes-studio", "hermes-web-ui-mcp", "ekko-studio-mcp",
+    }
+    for name, server in servers.items():
+        if not isinstance(server, dict):
+            continue
+        env = server.get("env") or {}
+        if not isinstance(env, dict):
+            raise ValueError("MCP env must be a mapping")
+        managed = name in names or str(env.get("HERMES_WEB_UI_MANAGED_MCP", "")) == "1"
+        args = server.get("args") or []
+        managed = managed or Path(str(server.get("command") or "")).name in names
+        managed = managed or any(Path(str(arg)).name in {"ekko-studio-mcp.mjs", "hermes-web-ui-mcp.mjs"} for arg in args)
+        if managed:
+            if server.get("url"):
+                raise RuntimeError("managed MCP requires a bound stdio launch environment")
+            server["env"] = {**env, "HERMES_WEB_UI_REQUIRE_MODEL_RUN_AUTH": "1",
+                             "HERMES_WEB_UI_MODEL_RUN_AUTH": binding.serialized(),
+                             "HERMES_WEB_UI_PROFILE": binding.profile}
+        # Preserve enabled/disabled verbatim: never turn a disabled entry on.
+    if session_id:
+        bridge_path = Path(__file__).resolve()
+        roots = [bridge_path.parents[4]]
+        if bridge_path.parent.name == "python" and len(bridge_path.parents) > 8:
+            roots.append(bridge_path.parents[8])
+        script = next((root / "bin" / "ekko-studio-mcp.mjs" for root in roots
+                       if (root / "bin" / "ekko-studio-mcp.mjs").is_file()), roots[0] / "bin" / "ekko-studio-mcp.mjs")
+        node = shutil.which("node")
+        if not script.is_file() or not node:
+            raise RuntimeError("Bundled session API launcher unavailable")
+        # Separate run-local capability, not a rewrite of disabled profile MCPs.
+        servers["webui-session-api"] = {
+            "command": node, "args": [str(script), "api"], "enabled": True,
+            "tools": {"include": ["ekko_studio_api_openapi_get", "ekko_studio_api_request"]},
+            "env": {
+                "HERMES_WEB_UI_MANAGED_MCP": "1",
+                "HERMES_WEB_UI_REQUIRE_MODEL_RUN_AUTH": "1",
+                "HERMES_WEB_UI_MODEL_RUN_AUTH": binding.serialized(),
+                "HERMES_WEB_UI_PROFILE": binding.profile,
+                "HERMES_STUDIO_SESSION_ID": session_id,
+                "HERMES_WEB_UI_API_SCOPE": "current-session-recovery" if recovery_run else "current-session-loop",
+                "HERMES_WEB_UI_URL": "http://127.0.0.1:" + os.environ.get("PORT", "8648"),
+                "HERMES_MCP_SERVER_NAME": "webui-session-api",
+            },
+        }
+    return servers
+
+
+def _discover_bridge_mcp_tools(model_run_auth: Any = None, session_id: str | None = None) -> list[str]:
+    # Startup diagnostics and independent estimates cannot borrow shared files.
+    if model_run_auth is None:
+        return []
+    binding = ModelRunAuth.parse(model_run_auth)
     _ensure_agent_imports()
     try:
         try:
-            from tools.mcp_tool_discovery import discover_mcp_tools
+            from tools.mcp_tool_discovery import register_mcp_servers
         except ModuleNotFoundError as exc:
             if exc.name != "tools.mcp_tool_discovery":
                 raise
-            from tools.mcp_tool import discover_mcp_tools
-
-        tools = discover_mcp_tools()
-        return list(tools) if isinstance(tools, list) else []
-    except Exception as exc:
-        print(
-            f"[hermes_bridge] MCP tool discovery failed: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return []
+            from tools.mcp_tool import register_mcp_servers
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError("Core lacks explicit MCP config registration; refusing unbound discovery") from exc
+    tools = register_mcp_servers(_bound_bridge_mcp_configs(_load_cfg(), binding, session_id))
+    return list(tools) if isinstance(tools, list) else []
 
 
 def _log_worker_startup_context(profile: str | None) -> None:

@@ -133,7 +133,12 @@ export class TaskPlanRuns {
 
 }
 
+function taskPlanInjectionDisabled(): boolean {
+  return ['1', 'true', 'yes', 'on'].includes(String(process.env.HERMES_WEB_UI_DISABLE_TASK_PLAN_INJECTION || '').trim().toLowerCase())
+}
+
 export function taskPlanRunInstruction(): string {
+  if (taskPlanInjectionDisabled()) return ''
   return `For multi-step work, maintain the user's Studio task card with ekko_studio_update_plan from the dedicated ekko-studio-interaction MCP server. Call the tool directly; it is not inside ekko_studio_use_toolset. If tools are deferred, search for ekko-studio-interaction / update_plan and use the exact discovered tool name (including its MCP prefix). The latest input supplies the current context_id; never reuse a context from history. Send the complete ordered plan each time, with stable step ids and statuses pending, in_progress, or completed; at most one step may be in_progress. Create the plan before substantial work and update it as work advances. Mark steps completed only after verification. Skip planning for simple one-step requests unless the user explicitly asks for a plan or task card. Prefer this shared tool over native todo/planning tools so progress appears in Studio and App.`
 }
 
@@ -144,12 +149,13 @@ Keep one goal per user outcome. Reuse its id for follow-ups, refinements, correc
 
 /** Attach changing run metadata to the latest input, outside cached system prompts. */
 export function taskPlanTurnInstruction(contextId: string, sessionTasksEnabled = false): string {
+  if (taskPlanInjectionDisabled()) return ''
   return `<studio_task_plan_context>\n${taskPlanRunInstruction()}\nCurrent turn context_id="${contextId}". This supersedes all older task-plan contexts and discovery instructions, including cached system instructions.\n</studio_task_plan_context>`
     + (sessionTasksEnabled ? `\n\n<studio_session_tasks_context>\n${sessionTasksRunInstruction()}\nCurrent turn context_id="${contextId}". This supersedes all older session-task contexts.\n</studio_session_tasks_context>` : '')
 }
 
 export function withTaskPlanTurnContext<T extends { type: string; text?: string }>(message: string | T[], contextId?: string, sessionTasksEnabled = false): string | Array<T | { type: 'text'; text: string }> {
-  if (!contextId) return message
+  if (!contextId || taskPlanInjectionDisabled()) return message
   const text = taskPlanTurnInstruction(contextId, sessionTasksEnabled)
   return typeof message === 'string' ? `${message}\n\n${text}` : [...message, { type: 'text', text }]
 }

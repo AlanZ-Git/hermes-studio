@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from bridge_pool import AgentPool
+from bridge_model_run_auth import ModelRunAuth
 from bridge_runtime import (
     _agent_root,
     _apply_profile_env,
@@ -27,7 +28,7 @@ from bridge_runtime import (
     _start_parent_process_watchdog,
     _worker_profile,
 )
-from bridge_transport import _make_listen_socket, _read_json_request, _write_json_response
+from bridge_transport import _make_listen_socket, _read_json_request, _write_json_response, _socket_identity, _unlink_owned_endpoint
 
 class BridgeServer:
     IDLE_TIMEOUT_SECONDS = 30 * 60  # 30 minutes
@@ -37,12 +38,24 @@ class BridgeServer:
         self.endpoint = endpoint
         self.pool = AgentPool()
         self._stop = threading.Event()
-        self._last_gc = time.time()
+        self._last_gc = time.monotonic()
+        self._admission_lock = threading.RLock()
 
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
+        with self._admission_lock:
+            if self.pool._retired and req.get("action") not in {"shutdown", "ping", "prepare_retire", "lifecycle_snapshot"}:
+                raise RuntimeError("worker retired")
+            return self._handle(req)
+
+    def _handle(self, req: dict[str, Any]) -> dict[str, Any]:
         action = str(req.get("action") or "").strip()
         if not action:
             raise ValueError("action is required")
+        worker_binding = getattr(self.pool, "_model_run_auth", None)
+        if worker_binding is not None and action not in {"ping", "shutdown", "destroy_all", "list"}:
+            binding = ModelRunAuth.parse(req.get("model_run_auth"), worker_binding.profile)
+            if binding != worker_binding:
+                raise ValueError("model_run_auth worker descriptor mismatch")
 
         if action == "ping":
             with self.pool._lock:
@@ -92,16 +105,17 @@ class BridgeServer:
                 source,
                 reasoning_effort,
                 background_delegation_enabled,
+                model_run_auth=req.get("model_run_auth"),
             )
             if req.get("wait"):
                 timeout = float(req.get("timeout", 0) or 0)
                 deadline = time.time() + timeout if timeout > 0 else None
-                while record.status == "running":
+                while self.pool.get_output(record.run_id)["done"] is False:
                     if deadline is not None and time.time() >= deadline:
                         break
                     time.sleep(0.05)
                 return self.pool.get_result(record.run_id)
-            return {"run_id": record.run_id, "session_id": session_id, "status": record.status}
+            return {"run_id": record.run_id, "session_id": session_id, "status": self.pool.get_result(record.run_id)["status"]}
 
         if action == "context_estimate":
             session_id = str(req.get("session_id") or "").strip() or uuid.uuid4().hex
@@ -123,6 +137,7 @@ class BridgeServer:
                 provider=req.get("provider"),
                 workspace=req.get("workspace"),
                 background_delegation_enabled=background_delegation_enabled,
+                model_run_auth=req.get("model_run_auth"),
             )
 
         if action == "provider_credentials":
@@ -178,6 +193,18 @@ class BridgeServer:
                     "relogin_required": bool(getattr(exc, "relogin_required", False)),
                 }
 
+        if action == "lifecycle_snapshot":
+            return self.pool.lifecycle_snapshot()
+
+        if action == "prepare_retire":
+            return self.pool.prepare_retire()
+
+        if action == "result_ack":
+            return self.pool.acknowledge_result(str(req.get("run_id") or ""), req.get("cursor"), req.get("event_cursor"))
+
+        if action == "background_events_ack":
+            return self.pool.acknowledge_background_events(str(req.get("session_id") or ""), req.get("sequence"))
+
         if action == "get_result":
             return self.pool.get_result(str(req.get("run_id") or ""))
 
@@ -212,7 +239,9 @@ class BridgeServer:
             approval_id = str(req.get("approval_id") or "").strip()
             if not approval_id:
                 raise ValueError("approval_id is required")
-            return self.pool.respond_approval(approval_id, str(req.get("choice") or "deny"))
+            return self.pool.respond_approval(approval_id, str(req.get("choice") or "deny"),
+                session_id=str(req.get("session_id") or ""), profile=str(req.get("profile") or ""),
+                run_id=str(req.get("run_id") or "") or None)
 
         if action == "clarify_respond":
             clarify_id = str(req.get("clarify_id") or "").strip()
@@ -253,6 +282,9 @@ class BridgeServer:
                 str(req.get("command") or ""),
                 req.get("profile"),
             )
+
+        if action == 'loop_operation':
+            return self.pool.loop_operation(req)
 
         if action == "skills_reload":
             return self._reload_skills(req.get("profile"))
@@ -329,6 +361,8 @@ class BridgeServer:
 
         # ───── MCP Management (forwarded from broker) ─────
         if action.startswith("mcp_"):
+            if getattr(self.pool, "_model_run_auth", None) is not None:
+                raise ValueError("managed MCP changes require a new bound worker")
             return self._handle_mcp_action(action, req, req.get("profile"))
 
         raise ValueError(f"unknown action: {action}")
@@ -735,23 +769,16 @@ class BridgeServer:
         _write_json_response(conn, resp)
 
     def _gc_idle_sessions(self) -> None:
-        """Destroy sessions idle longer than IDLE_TIMEOUT_SECONDS."""
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_gc < self.GC_INTERVAL_SECONDS:
             return
         self._last_gc = now
-        with self.pool._lock:
-            idle_ids = [
-                sid for sid, s in self.pool._sessions.items()
-                if not s.running and now - s.last_used_at > self.IDLE_TIMEOUT_SECONDS
-            ]
-        for sid in idle_ids:
-            if self.pool.has_active_background_for_session(sid):
-                continue
-            self.pool.destroy(sid)
+        with self._admission_lock:
+            self.pool.gc_idle_sessions(time.time() - self.IDLE_TIMEOUT_SECONDS)
 
     def serve_forever(self) -> None:
         server = self._make_server_socket()
+        socket_identity = _socket_identity(self.endpoint)
         restore_signals = _install_stop_signal_handlers(self._stop)
         _start_parent_process_watchdog(
             _positive_int(os.environ.get("HERMES_AGENT_BRIDGE_BROKER_PID")),
@@ -761,7 +788,7 @@ class BridgeServer:
         try:
             server.listen(16)
             server.settimeout(0.2)
-            print(json.dumps({"event": "ready", "endpoint": self.endpoint}), flush=True)
+            print(json.dumps({"event": "ready", "endpoint": self.endpoint, "socket_identity": socket_identity}), flush=True)
 
             while not self._stop.is_set():
                 conn: socket.socket | None = None
@@ -787,6 +814,7 @@ class BridgeServer:
                 except Exception as exc:
                     print(f"[hermes-bridge] server loop error: {exc}", file=sys.stderr, flush=True)
                 finally:
+                    self._gc_idle_sessions()
                     if conn is not None:
                         try:
                             conn.close()
@@ -795,8 +823,4 @@ class BridgeServer:
         finally:
             restore_signals()
             server.close()
-            if self.endpoint.startswith("ipc://"):
-                try:
-                    Path(self.endpoint.removeprefix("ipc://")).unlink(missing_ok=True)
-                except OSError:
-                    pass
+            _unlink_owned_endpoint(self.endpoint, socket_identity)

@@ -23,6 +23,36 @@ describe('compression cursor persistence', () => {
     vi.resetModules()
   })
 
+  it('rebuilds hidden notification causes after reload and preserves the next user turn', async () => {
+    const { createSession, addMessage, getSessionDetail } = await import('../../packages/server/src/modules/studio/repositories/session-store')
+    const { buildDbHistory } = await import('../../packages/server/src/modules/studio/services/chat-run/context-history')
+    createSession({ id: 'notify', source: 'cli' })
+    const messages = [
+      { role: 'user', content: 'Original goal' },
+      { role: 'user', content: 'Synthetic notification', display_role: 'internal', display_content: '' },
+      { role: 'assistant', content: 'Notification consumed' },
+      { role: 'user', content: 'Next ordinary question' },
+    ]
+    for (const [index, message] of messages.entries()) addMessage({ session_id: 'notify', ...message, timestamp: index + 1 })
+    const reloaded = getSessionDetail('notify')!
+    expect(reloaded.messages.map(message => [message.role, message.content])).toEqual(messages.map(message => [message.role, message.content]))
+    expect(reloaded.messages[1]).toMatchObject({ role: 'user', display_role: 'internal', display_content: '' })
+    expect(buildDbHistory('notify').map(message => [message.role, message.content])).toEqual(messages.map(message => [message.role, message.content]))
+    expect(buildDbHistory('notify', { excludeLastUser: true }).map(message => message.content)).toEqual(messages.slice(0, 3).map(message => message.content))
+  })
+
+  it('discovers cold recovery routes without querying any message bodies or previews', async () => {
+    const store = await import('../../packages/server/src/modules/studio/repositories/session-store')
+    store.createSession({ id: 'recent', source: 'cli', profile: 'research', user_id: 7 })
+    store.createSession({ id: 'old', source: 'cli', profile: 'research' })
+    store.updateSession('recent', { last_active: 200 })
+    store.updateSession('old', { last_active: 10 })
+    db.exec('DROP TABLE messages')
+    expect(store.listRecoverySessionMetadata(100)).toEqual([
+      expect.objectContaining({ id: 'recent', profile: 'research', user_id: '7', last_active: 200 }),
+    ])
+  })
+
   it('stores a stable cursor while retaining legacy diagnostics', async () => {
     const { addMessage, createSession } = await import('../../packages/server/src/modules/studio/repositories/session-store')
     const { getCompressionSnapshot, saveCompressionSnapshot } = await import('../../packages/server/src/modules/studio/repositories/compression-snapshot')

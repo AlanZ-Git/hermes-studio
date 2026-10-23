@@ -154,6 +154,7 @@ export const HERMES_MCP_USAGE_GUIDELINES = [
 ];
 
 export function studioMcpUsageGuidelines(capabilities?: StudioMcpCapabilities): string {
+  if (['1', 'true', 'yes', 'on'].includes(String(process.env.HERMES_WEB_UI_DISABLE_MCP_GUIDANCE || '').trim().toLowerCase())) return ''
   if (!capabilities) return ''
   const rules: string[] = []
   if (capabilities.api) rules.push(...HERMES_MCP_USAGE_GUIDELINES.slice(0, 3))

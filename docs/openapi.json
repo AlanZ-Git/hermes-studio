@@ -12550,6 +12550,44 @@
         "x-session-share-permission": "upload"
       }
     },
+    "/api/studio/chat-run/loop-recovery": {
+      "post": {
+        "tags": [
+          "Chat Run"
+        ],
+        "summary": "Create loop-recovery",
+        "description": "POST /api/studio/chat-run/loop-recovery",
+        "operationId": "loopRecovery",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/studio/chat-run/runs": {
       "post": {
         "tags": [

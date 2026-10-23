@@ -1,10 +1,23 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseTaskPlanUpdate, TaskPlanRuns, taskPlanRunInstruction, taskPlanTurnInstruction, withTaskPlanTurnContext } from '../../packages/server/src/modules/studio/services/task-plan-runs'
 
 const steps = () => ({ plan: [
   { id: 'inspect', step: 'Inspect', status: 'completed' },
   { id: 'verify', step: 'Verify', status: 'in_progress' },
 ] })
+
+afterEach(() => vi.unstubAllEnvs())
+
+it('honors the installed task-plan injection opt-out while leaving explicit plan APIs available', () => {
+  vi.stubEnv('HERMES_WEB_UI_DISABLE_TASK_PLAN_INJECTION', '1')
+  const blocks = [{ type: 'text', text: 'Original request' }]
+  expect(withTaskPlanTurnContext('Original request', 'turn-one', true)).toBe('Original request')
+  expect(withTaskPlanTurnContext(blocks, 'turn-one', true)).toBe(blocks)
+  expect(taskPlanTurnInstruction('turn-one', true)).toBe('')
+  expect(taskPlanRunInstruction()).toBe('')
+  const { runs, contextId } = harness()
+  expect(runs.update(contextId, 'research', steps()).plan).toHaveLength(2)
+})
 function harness() {
   const commit = vi.fn()
   const publish = vi.fn()

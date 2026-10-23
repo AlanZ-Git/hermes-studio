@@ -7,6 +7,7 @@ function runPython(script: string): void {
       cwd: process.cwd(),
       encoding: 'utf-8',
       stdio: 'pipe',
+      timeout: 25_000,
     })
   } catch (error) {
     const err = error as { stdout?: string; stderr?: string; message?: string }
@@ -83,6 +84,8 @@ approval._notify = {}
 approval._resolved_gateway = []
 approval._resolved_gateway_requests = []
 approval._gateway_waiters = {}
+approval._lock = threading.Lock()
+approval._gateway_queues = {}
 approval._session_approved = {}
 approval._session_yolo = set()
 approval._permanent_approved = set()
@@ -106,6 +109,26 @@ def unregister_gateway_notify(session_key):
 
 def queue_gateway_approval(session_key, request_id):
     approval._gateway_waiters.setdefault(session_key, []).append(request_id)
+    entry = types.SimpleNamespace(data={"request_id":request_id,"timeout_ms":120000,"deadline_ms":int((time.time()+120)*1000)}, deadline=time.monotonic()+120, result=None, settle=None)
+    with approval._lock:
+        approval._gateway_queues.setdefault(session_key, []).append(entry)
+
+def register_gateway_settle(session_key, request_id, settle):
+    with approval._lock:
+        for entry in approval._gateway_queues.get(session_key, []):
+            if entry.data["request_id"] == request_id:
+                entry.settle = settle
+                return True
+    return False
+
+def finish_gateway_wait(session_key, request_id):
+    # Core's waiter settles outside the non-reentrant lock, not the resolver.
+    with approval._lock:
+        entries = approval._gateway_queues.get(session_key, [])
+        entry = next(e for e in entries if e.data["request_id"] == request_id)
+        entries.remove(entry)
+    if entry.settle:
+        entry.settle("answered" if entry.result else "cancelled")
 
 def resolve_gateway_approval(session_key, choice, request_id=None):
     waiters = approval._gateway_waiters.get(session_key, [])
@@ -118,6 +141,11 @@ def resolve_gateway_approval(session_key, choice, request_id=None):
         resolved_request_id = None
     approval._resolved_gateway.append((session_key, choice))
     approval._resolved_gateway_requests.append((session_key, choice, request_id, resolved_request_id))
+    if resolved_request_id:
+        with approval._lock:
+            for entry in approval._gateway_queues.get(session_key, []):
+                if entry.data["request_id"] == resolved_request_id:
+                    entry.result = choice
     return 1 if resolved_request_id else 0
 
 def is_approved(session_key, pattern_key):
@@ -158,6 +186,7 @@ approval.get_current_session_key = get_current_session_key
 approval.register_gateway_notify = register_gateway_notify
 approval.unregister_gateway_notify = unregister_gateway_notify
 approval.resolve_gateway_approval = resolve_gateway_approval
+approval.register_gateway_settle = register_gateway_settle
 approval.queue_gateway_approval = queue_gateway_approval
 approval.is_approved = is_approved
 approval.approve_session = approve_session
@@ -169,6 +198,14 @@ approval.save_permanent_allowlist = save_permanent_allowlist
 approval.load_permanent_allowlist = load_permanent_allowlist
 approval.check_execute_code_guard = check_execute_code_guard
 sys.modules["tools.approval"] = approval
+
+# New Core owns the contextvar in approval_context (approval re-exports readers).
+approval_context = types.ModuleType("tools.approval_context")
+approval_context.set_current_session_key = set_current_session_key
+approval_context.reset_current_session_key = reset_current_session_key
+approval_context.get_current_session_key = get_current_session_key
+approval_context._get_approval_timeout = lambda: 120
+sys.modules["tools.approval_context"] = approval_context
 
 path = Path("packages/server/src/modules/hermes/services/bridge/python/hermes_bridge.py")
 spec = importlib.util.spec_from_file_location("hermes_bridge", path)
@@ -214,6 +251,15 @@ def make_pool():
     fake_db = FakeDb()
     pool._db = FakeDbHolder(fake_db)
     return pool, fake_db
+
+def add_active_run(pool, sid, rid=None):
+    rid = rid or f"approval-{sid}"
+    session = pool._sessions.get(sid) or bridge.AgentSession(session_id=sid, agent=object())
+    session.current_run_id = rid
+    session.running = True
+    pool._sessions[sid] = session
+    pool._runs[rid] = bridge.RunRecord(run_id=rid, session_id=sid)
+    return session
 
 def start_manual_run(pool, session_id, agent, message=None, workspace=None):
     session = bridge.AgentSession(session_id=session_id, agent=agent)
@@ -384,6 +430,7 @@ threads = []
 for sid, run_id in (("session-a", "run-previous"), ("session-a", "run-current"), ("session-b", "run-current")):
     with pool._lock:
         pool._sessions[sid].current_run_id = run_id
+        pool._runs[run_id] = bridge.RunRecord(run_id=run_id, session_id=sid)
     thread = threading.Thread(
         target=lambda current=sid, generation=run_id: choices.__setitem__(
             f"{current}:{generation}",
@@ -419,6 +466,7 @@ pool._gateway_approval_notify("session-a")({
 })
 with pool._lock:
     pool._sessions["session-a"].current_run_id = "run-later"
+    pool._runs["run-later"] = bridge.RunRecord(run_id="run-later", session_id="session-a")
 approval.queue_gateway_approval("session-a", "request-later")
 pool._gateway_approval_notify("session-a")({
     "request_id": "request-later",
@@ -439,6 +487,7 @@ assert result["status"] == "interrupted"
 threads[1].join(timeout=5)
 assert not threads[1].is_alive()
 assert choices["session-a:run-current"] == "deny"
+finish_gateway_wait("session-a", "request-current")
 assert threads[0].is_alive()
 with pool._lock:
     assert set(pool._approval_request_generations.values()) == {
@@ -461,8 +510,11 @@ assert approval._gateway_waiters == {
     "session-b": ["request-other-session"],
 }
 
-assert pool.respond_approval(previous_id, "deny")["resolved"] is True
-assert pool.respond_approval(other_session_id, "deny")["resolved"] is True
+assert pool.respond_approval(previous_id, "deny", session_id="session-a", profile="default")["resolved"] is False
+with pool._lock:
+    pool._sessions["session-a"].current_run_id = "run-previous"
+assert pool.respond_approval(previous_id, "deny", session_id="session-a", profile="default")["resolved"] is True
+assert pool.respond_approval(other_session_id, "deny", session_id="session-b", profile="default")["resolved"] is True
 threads[0].join(timeout=5)
 threads[2].join(timeout=5)
 assert not threads[0].is_alive()
@@ -609,7 +661,10 @@ ${harness}
 captured = []
 
 class FakePool:
-    def start_chat(self, *args):
+    def get_result(self, run_id):
+        return {"run_id": run_id, "status": "running"}
+
+    def start_chat(self, *args, **kwargs):
         captured.append(args)
         return bridge.RunRecord(run_id=f"run-{len(captured)}", session_id=args[0])
 
@@ -619,6 +674,8 @@ class FakePool:
 
 server = object.__new__(bridge.BridgeServer)
 server.pool = FakePool()
+server.pool._retired = False
+server._admission_lock = threading.RLock()
 
 disabled = server.handle({
     "action": "chat",
@@ -685,6 +742,7 @@ assert [event["event"] for event in polled["sessions"][0]["events"]] == [
     "subagent.text", "subagent.complete"
 ]
 assert polled["sessions"][0]["tasks"][0]["status"] == "completed"
+pool.acknowledge_background_events(session.session_id, polled["sessions"][0]["events"][-1]["background_seq"])
 assert pool.poll_background()["sessions"] == []
 `)
   })
@@ -1487,11 +1545,13 @@ assert [(msg["role"], msg["content"]) for msg in messages] == [
 `)
   })
 
-  it('remembers execute_code approvals inside the bridge without patching upstream files', () => {
+  it('leaves execute_code policy persistence and unattended floors to Core', () => {
     runPython(String.raw`
 ${harness}
 
 pool, _fake_db = make_pool()
+add_active_run(pool, "session-a")
+add_active_run(pool, "session-b")
 
 notify = pool._gateway_approval_notify("session-a")
 approval.queue_gateway_approval("session-a", "request-session-a")
@@ -1501,11 +1561,14 @@ notify({
     "description": "execute_code script execution",
     "pattern_key": "execute_code",
     "pattern_keys": ["execute_code"],
+    "allow_session": True,
+    "allow_permanent": True,
 })
 approval_id = next(iter(pool._gateway_approval_requests.keys()))
-result = pool.respond_approval(approval_id, "session")
+result = pool.respond_approval(approval_id, "session", session_id="session-a", profile="default")
 assert result["resolved"] is True
-assert approval.is_approved("session-a", "execute_code") is True
+assert approval.is_approved("session-a", "execute_code") is False
+finish_gateway_wait("session-a", "request-session-a")
 assert approval._saved_permanent == set()
 
 notify = pool._gateway_approval_notify("session-b")
@@ -1516,27 +1579,30 @@ notify({
     "description": "execute_code script execution",
     "pattern_key": "execute_code",
     "pattern_keys": ["execute_code"],
+    "allow_session": True,
+    "allow_permanent": True,
 })
 approval_id = next(iter(pool._gateway_approval_requests.keys()))
-result = pool.respond_approval(approval_id, "always")
+result = pool.respond_approval(approval_id, "always", session_id="session-b", profile="default")
 assert result["resolved"] is True
-assert approval.is_approved("session-b", "execute_code") is True
-assert "execute_code" in approval._permanent_approved
-assert "execute_code" in approval._saved_permanent
+assert approval.is_approved("session-b", "execute_code") is False
+assert "execute_code" not in approval._permanent_approved
+assert "execute_code" not in approval._saved_permanent
+finish_gateway_wait("session-b", "request-session-b")
 
 bridge._install_execute_code_approval_memory_patch()
 token = approval.set_current_session_key("session-c")
 try:
     approval.approve_session("session-c", "execute_code")
     check_result = approval.check_execute_code_guard("print(3)", "local", has_host_access=True)
-    assert check_result["approved"] is True
-    assert approval._check_execute_code_calls == []
+    assert check_result["approved"] is False
+    assert approval._check_execute_code_calls == [("print(3)", "local", True)]
 finally:
     approval.reset_current_session_key(token)
 
 check_result = approval.check_execute_code_guard("print(4)", "local", has_host_access=True)
 assert check_result["approved"] is False
-assert approval._check_execute_code_calls == [("print(4)", "local", True)]
+assert approval._check_execute_code_calls == [("print(3)", "local", True), ("print(4)", "local", True)]
 `)
   })
 
@@ -1562,6 +1628,8 @@ class FakeAgent:
             "request_id": request_id,
             "command": f"gateway:{self.session_id}",
             "description": f"gateway-desc:{self.session_id}",
+            "allow_session": True,
+            "allow_permanent": True,
         })
         kwargs["stream_callback"](f"delta:{self.session_id}")
         callback = _get_approval_callback()
@@ -1621,10 +1689,12 @@ if not wait_for(approvals_ready):
 assert os.environ.get("HERMES_EXEC_ASK") == "1"
 assert pool._exec_ask_depth == 2
 
-pool.respond_approval(gateway_approval_ids["session-b"], "always")
-pool.respond_approval(gateway_approval_ids["session-a"], "session")
-pool.respond_approval(terminal_approval_ids["session-b"], "deny")
-pool.respond_approval(terminal_approval_ids["session-a"], "once")
+pool.respond_approval(gateway_approval_ids["session-b"], "always", session_id="session-b", profile="default")
+pool.respond_approval(gateway_approval_ids["session-a"], "session", session_id="session-a", profile="default")
+finish_gateway_wait("session-b", "request:session-b")
+finish_gateway_wait("session-a", "request:session-a")
+pool.respond_approval(terminal_approval_ids["session-b"], "deny", session_id="session-b", profile="default")
+pool.respond_approval(terminal_approval_ids["session-a"], "once", session_id="session-a", profile="default")
 
 for thread in threads:
     thread.join(timeout=20)
@@ -1788,7 +1858,9 @@ ${harness}
 
 server_calls = []
 server = bridge.BridgeServer.__new__(bridge.BridgeServer)
+server._admission_lock = threading.RLock()
 server.pool = types.SimpleNamespace(
+    _retired=False,
     request_boundary_interrupt=lambda session_id, run_id: server_calls.append(
         (session_id, run_id)
     ) or {"status": "accepted", "run_id": run_id}
@@ -1812,7 +1884,7 @@ class BoundaryWorker:
     def __init__(self):
         self.requests = []
 
-    def request(self, req, timeout=None):
+    def request(self, req, timeout=None, allow_start=True):
         self.requests.append(req)
         return {"ok": True, "status": "accepted", "run_id": req["expected_run_id"]}
 
@@ -1871,7 +1943,7 @@ class StatusWorker:
         self.key = "default"
         self.requests = []
 
-    def request(self, req, timeout=None):
+    def request(self, req, timeout=None, allow_start=True):
         self.requests.append(req)
         assert req["action"] == "status"
         assert "worker_key" not in req
@@ -1915,7 +1987,7 @@ class StatusWorker:
     profile = "default"
     key = "default"
 
-    def request(self, req, timeout=None):
+    def request(self, req, timeout=None, allow_start=True):
         return {
             "ok": True,
             "session_id": req["session_id"],
@@ -1955,7 +2027,7 @@ class CommandWorker:
         self.key = "work"
         self.requests = []
 
-    def request(self, req, timeout=None):
+    def request(self, req, timeout=None, allow_start=True):
         self.requests.append(req)
         return {
             "ok": True,
@@ -2005,7 +2077,10 @@ class RoutedWorker:
         self.requests = []
         self.stopped = False
 
-    def request(self, req, timeout=None):
+    def bind_model_run_auth(self, binding):
+        self.model_run_auth = binding
+
+    def request(self, req, timeout=None, allow_start=True):
         self.requests.append(req)
         action = req.get("action")
         if action == "chat":
@@ -2020,7 +2095,8 @@ class RoutedWorker:
         self.stopped = True
 
 broker = bridge.BridgeBroker("ipc:///tmp/unused.sock")
-worker = RoutedWorker("default", "default:compression:session-a")
+binding = bridge.ModelRunAuth.parse({"version":1,"owner_id":"fixture-owner","profile":"default","run_marker":"compression-run","token_path":"/tmp/fixture-run-source.json"})
+worker = RoutedWorker("default", binding.worker_key())
 broker._workers[worker.key] = worker
 
 chat_resp = broker.handle({
@@ -2029,12 +2105,13 @@ chat_resp = broker.handle({
     "profile": "default",
     "worker_key": worker.key,
     "message": "summarize",
+    "model_run_auth": binding.descriptor(),
 })
 assert chat_resp["run_id"] == "run-compress"
 assert worker.requests[-1]["profile"] == "default"
 assert "worker_key" not in worker.requests[-1]
 
-broker.handle({"action": "get_output", "run_id": "run-compress"})
+broker.handle({"action": "get_output", "run_id": "run-compress", "profile": "default", "model_run_auth": binding.descriptor()})
 assert worker.requests[-1]["action"] == "get_output"
 
 destroy_resp = broker.handle({
@@ -2042,6 +2119,7 @@ destroy_resp = broker.handle({
     "session_id": "compress-temp",
     "profile": "default",
     "worker_key": worker.key,
+    "model_run_auth": binding.descriptor(),
 })
 assert destroy_resp["destroyed"] is True
 assert worker.requests[-1]["action"] == "destroy"
@@ -2161,6 +2239,7 @@ ${harness}
 
 pool, _fake_db = make_pool()
 callback = pool._approval_callback("session-a")
+add_active_run(pool, "session-a")
 result = {}
 
 def first_prompt():
@@ -2179,10 +2258,11 @@ while time.time() < deadline:
     time.sleep(0.01)
 
 assert approval_id is not None
-assert pool.respond_approval(approval_id, "session") == {
+assert pool.respond_approval(approval_id, "session", session_id="session-a", profile="default") == {
     "approval_id": approval_id,
     "resolved": True,
     "choice": "session",
+    "outcome": "approved",
 }
 thread.join(timeout=5)
 assert result["first"] == "session"
@@ -2203,7 +2283,7 @@ while time.time() < deadline:
     time.sleep(0.01)
 
 assert approval_id is not None
-pool.respond_approval(approval_id, "once")
+pool.respond_approval(approval_id, "once", session_id="session-a", profile="default")
 thread.join(timeout=5)
 assert second_result["choice"] == "once"
 `)
@@ -2214,6 +2294,7 @@ assert second_result["choice"] == "once"
 ${harness}
 
 pool, _fake_db = make_pool()
+add_active_run(pool, "session-a")
 pool._install_approval_dispatcher_for_current_thread("session-a")
 parent_callback = terminal_tool._get_approval_callback()
 assert parent_callback is not None
@@ -2239,7 +2320,7 @@ while time.time() < deadline:
     time.sleep(0.01)
 
 assert approval_id is not None
-pool.respond_approval(approval_id, "session")
+pool.respond_approval(approval_id, "session", session_id="session-a", profile="default")
 thread.join(timeout=5)
 assert result["first"] == "session"
 `)
@@ -2493,6 +2574,8 @@ events = []
 class FakeProcess:
     def __init__(self):
         self.terminated = False
+        self.stdout = None
+        self.stderr = None
 
     def poll(self):
         return None
@@ -2523,6 +2606,7 @@ worker.stop()
 
 assert events == [
     ("request", {"action": "shutdown"}, worker.SHUTDOWN_REQUEST_TIMEOUT_SECONDS),
+    ("wait", 3),
     "terminate",
     ("wait", 3),
 ], events
