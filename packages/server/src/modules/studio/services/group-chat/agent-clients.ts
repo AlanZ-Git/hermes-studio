@@ -9,6 +9,7 @@ import { groupRunUsageMessage } from './run-usage'
 import { completeRunUsage } from '../../repositories/run-usage-store'
 import { recordBridgeModelUsage } from '../usage/bridge-model-usage'
 import { groupRunUser } from './run-user'
+import { createModelRunSource, closeModelRunSource, readModelRunSource, type ModelRunAuth } from '../chat-run/model-run-source'
 import { runMcpCredentials } from '../auth/run-mcp-credentials'
 import type { AuthenticatedUser } from '../../public/auth'
 import { io, Socket } from 'socket.io-client'
@@ -381,6 +382,8 @@ export class AgentClient implements GroupAgentExecutor {
     private workspaceDiffRuns = new Map<string, WorkspaceDiffRunState>()
     private interruptVersions = new Map<string, number>()
     private activeSessions = new Map<string, string>()
+    private modelRuns = new Map<string, { binding: ModelRunAuth; ownerIsCurrent: () => boolean }>()
+    private hermesInteractions = new Map<string, { kind: 'approval' | 'clarify'; sessionId: string }>()
     private workspaceDiffBroadcaster: WorkspaceDiffBroadcaster | null = null
     private chatRunService: GroupChatRunService | null = null
     private readonly eventSink: GroupAgentEventSink | null
@@ -483,6 +486,14 @@ export class AgentClient implements GroupAgentExecutor {
         const sessions = [...this.activeSessions.values()]
         for (const sessionId of sessions) {
             this.markSessionInterrupted(sessionId)
+            const modelRun = this.modelRuns.get(sessionId)
+            if (this.agent === 'hermes' && modelRun) {
+                try {
+                    await createGroupPrimaryAgentBridge().request({ action: 'destroy', session_id: sessionId, profile: this.profile, model_run_auth: modelRun.binding })
+                } catch (err) { logger.warn(err, '[GroupChat] disconnected run cleanup failed') }
+                finally { await closeModelRunSource(modelRun.binding) }
+                continue
+            }
             await this.chatRunService?.abortSession(sessionId, 'Coding agent removed, reconfigured, or disconnected')
                 .catch((err: any) => {
                     logger.warn(`[AgentClients] failed to abort disconnected coding-agent session ${sessionId}: ${err?.message || err}`)
@@ -508,7 +519,8 @@ export class AgentClient implements GroupAgentExecutor {
         this.acknowledgedToolCallIds.clear()
     }
 
-    respondApproval(approvalId: string, choice: string): Promise<boolean> {
+    async respondApproval(approvalId: string, choice: string): Promise<boolean> {
+        if (this.agent === 'hermes') return this.respondHermesInteraction('approval', approvalId, choice)
         if (!this.chatRunService?.respondCodingAgentApproval) return Promise.resolve(false)
         for (const sessionId of this.activeSessions.values()) {
             if (this.chatRunService.respondCodingAgentApproval(sessionId, approvalId, choice)) return Promise.resolve(true)
@@ -516,7 +528,8 @@ export class AgentClient implements GroupAgentExecutor {
         return Promise.resolve(false)
     }
 
-    respondClarify(clarifyId: string, response: string): Promise<boolean> {
+    async respondClarify(clarifyId: string, response: string): Promise<boolean> {
+        if (this.agent === 'hermes') return this.respondHermesInteraction('clarify', clarifyId, response)
         if (!this.chatRunService?.respondCodingAgentClarification) return Promise.resolve(false)
         for (const sessionId of this.activeSessions.values()) {
             if (this.chatRunService.respondCodingAgentClarification(sessionId, clarifyId, response)) return Promise.resolve(true)
@@ -527,6 +540,19 @@ export class AgentClient implements GroupAgentExecutor {
     async cancelClarify(clarifyId: string, sessionId: string, runId: string): Promise<boolean> {
         if (this.agent !== 'ekko') return false
         return cancelGroupEkkoClarification(sessionId, clarifyId, runId).resolved
+    }
+
+    private async respondHermesInteraction(kind: 'approval' | 'clarify', id: string, response: string): Promise<boolean> {
+        const route = this.hermesInteractions.get(`${kind}:${id}`)
+        const run = route && this.modelRuns.get(route.sessionId)
+        if (!route || !run || !run.ownerIsCurrent() || ![...this.activeSessions.values()].includes(route.sessionId)) return false
+        await readModelRunSource(run.binding)
+        const result = await createGroupPrimaryAgentBridge().request({
+            action: kind === 'approval' ? 'approval_respond' : 'clarify_respond',
+            session_id: route.sessionId, profile: this.profile, model_run_auth: run.binding,
+            ...(kind === 'approval' ? { approval_id: id, choice: response } : { clarify_id: id, response }),
+        })
+        return result?.resolved === true
     }
 
     async joinRoom(roomId: string): Promise<JoinResult> {
@@ -689,7 +715,12 @@ export class AgentClient implements GroupAgentExecutor {
         }
         let result: Awaited<ReturnType<GroupPrimaryAgentBridge['interrupt']>> | null = null
         try {
-            result = await createGroupPrimaryAgentBridge().interrupt(sessionId, 'Interrupted by group chat user', this.profile)
+            const binding = this.modelRuns.get(sessionId)?.binding
+            if (!binding) throw new Error('Group run identity is unavailable')
+            result = await createGroupPrimaryAgentBridge().request({
+                action: 'interrupt', session_id: sessionId, profile: this.profile,
+                message: 'Interrupted by group chat user', model_run_auth: binding,
+            })
         } catch (err) {
             if (!isUnknownBridgeSessionError(err)) throw err
             logger.info(`[AgentClients] ${this.name}: bridge session ${sessionId} was already idle/missing during interrupt`)
@@ -912,6 +943,7 @@ export class AgentClient implements GroupAgentExecutor {
 
     private replySessionIsCurrent(roomId: string, sessionId: string, interruptVersion: number): boolean {
         return this.roomSessionIsCurrent(roomId, sessionId) && this.interruptVersion(sessionId) === interruptVersion
+            && (this.modelRuns.get(sessionId)?.ownerIsCurrent() ?? true)
     }
 
     private roomSessionIsCurrent(roomId: string, sessionId: string): boolean {
@@ -1433,7 +1465,15 @@ export class AgentClient implements GroupAgentExecutor {
         let planFailed = false
         let staleStartedRunStopped = false
         let stopStaleStartedRun: ((reason?: string) => Promise<void>) | null = null
+        let modelRunAuth: ModelRunAuth | undefined
         try {
+            const sessionId = groupRuntimeSessionId(roomId, this.profile, this.name)
+            this.activeSessions.set(roomId, sessionId)
+            const replyInterruptVersion = this.interruptVersion(sessionId)
+            activeSessionId = sessionId
+            activeReplyInterruptVersion = replyInterruptVersion
+            const executionUser = groupRunUser(this.storage, roomId, this.profile, msg)
+            if (!executionUser) throw new Error('Hermes group chat requires an active local member with profile access; remote or Agent delegation is not authorized')
             // Notify room that agent is typing
             this.startTyping(roomId)
 
@@ -1441,21 +1481,22 @@ export class AgentClient implements GroupAgentExecutor {
             const mcpCapabilities = await hermesStudioMcpCapabilities(this.profile)
             let instructions = [this.groupSystemPrompt(roomId, msg), studioMcpUsageGuidelines(mcpCapabilities)].filter(Boolean).join('\n\n')
             const bridge = createGroupPrimaryAgentBridge()
-            const sessionId = groupRuntimeSessionId(roomId, this.profile, this.name)
-            this.activeSessions.set(roomId, sessionId)
-            const replyInterruptVersion = this.interruptVersion(sessionId)
             const reportStatus = (status: 'compressing' | 'replying' | 'ready', extra?: Record<string, unknown>) => {
                 onStatus?.(status, { ...extra, agentSessionId: sessionId, runId: runMessageId })
             }
-            activeSessionId = sessionId
-            activeReplyInterruptVersion = replyInterruptVersion
+            modelRunAuth = await createModelRunSource(executionUser, this.profile, sessionId)
+            const binding = modelRunAuth
+            this.modelRuns.set(sessionId, {
+                binding,
+                ownerIsCurrent: () => groupRunUser(this.storage, roomId, this.profile, msg)?.id === executionUser.id,
+            })
             stopStaleStartedRun = async (reason = 'Interrupted because group chat room state changed') => {
                 if (staleStartedRunStopped) return
                 staleStartedRunStopped = true
                 if (bridgeStarted) {
                     let destroySession = false
                     try {
-                        const result = await bridge.interrupt(sessionId, reason, this.profile)
+                        const result = await bridge.request({ action: 'interrupt', session_id: sessionId, profile: this.profile, message: reason, model_run_auth: binding })
                         destroySession = result?.synced === false
                     } catch (err: any) {
                         destroySession = true
@@ -1463,7 +1504,7 @@ export class AgentClient implements GroupAgentExecutor {
                     }
                     if (destroySession) {
                         try {
-                            await bridge.destroy(sessionId, this.profile)
+                            await bridge.request({ action: 'destroy', session_id: sessionId, profile: this.profile, model_run_auth: binding })
                         } catch (err: any) {
                             logger.warn(`[AgentClients] ${this.name}: failed to destroy stale bridge session: ${err.message || err}`)
                         }
@@ -1528,6 +1569,11 @@ export class AgentClient implements GroupAgentExecutor {
             const flushedAssistantParts = new Set<string>()
             let lastChunk: GroupPrimaryAgentBridgeOutput | null = null
             const roomWorkspace = String(this.storage?.getRoom?.(roomId)?.workspace || '').trim()
+            await readModelRunSource(binding)
+            if (!this.replySessionIsCurrent(roomId, sessionId, replyInterruptVersion)) {
+                await stopStaleStartedRun?.()
+                return
+            }
             const started = await bridge.chat(
                 sessionId,
                 bridgeInput,
@@ -1539,6 +1585,7 @@ export class AgentClient implements GroupAgentExecutor {
                     ...(modelContext.provider ? { provider: modelContext.provider } : {}),
                     ...(this.reasoningEffort ? { reasoning_effort: this.reasoningEffort } : {}),
                     source: 'api_server',
+                    model_run_auth: binding,
                     ...(roomWorkspace ? { workspace: roomWorkspace } : {}),
                     // Used only if this operation creates the cached AgentSession.
                     background_delegation_enabled: this.backgroundDelegationEnabled,
@@ -1713,11 +1760,20 @@ export class AgentClient implements GroupAgentExecutor {
             } catch (error) { logger.warn(error, '[GroupChat] task plan finalization failed') }
             if (activeSessionId) {
                 if (this.activeSessions.get(roomId) === activeSessionId) this.activeSessions.delete(roomId)
-                await createGroupPrimaryAgentBridge().destroy(activeSessionId, this.profile).catch((err: any) => {
+                if (modelRunAuth) await createGroupPrimaryAgentBridge().request({ action: 'destroy', session_id: activeSessionId, profile: this.profile, model_run_auth: modelRunAuth }).catch((err: any) => {
                     if (!isUnknownBridgeSessionError(err)) {
                         logger.warn(`[AgentClients] ${this.name}: failed to destroy temporary bridge session: ${err.message || err}`)
                     }
                 })
+            }
+            if (modelRunAuth) {
+                try { await closeModelRunSource(modelRunAuth) }
+                finally {
+                    this.modelRuns.delete(activeSessionId)
+                    for (const [key, route] of this.hermesInteractions) {
+                        if (route.sessionId === activeSessionId) this.hermesInteractions.delete(key)
+                    }
+                }
             }
         }
     }
@@ -1775,6 +1831,7 @@ export class AgentClient implements GroupAgentExecutor {
                 if (!this.replySessionIsCurrent(roomId, sessionId, interruptVersion)) return reasoning
                 await this.recordToolCompleted(roomId, sessionId, ev as Record<string, unknown>)
             } else if (eventType === 'approval.requested') {
+                this.hermesInteractions.set(`approval:${(ev as any).approval_id}`, { kind: 'approval', sessionId })
                 this.emitApprovalRequested(roomId, {
                     event: 'approval.requested',
                     agentSessionId: sessionId,
@@ -1794,6 +1851,7 @@ export class AgentClient implements GroupAgentExecutor {
                     choice: (ev as any).choice,
                 })
             } else if (eventType === 'clarify.requested') {
+                this.hermesInteractions.set(`clarify:${(ev as any).clarify_id}`, { kind: 'clarify', sessionId })
                 this.emitClarifyRequested(roomId, {
                     event: 'clarify.requested',
                     agentSessionId: sessionId,

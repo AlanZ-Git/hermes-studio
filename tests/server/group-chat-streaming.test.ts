@@ -42,6 +42,19 @@ describe('group chat streaming baseline', () => {
     return { alice, bob, worker, agentSessionId }
   }
 
+  it('never persists an invite guest claimed authUserId as a local execution owner', async () => {
+    groupServer.getStorage().addRoomMember('room-1', 'auth:7', 'Local', '', '', 7)
+    const guest = await connectGroupChatClient(port, 'auth:7', 'Guest', { inviteCode: 'ROOM1', authUserId: 7 })
+    harness.sockets.push(guest)
+    const joined = await emitAck(guest, 'join', { roomId: 'room-1', inviteCode: 'ROOM1', name: 'Guest' })
+    expect(joined.error).toBeUndefined()
+    const member = groupServer.getStorage().getMemberByUserId('room-1', 'auth:7')
+    expect(member?.name).toBe('Local')
+    const guests = groupServer.getStorage().getRoomMembers('room-1').filter(member => member.name === 'Guest')
+    expect(guests).toHaveLength(1)
+    expect(guests[0].userId).not.toBe('auth:7')
+  })
+
   it('relays stream start, content delta, reasoning delta, and stream end to room members', async () => {
     const { worker, bob, agentSessionId } = await joinPair()
 

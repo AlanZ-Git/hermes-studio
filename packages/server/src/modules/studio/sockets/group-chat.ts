@@ -4175,9 +4175,11 @@ export class GroupChatServer {
         const requestedSource = auth.source === 'agent' && auth.agentSocketSecret === GROUP_CHAT_AGENT_SOCKET_SECRET ? 'agent' : 'human'
         const authenticatedUser = socket.data.authUser as AuthenticatedUser | undefined
         const authUserId = requestedSource === 'human'
-            ? authenticatedUser?.id ?? (typeof auth.authUserId === 'number' && auth.authUserId > 0 ? auth.authUserId : undefined)
+            ? authenticatedUser?.id
             : undefined
-        const userId = authUserId ? authenticatedGroupUserId(authUserId) : auth.userId || socket.id
+        const userId = authUserId ? authenticatedGroupUserId(authUserId)
+            : requestedSource === 'human' && typeof auth.userId === 'string' && auth.userId.startsWith('auth:')
+                ? socket.id : auth.userId || socket.id
         const userName = auth.name || authenticatedUser?.username || `User-${userId.slice(0, 6)}`
         const description = auth.description || ''
 

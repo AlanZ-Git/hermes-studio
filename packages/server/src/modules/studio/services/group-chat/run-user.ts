@@ -11,6 +11,7 @@ export function groupRunUser(
   if ((message.role && message.role !== 'user') || typeof storage?.getMemberByUserId !== 'function') return undefined
   const userId = storage.getMemberByUserId(roomId, message.senderId)?.authUserId
   if (typeof userId !== 'number' || !Number.isSafeInteger(userId) || userId <= 0) return undefined
+  if (message.senderId !== `auth:${userId}`) return undefined
   const user = findUserById(userId)
   if (!user || user.status !== 'active' || (user.role !== 'super_admin' && !userCanAccessProfile(user.id, profile))) return undefined
   return toAuthenticatedUser(user)

@@ -38,6 +38,7 @@ const bridgeMock = vi.hoisted(() => ({
     }
   }),
   contextEstimate: vi.fn(),
+  request: vi.fn(),
   interrupt: vi.fn(),
   destroy: vi.fn(),
 }))
@@ -49,6 +50,21 @@ const trackerMock = vi.hoisted(() => ({
 }))
 
 vi.mock('socket.io-client', () => ({ io: vi.fn(() => mockSocket) }))
+// Runtime transport tests use a trusted synthetic requester; auth provenance is
+// exercised through real member records in group-chat-model-run-auth/streaming.
+vi.mock('../../packages/server/src/modules/studio/services/group-chat/run-user', () => ({
+  groupRunUser: vi.fn(() => ({ id: 7, username: 'fixture', role: 'admin' })),
+}))
+vi.mock('../../packages/server/src/modules/studio/repositories/users-store', () => ({
+  findUserById: vi.fn(() => ({ id: 7, username: 'fixture', role: 'user', status: 'active' })),
+  userCanAccessProfile: vi.fn(() => true),
+  listUserProfiles: vi.fn(() => [{ profile_name: 'default' }]),
+}))
+vi.mock('../../packages/server/src/modules/studio/public/auth', () => ({
+  getToken: vi.fn(async () => 'test-token'),
+  issueModelRunJwt: vi.fn(async () => 'synthetic-7'),
+  authenticateUserToken: vi.fn(async () => ({ id: 7 })),
+}))
 vi.mock('../../packages/server/src/modules/studio/services/auth/token-auth', () => ({ getToken: vi.fn(async () => 'test-token') }))
 vi.mock('../../packages/server/src/modules/studio/public/profile-config', () => ({
   readConfigYamlForProfile: vi.fn(async () => ({ model: { default: 'model-a', provider: 'provider-a' }, mcp_servers: { 'ekko-studio-interaction': { command: 'studio' } } })),
@@ -91,6 +107,9 @@ describe('group chat agent workspace bridge runs', () => {
     })
     bridgeMock.interrupt.mockResolvedValue(undefined)
     bridgeMock.destroy.mockResolvedValue(undefined)
+    bridgeMock.request.mockImplementation(async (request: any) => request.action === 'interrupt'
+      ? bridgeMock.interrupt(request.session_id, request.message, request.profile)
+      : bridgeMock.destroy(request.session_id, request.profile))
   })
 
   function workspaceDraft(runId: string, sessionId = 'session-1') {
@@ -1520,6 +1539,7 @@ describe('group chat agent workspace bridge runs', () => {
     } as any)
     const storage = {
       getRoom: vi.fn(() => ({ sessionSeed: 'seed-1', workspace })),
+      getMemberByUserId: vi.fn(() => ({ authUserId: 7 })),
       saveWorkspaceDiffMessageForRun: vi.fn(),
       updateRoomTotalTokens: vi.fn(),
       getMessagesForContext: vi.fn(() => []),
@@ -1799,6 +1819,7 @@ describe('group chat agent workspace bridge runs', () => {
     const { groupRuntimeSessionId } = await import('../../packages/server/src/modules/studio/services/group-chat/agent-clients')
     const sessionId = groupRuntimeSessionId('room-1', 'default', 'Worker')
     client.activeSessions.set('room-1', sessionId)
+    client.modelRuns.set(sessionId, { binding: { version: 1, owner_id: '7', profile: 'default', run_marker: sessionId, token_path: '/tmp/fixture-source.json' }, ownerIsCurrent: () => true })
     const runId = '0123456789abcdef0123456789abcdef'
     const state = client.beginWorkspaceDiffIfNeeded({ roomId: 'room-1', sessionId, runId, workspace: '/tmp/workspace' })
     const saveWorkspaceDiffMessageForRun = client.__testStorage.saveWorkspaceDiffMessageForRun
@@ -1829,6 +1850,7 @@ describe('group chat agent workspace bridge runs', () => {
     const { groupRuntimeSessionId } = await import('../../packages/server/src/modules/studio/services/group-chat/agent-clients')
     const sessionId = groupRuntimeSessionId('room-1', 'default', 'Worker')
     client.activeSessions.set('room-1', sessionId)
+    client.modelRuns.set(sessionId, { binding: { version: 1, owner_id: '7', profile: 'default', run_marker: sessionId, token_path: '/tmp/fixture-source.json' }, ownerIsCurrent: () => true })
     const runId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     client.beginWorkspaceDiffIfNeeded({ roomId: 'room-1', sessionId, runId, workspace: '/tmp/workspace' })
     const saveWorkspaceDiffMessageForRun = client.__testStorage.saveWorkspaceDiffMessageForRun
@@ -1851,6 +1873,7 @@ describe('group chat agent workspace bridge runs', () => {
     const { groupRuntimeSessionId } = await import('../../packages/server/src/modules/studio/services/group-chat/agent-clients')
     const sessionId = groupRuntimeSessionId('room-1', 'default', 'Worker')
     client.activeSessions.set('room-1', sessionId)
+    client.modelRuns.set(sessionId, { binding: { version: 1, owner_id: '7', profile: 'default', run_marker: sessionId, token_path: '/tmp/fixture-source.json' }, ownerIsCurrent: () => true })
     const runId = 'dddddddddddddddddddddddddddddddd'
     const state = client.beginWorkspaceDiffIfNeeded({ roomId: 'room-1', sessionId, runId, workspace: '/tmp/workspace' })
     const saveWorkspaceDiffMessageForRun = client.__testStorage.saveWorkspaceDiffMessageForRun
@@ -1869,6 +1892,7 @@ describe('group chat agent workspace bridge runs', () => {
     const { groupRuntimeSessionId } = await import('../../packages/server/src/modules/studio/services/group-chat/agent-clients')
     const sessionId = groupRuntimeSessionId('room-1', 'default', 'Worker')
     client.activeSessions.set('room-1', sessionId)
+    client.modelRuns.set(sessionId, { binding: { version: 1, owner_id: '7', profile: 'default', run_marker: sessionId, token_path: '/tmp/fixture-source.json' }, ownerIsCurrent: () => true })
     const runId = 'cccccccccccccccccccccccccccccccc'
     const state = client.beginWorkspaceDiffIfNeeded({ roomId: 'room-1', sessionId, runId, workspace: '/tmp/workspace' })
     const saveWorkspaceDiffMessageForRun = client.__testStorage.saveWorkspaceDiffMessageForRun
