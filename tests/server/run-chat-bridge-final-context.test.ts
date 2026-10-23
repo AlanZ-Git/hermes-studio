@@ -304,6 +304,23 @@ describe('bridge run final context usage', () => {
     for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true })
   })
 
+  it('preserves authoritative approval terminal semantics through stream forwarding and resume state', async () => {
+    const emit = vi.fn()
+    const state = makeState()
+    const terminal = { event: 'approval.resolved', approval_id: 'approval-1', choice: null, resolved: false, terminal: true, outcome: 'timeout' }
+    const bridge = {
+      chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
+      contextEstimate: vi.fn().mockResolvedValue({ token_count: 100 }),
+      streamOutput: vi.fn(async function* () {
+        yield { run_id: 'run-1', events: [terminal], done: true, status: 'completed', output: 'done' }
+      }),
+    } as any
+    const { handleBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
+    await handleBridgeRun(makeNamespace(emit), makeSocket(), { input: 'hello', session_id: 'session-1' }, 'default', new Map([['session-1', state]]), bridge, false, vi.fn(), vi.fn())
+    expect(emit).toHaveBeenCalledWith('approval.resolved', expect.objectContaining(terminal))
+    expect(replaceStateMock).toHaveBeenCalledWith(expect.any(Map), 'session-1', 'approval.resolved', expect.objectContaining(terminal))
+  })
+
   it('reopens an ended bridge session when starting a new run', async () => {
     getSessionMock.mockReturnValue({
       id: 'session-1',

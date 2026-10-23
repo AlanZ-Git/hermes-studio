@@ -176,6 +176,32 @@ describe('chat store error handling - #1644', () => {
     expect(store.pendingClarifies.get('session-b')!.countdownDeadline - now).toBeLessThanOrEqual(17_100)
   })
 
+  it.each(['timeout', 'session_closed', 'interrupted', 'notify_failed'])('clears a terminal %s without requiring an accepted decision', outcome => {
+    const store = useChatStore()
+    store.sessions = [makeSession('session-b')]
+    chatApi.globalPendingHandler?.({
+      event: 'approval.requested', session_id: 'session-b', approval_id: 'approval-b', choices: ['once', 'deny'],
+    })
+    chatApi.globalPendingHandler?.({
+      event: 'approval.resolved', session_id: 'session-b', approval_id: 'approval-b', resolved: false, terminal: true, outcome,
+    })
+    expect(store.pendingApprovals.has('session-b')).toBe(false)
+  })
+
+  it('does not let an old terminal clear a newer approval in the same session', () => {
+    const store = useChatStore()
+    chatApi.globalPendingHandler?.({ event: 'approval.requested', session_id: 'session-b', approval_id: 'new', choices: ['once', 'deny'] })
+    chatApi.globalPendingHandler?.({ event: 'approval.resolved', session_id: 'session-b', approval_id: 'old', terminal: true, resolved: false, outcome: 'timeout' })
+    expect(store.pendingApprovals.get('session-b')?.approvalId).toBe('new')
+  })
+
+  it.each(['binding_mismatch', 'invalid_scope', 'stale'])('keeps valid pending approvals after a non-terminal %s response', outcome => {
+    const store = useChatStore()
+    for (const sid of ['session-a', 'session-b']) chatApi.globalPendingHandler?.({ event: 'approval.requested', session_id: sid, approval_id: sid, choices: ['once', 'deny'] })
+    chatApi.globalPendingHandler?.({ event: 'approval.resolved', session_id: 'session-a', approval_id: 'session-a', resolved: false, terminal: false, outcome })
+    expect([...store.pendingApprovals.keys()]).toEqual(['session-a', 'session-b'])
+  })
+
   it('keeps a pending approval when the authoritative response is unresolved', () => {
     const store = useChatStore()
     store.sessions = [makeSession('session-a'), makeSession('session-b')]

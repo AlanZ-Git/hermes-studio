@@ -1771,6 +1771,7 @@ class AgentPool:
             self._append_approval_event(session_id, run_id, {
                 "event": "approval.resolved", "approval_id": approval_id,
                 "choice": choice, "resolved": outcome in {"approved", "denied"}, "outcome": outcome,
+                "terminal": True,
             })
             return choice
         return callback
@@ -1931,10 +1932,11 @@ class AgentPool:
             choice = meta["entry"].result
             outcome = meta.get("terminal_outcome") or (
                 ("denied" if choice == "deny" else "approved" if choice in {"once", "session", "always"} else "unanswered")
-                if reason == "answered" else reason)
+                if reason in {"resolved", "answered"} else reason)
             self._append_approval_event(session_id, run_id, {
                 "event": "approval.resolved", "approval_id": approval_id, "request_id": request_id,
                 "choice": choice, "resolved": outcome in {"approved", "denied"}, "outcome": outcome,
+                "terminal": True,
             })
 
     def _gateway_approval_notify(self, session_id: str):

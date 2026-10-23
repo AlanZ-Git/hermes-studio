@@ -40,6 +40,7 @@ const getSessionMock = vi.hoisted(() => vi.fn((sessionId?: string) => sessionId
   ? { id: sessionId, profile: 'default', source: 'cli', model: 'gpt-test', provider: 'openai' }
   : undefined))
 const bridgeMock = vi.hoisted(() => ({
+  request: vi.fn(async () => ({ resolved: true })),
   status: vi.fn(),
   statusIfLoaded: vi.fn(),
   releaseBackgroundNotification: vi.fn(async () => ({ ok: true, released: true })),
@@ -51,6 +52,10 @@ const bridgeMock = vi.hoisted(() => ({
 vi.mock('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run', () => ({
   handleBridgeRun: handleBridgeRunMock,
   resumeBridgeRun: resumeBridgeRunMock,
+}))
+
+vi.mock('../../packages/server/src/modules/studio/services/chat-run/model-run-source', () => ({
+  readModelRunSource: vi.fn(async () => ({})),
 }))
 
 vi.mock('../../packages/server/src/modules/studio/services/chat-run/load-state', () => ({
@@ -240,6 +245,47 @@ describe('ChatRunSocket global pending interactions', () => {
       room: 'pending-interactions:default', event: 'clarify.resolved',
       payload: expect.objectContaining({ session_id: 'session-b', clarify_id: 'clarify-b' }),
     }))
+  })
+
+  it.each(['binding_mismatch', 'invalid_scope', 'stale'])('does not broadcast a rejected %s approval attempt as an expired request', async outcome => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, socket, emitted } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).onConnection(socket)
+    ;(server as any).sessionMap.set('session-b', { modelRunAuth: { version: 1, owner_id: '7', profile: 'default', run_marker: 'marker', token_path: '/synthetic/source' }, runId: 'run-b', events: [], queue: [] })
+    bridgeMock.request.mockResolvedValueOnce({ resolved: false, outcome } as any)
+    await handlers.get('approval.respond')?.({ session_id: 'session-b', approval_id: 'approval-b', choice: 'once' })
+    expect(socket.emit).toHaveBeenCalledWith('approval.resolved', expect.objectContaining({
+      approval_id: 'approval-b', resolved: false, terminal: false, outcome,
+    }))
+    expect(emitted).not.toContainEqual(expect.objectContaining({ event: 'approval.resolved' }))
+  })
+
+  it('binds approval responses to the server-owned session/profile/generation', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    const binding = { version: 1, owner_id: '7', profile: 'default', run_marker: 'marker', token_path: '/synthetic/source' }
+    ;(server as any).sessionMap.set('session-b', { modelRunAuth: binding, runId: 'run-b', events: [], queue: [] })
+    ;(server as any).onConnection(socket)
+    await handlers.get('approval.respond')?.({ session_id: 'session-b', approval_id: 'approval-b', choice: 'once' })
+    expect(bridgeMock.request).toHaveBeenCalledWith({ action: 'approval_respond', session_id: 'session-b', profile: 'default', model_run_auth: binding, run_id: 'run-b', approval_id: 'approval-b', choice: 'once' })
+  })
+
+  it.each(['missing', 'profile', 'changed'])('rejects %s run binding without publishing a terminal', async kind => {
+    const { readModelRunSource } = await import('../../packages/server/src/modules/studio/services/chat-run/model-run-source')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, socket, emitted } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    const state = { modelRunAuth: kind === 'missing' ? undefined : { version: 1, owner_id: '7', profile: kind === 'profile' ? 'research' : 'default', run_marker: 'marker', token_path: '/synthetic/source' }, runId: 'run-b', events: [], queue: [] }
+    ;(server as any).sessionMap.set('session-b', state)
+    if (kind === 'changed') vi.mocked(readModelRunSource).mockImplementationOnce(async () => { state.runId = 'next-run'; return {} as any })
+    bridgeMock.request.mockClear()
+    ;(server as any).onConnection(socket)
+    await handlers.get('approval.respond')?.({ session_id: 'session-b', approval_id: 'approval-b', choice: 'once' })
+    expect(bridgeMock.request).not.toHaveBeenCalled()
+    expect(socket.emit).toHaveBeenCalledWith('approval.resolved', expect.objectContaining({ resolved: false, terminal: false }))
+    expect(emitted).not.toContainEqual(expect.objectContaining({ event: 'approval.resolved' }))
   })
 
   it('does not republish group-chat approvals through the generic chat pending audience', async () => {

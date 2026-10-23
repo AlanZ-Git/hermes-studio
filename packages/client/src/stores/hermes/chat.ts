@@ -3429,6 +3429,13 @@ export const useChatStore = defineStore('chat', () => {
     }
     if (approvalId && current.approvalId !== approvalId) return
     if ((evt as any).resolved === false) {
+      // A withdrawn/expired request is terminal without being an accepted decision.
+      // A rejected response attempt must not dismiss the still-live request.
+      if ((evt as any).terminal === true) {
+        dismissPendingApprovalFor(sid, current.approvalId)
+        return
+      }
+      if ((evt as any).terminal === false) return
       if ((evt as any).stale === true || isPendingInteractionExpiredError((evt as any).error || (evt as any).reason)) {
         dismissPendingApprovalFor(sid, current.approvalId)
         if (attempted) notifyPendingInteractionExpired()

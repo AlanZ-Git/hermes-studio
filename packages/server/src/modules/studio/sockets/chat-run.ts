@@ -54,6 +54,7 @@ import {
   respondToChatEkkoToolApproval as respondToEkkoToolApproval,
 } from '../public/chat-agent-runtime'
 import { handleBridgeRun, resumeBridgeRun } from '../services/chat-run/handle-bridge-run'
+import { readModelRunSource } from '../services/chat-run/model-run-source'
 import { handleCodingAgentRun } from '../services/chat-run/handle-coding-agent-run'
 import { handleEkkoAgentRun, type EkkoAgentRunSocketData } from '../services/chat-run/handle-ekko-agent-run'
 import { handleEkkoSessionCommand, parseEkkoRunCommand } from '../services/chat-run/ekko-session-command'
@@ -1305,24 +1306,33 @@ export class ChatRunSocket {
       }
       try {
         if (shared && !buildResumeEvents(this.sessionMap.get(data.session_id)?.events || []).some(entry => entry.event === 'approval.requested' && entry.data?.approval_id === data.approval_id)) throw new Error('Approval does not belong to this session')
-        const result = await this.bridge.approvalRespond(data.approval_id, data.choice || 'deny')
+        const result = await this.respondToBridgeApproval(data.session_id, currentProfile(), data.approval_id, data.choice || 'deny')
         const resolved = Boolean(result.resolved)
+        if (!resolved) {
+          // Failure belongs to this attempt, not to the lifetime of the request.
+          // Only the authoritative bridge terminal may dismiss it for all clients.
+          socket.emit('approval.resolved', {
+            event: 'approval.resolved', session_id: data.session_id,
+            approval_id: data.approval_id, choice: data.choice || 'deny',
+            resolved: false, terminal: false, outcome: result.outcome,
+            error: 'Approval response could not be applied.',
+          })
+          return
+        }
         this.emitToSession(socket, data.session_id, 'approval.resolved', {
           event: 'approval.resolved',
           approval_id: data.approval_id,
           choice: data.choice || 'deny',
           resolved,
-          ...(!resolved ? {
-            stale: true,
-            error: 'Approval is no longer pending.',
-          } : {}),
         })
       } catch (err) {
-        this.emitToSession(socket, data.session_id, 'approval.resolved', {
+        socket.emit('approval.resolved', {
           event: 'approval.resolved',
+          session_id: data.session_id,
           approval_id: data.approval_id,
           choice: data.choice || 'deny',
           resolved: false,
+          terminal: false,
           error: err instanceof Error ? err.message : String(err),
         })
       }
@@ -2667,6 +2677,23 @@ export class ChatRunSocket {
 
   // --- Helpers ---
 
+  private async respondToBridgeApproval(sessionId: string, profile: string, approvalId: string, choice: string, expectedRunId?: string) {
+    const state = this.sessionMap.get(sessionId)
+    const binding = state?.modelRunAuth
+    const runId = state?.runId
+    if (!binding || !runId || binding.profile !== profile || (expectedRunId && expectedRunId !== runId)) {
+      throw new Error('Approval run binding is unavailable')
+    }
+    await readModelRunSource(binding)
+    if (this.sessionMap.get(sessionId) !== state || state.modelRunAuth !== binding || state.runId !== runId) {
+      throw new Error('Approval run binding changed')
+    }
+    return this.bridge.request({
+      action: 'approval_respond', session_id: sessionId, profile,
+      model_run_auth: binding, run_id: runId, approval_id: approvalId, choice,
+    })
+  }
+
   async runAndWait(
     data: {
       input: string | ContentBlock[]
@@ -2773,7 +2800,7 @@ export class ChatRunSocket {
           const codingAgentResult = codingAgentRunManager.resolveApproval(sessionId, approvalId, choice)
           const result = codingAgentResult.handled
             ? codingAgentResult
-            : await this.bridge.approvalRespond(approvalId, choice)
+            : await this.respondToBridgeApproval(sessionId, profile, approvalId, choice, payload.run_id)
           const resolvedPayload = {
             event: 'approval.resolved',
             session_id: sessionId,

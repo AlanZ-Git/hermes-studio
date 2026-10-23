@@ -128,7 +128,7 @@ def finish_gateway_wait(session_key, request_id):
         entry = next(e for e in entries if e.data["request_id"] == request_id)
         entries.remove(entry)
     if entry.settle:
-        entry.settle("answered" if entry.result else "cancelled")
+        entry.settle("resolved" if entry.result else "session_closed")
 
 def resolve_gateway_approval(session_key, choice, request_id=None):
     waiters = approval._gateway_waiters.get(session_key, [])
@@ -290,6 +290,28 @@ def wait_for(condition, timeout=20):
 `
 
 describe('agent bridge Python session concurrency', () => {
+  it('maps actual Core resolved decisions without treating a terminal timeout as consent', () => {
+    runPython(String.raw`
+${harness}
+
+for choice, reason, outcome in [("once", "resolved", "approved"), ("deny", "resolved", "denied"), (None, "timeout", "timeout"), (None, "session_closed", "session_closed")]:
+    pool, _ = make_pool()
+    sid, rid = "terminal-session", "terminal-run"
+    pool._sessions[sid] = bridge.AgentSession(session_id=sid, agent=None, current_run_id=rid)
+    pool._runs[rid] = bridge.RunRecord(rid, sid)
+    entry = types.SimpleNamespace(result=choice)
+    pool._gateway_approval_requests["approval"] = (sid, rid, "request")
+    pool._gateway_approval_meta["approval"] = {"entry": entry}
+    pool._settle_gateway_approval("approval", reason)
+    event = pool._runs[rid].events[-1]
+    assert event["outcome"] == outcome, event
+    assert event["resolved"] is (choice is not None), event
+    assert event["terminal"] is True, event
+    pool._settle_gateway_approval("approval", reason)
+    assert len(pool._runs[rid].events) == 1
+`)
+  })
+
   it('settles abnormal exits and failures before conversation setup', () => {
     runPython(String.raw`
 ${harness}

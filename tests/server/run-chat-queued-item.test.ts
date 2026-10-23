@@ -24,6 +24,7 @@ const sessionCommandMocks = vi.hoisted(() => ({
   parseSessionCommand: vi.fn(() => null),
 }))
 const bridgeMock = vi.hoisted(() => ({
+  request: vi.fn(async () => ({ resolved: true })),
   status: vi.fn(),
   statusIfLoaded: vi.fn(),
   interrupt: vi.fn(),
@@ -49,6 +50,10 @@ vi.mock('../../packages/server/src/modules/studio/services/task-plans', () => ({
 vi.mock('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run', () => ({
   handleBridgeRun: handleBridgeRunMock,
   resumeBridgeRun: resumeBridgeRunMock,
+}))
+
+vi.mock('../../packages/server/src/modules/studio/services/chat-run/model-run-source', () => ({
+  readModelRunSource: vi.fn(async () => ({})),
 }))
 
 vi.mock('../../packages/server/src/modules/studio/services/chat-run/load-state', () => ({
@@ -674,7 +679,9 @@ describe('ChatRunSocket queued bridge runs', () => {
   })
 
   it('auto-responds once to approvals only when runAndWait enables it', async () => {
-    handleBridgeRunMock.mockImplementationOnce(async (_nsp, _socket, data) => {
+    const binding = { version: 1, owner_id: '1', profile: 'default', run_marker: 'marker', token_path: '/synthetic/source' }
+    handleBridgeRunMock.mockImplementationOnce(async (_nsp, _socket, data, _profile, sessionMap) => {
+      sessionMap.set('session-1', { modelRunAuth: binding, runId: 'run-workflow-approval', messages: [], events: [], queue: [] })
       data.onEvent?.('approval.requested', {
         run_id: 'run-workflow-approval',
         approval_id: 'approval-1',
@@ -702,8 +709,8 @@ describe('ChatRunSocket queued bridge runs', () => {
       run_id: 'run-workflow-approval',
       output: 'approved',
     })
-    expect(bridgeMock.approvalRespond).toHaveBeenCalledWith('approval-1', 'once')
-    expect(namespace.to).toHaveBeenCalledWith('session:session-1')
+    expect(bridgeMock.request).toHaveBeenCalledWith(expect.objectContaining({ action: 'approval_respond', session_id: 'session-1', profile: 'default', run_id: 'run-workflow-approval', model_run_auth: binding, approval_id: 'approval-1', choice: 'once' }))
+    await vi.waitFor(() => expect(namespace.to).toHaveBeenCalledWith('session:session-1'))
   })
 
   it('does not auto-respond to approvals for normal runAndWait calls', async () => {
