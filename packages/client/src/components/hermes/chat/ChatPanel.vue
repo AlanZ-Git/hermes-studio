@@ -8,6 +8,7 @@ import { useCodingAgentModels } from '@/composables/useCodingAgentModels'
 import PageHeader from '@/components/layout/PageHeader.vue'
 import HeaderSidebarToggle from '@/components/layout/HeaderSidebarToggle.vue'
 import { AGENT_OPTIONS } from "@/utils/agent-options"
+import { DEFAULT_NEW_CHAT_AGENT, loadNewChatAgent, NEW_CHAT_AGENT_STORAGE_KEY } from "@/utils/new-chat-agent"
 import { setSessionPinned } from "@/api/studio/sessions";
 import DshSessionPresetSelect from "@/components/coding-agents/dsh/DshSessionPresetSelect.vue";
 import {
@@ -924,15 +925,6 @@ function handleNewChatEscape(event: KeyboardEvent) {
 }
 
 watch(() => router.currentRoute.value.fullPath, () => closeNewChatPage());
-const NEW_CHAT_AGENT_STORAGE_KEY = "hermes_new_chat_agent_v1";
-function loadNewChatAgent(): "hermes" | ChatCodingAgentId {
-  try {
-    const saved = localStorage.getItem(NEW_CHAT_AGENT_STORAGE_KEY);
-    return AGENT_OPTIONS.find(option => option.value === saved)?.value || AGENT_OPTIONS[0].value;
-  } catch {
-    return AGENT_OPTIONS[0].value;
-  }
-}
 let preferredNewChatAgent = loadNewChatAgent();
 const newChatAgent = ref<"hermes" | ChatCodingAgentId>(preferredNewChatAgent);
 const newChatAgentMode = ref<"global" | "scoped">("scoped");
@@ -1342,7 +1334,7 @@ async function refreshNewChatAgentAvailability(sequence: number) {
     if (!isCurrentNewChatOptionsLoad(sequence)) return;
     newChatAgentAvailability.value = availability;
     newChatAgent.value = newChatAgentOptions.value.find(option => option.value === preferredNewChatAgent)?.value
-      || newChatAgentOptions.value[0]?.value || AGENT_OPTIONS[0].value;
+      || DEFAULT_NEW_CHAT_AGENT;
   } catch {
     if (isCurrentNewChatOptionsLoad(sequence) && !newChatAgentAvailability.value) {
       message.error(t("codingAgents.loadFailed"));

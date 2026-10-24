@@ -11,6 +11,17 @@ const form: NewChatFormPreferences = {
 beforeEach(() => { localStorage.clear(); sessionStorage.clear(); vi.restoreAllMocks() })
 
 describe('new-chat form preferences', () => {
+  it.each(['hermes', 'ekko-agent', 'codex'] as const)('preserves an explicit account choice of %s', agent => {
+    localStorage.setItem('hermes_new_chat_form_v1:107', JSON.stringify({ ...form, agent }))
+    expect(loadNewChatFormPreferences(107)?.agent).toBe(agent)
+  })
+
+  it('uses Hermes for a missing account agent value', () => {
+    const { agent, ...remaining } = form
+    localStorage.setItem('hermes_new_chat_form_v1:108', JSON.stringify(remaining))
+    expect(loadNewChatFormPreferences(108)?.agent).toBe('hermes')
+  })
+
   it('remembers native model and effort choices separately for each agent and scoped provider', () => {
     const nativeModels = { codex: { model: 'native-codex', reasoningEffort: 'high' }, pi: { model: 'provider/native-pi', reasoningEffort: 'low' },
       dsh: { model: '["native","model"]', reasoningEffort: 'off' } }
@@ -38,7 +49,7 @@ describe('new-chat form preferences', () => {
     localStorage.setItem('hermes_new_chat_form_v1:104', '{broken')
     expect(loadNewChatFormPreferences(104)).toBeNull()
     localStorage.setItem('hermes_new_chat_form_v1:104', JSON.stringify({ ...form, agent: 'unknown', mode: 'invalid', apiMode: 'invalid', categoryId: -1, reasoningEffort: 'invalid' }))
-    expect(loadNewChatFormPreferences(104)).toMatchObject({ agent: 'ekko-agent', mode: 'scoped', apiMode: 'chat_completions', categoryId: null, reasoningEffort: '' })
+    expect(loadNewChatFormPreferences(104)).toMatchObject({ agent: 'hermes', mode: 'scoped', apiMode: 'chat_completions', categoryId: null, reasoningEffort: '' })
   })
 
   it('continues to work when browser storage rejects writes', () => {

@@ -11,6 +11,7 @@ import {
   getGlobalEkkoAgent,
   GlobalEkkoAgent,
   setupGlobalEkkoAgent,
+  isGlobalEkkoAgentEnabled,
 } from '../../packages/server/src/modules/ekko/services/manager'
 import { DEFAULT_EKKO_JEV_CONFIG, EkkoFileLogReader, noul, setupEkkoAgent } from '../../packages/ekko-agent/src'
 import type { EkkoAgentSetup, ModelClient, ModelRequest } from '../../packages/ekko-agent/src'
@@ -48,6 +49,7 @@ let baseDirectory = ''
 let setups: EkkoAgentSetup[] = []
 
 beforeEach(async () => {
+  vi.stubEnv('HERMES_WEB_UI_ENABLE_EKKO_AGENT', '1')
   baseDirectory = await mkdtemp(join(tmpdir(), 'global-ekko-agent-'))
   setups = []
   getHermesBaseDirMock.mockReturnValue(join(baseDirectory, 'hermes'))
@@ -98,6 +100,30 @@ function modelClient(content: string): ModelClient {
 }
 
 describe('GlobalEkkoAgent', () => {
+  it('refuses implicit global setup without creating Ekko state', () => {
+    vi.stubEnv('HERMES_WEB_UI_ENABLE_EKKO_AGENT', undefined)
+    expect(() => setupGlobalEkkoAgent({ baseDirectory, profiles: ['default'] }))
+      .toThrow('HERMES_WEB_UI_ENABLE_EKKO_AGENT=1')
+    expect(existsSync(join(baseDirectory, '.ekko'))).toBe(false)
+    expect(() => getGlobalEkkoAgent()).toThrow('HERMES_WEB_UI_ENABLE_EKKO_AGENT=1')
+    expect(existsSync(join(baseDirectory, '.ekko'))).toBe(false)
+  })
+
+  it.each(['', '0', 'false', 'true', 'yes'])('requires the exact opt-in, rejecting %s', value => {
+    vi.stubEnv('HERMES_WEB_UI_ENABLE_EKKO_AGENT', value)
+    expect(isGlobalEkkoAgentEnabled()).toBe(false)
+    expect(() => setupGlobalEkkoAgent({ baseDirectory })).toThrow('Ekko is disabled')
+    expect(existsSync(join(baseDirectory, '.ekko'))).toBe(false)
+  })
+
+  it('does not allow a cached setup to bypass the disabled gate or overwrite existing data', async () => {
+    const setup = setupGlobalEkkoAgent({ baseDirectory, profiles: ['default'] })
+    const before = await readFile(setup.layout.configPath, 'utf8')
+    vi.stubEnv('HERMES_WEB_UI_ENABLE_EKKO_AGENT', undefined)
+    expect(() => getGlobalEkkoAgent()).toThrow('Ekko is disabled')
+    expect(await readFile(setup.layout.configPath, 'utf8')).toBe(before)
+  })
+
   it('passes current Profile JEV settings to Ekko without overwriting its persisted defaults', async () => {
     const setup = createTestSetup(['work', 'personal'])
     setup.config.update({ skills: { enabled: false }, jev: { enabled: true, memoryEnabled: true, skillsEnabled: true, apiKey: 'ekko-local-key' } })

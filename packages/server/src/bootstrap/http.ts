@@ -47,7 +47,7 @@ import {
   listAppConnections,
 } from '../modules/studio/repositories/app-connections-store'
 import { ensureAppRelayHostClient } from '../modules/studio/services/app-relay/connection'
-import { setupGlobalEkkoAgent } from './ekko'
+import { isGlobalEkkoAgentEnabled, setupGlobalEkkoAgent } from './ekko'
 import { injectManagedEkkoMcpServers } from '../modules/ekko/services/mcp'
 import { WorkflowSocketServer } from '../modules/studio/sockets/workflow'
 import { PetStateSocketServer } from '../modules/studio/sockets/pet-state'
@@ -449,21 +449,25 @@ export async function bootstrap() {
   }
 
   try {
-    const ekkoSetup = setupGlobalEkkoAgent()
-    try {
-      const injection = injectManagedEkkoMcpServers(ekkoSetup)
-      const changed = injection.targets.filter(target => target.status === 'injected' || target.status === 'updated')
-      if (changed.length > 0) {
-        logger.info({
-          serverNames: injection.serverNames,
-          targets: changed,
-        }, '[bootstrap] Studio MCP servers injected into Ekko config')
+    if (isGlobalEkkoAgentEnabled()) {
+      const ekkoSetup = setupGlobalEkkoAgent()
+      try {
+        const injection = injectManagedEkkoMcpServers(ekkoSetup)
+        const changed = injection.targets.filter(target => target.status === 'injected' || target.status === 'updated')
+        if (changed.length > 0) {
+          logger.info({
+            serverNames: injection.serverNames,
+            targets: changed,
+          }, '[bootstrap] Studio MCP servers injected into Ekko config')
+        }
+      } catch (err) {
+        logger.warn(err, '[bootstrap] failed to inject Studio MCP servers into Ekko config')
+        console.warn('[bootstrap] failed to inject Studio MCP servers into Ekko config:', err instanceof Error ? err.message : err)
       }
-    } catch (err) {
-      logger.warn(err, '[bootstrap] failed to inject Studio MCP servers into Ekko config')
-      console.warn('[bootstrap] failed to inject Studio MCP servers into Ekko config:', err instanceof Error ? err.message : err)
+      console.log('[bootstrap] ekko-agent setup complete')
+    } else {
+      console.log('[bootstrap] Ekko disabled; opt in with HERMES_WEB_UI_ENABLE_EKKO_AGENT=1')
     }
-    console.log('[bootstrap] ekko-agent setup complete')
   } catch (err) {
     logger.error(err, '[bootstrap] ekko-agent setup failed; continuing with Ekko unavailable')
     console.error('[bootstrap] ekko-agent setup failed; continuing without Ekko:', err instanceof Error ? err.message : err)

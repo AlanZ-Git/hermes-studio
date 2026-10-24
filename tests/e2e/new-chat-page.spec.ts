@@ -4,6 +4,13 @@ import catalog from '../../config/agents.json'
 import { expectNewChatEffectsMoving, selectNewChatAgent } from './new-chat-helpers'
 import { resolveProviderConnectionApiMode } from '../../packages/server/src/modules/studio/contracts/providers'
 
+// These picker/animation tests exercise an explicit Ekko choice, not the new-chat default.
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => {
+    if (!localStorage.getItem('hermes_new_chat_agent_v1')) localStorage.setItem('hermes_new_chat_agent_v1', 'ekko-agent')
+  })
+})
+
 for (const reducedMotion of ['no-preference', 'reduce'] as const) test(`Agent card interiors keep moving with ${reducedMotion} system motion preference`, async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   await page.emulateMedia({ reducedMotion })

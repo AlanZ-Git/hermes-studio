@@ -243,6 +243,10 @@ let globalEkkoSetup: EkkoAgentSetup | undefined
 let globalEkkoSetupOptions: SetupGlobalEkkoAgentOptions | undefined
 const globalEkkoAgents = new Map<string, GlobalEkkoAgent>()
 
+export function isGlobalEkkoAgentEnabled(): boolean {
+  return process.env.HERMES_WEB_UI_ENABLE_EKKO_AGENT === '1'
+}
+
 function reloadGlobalEkkoSetupAfterRecovery(): boolean {
   if (!globalEkkoSetup?.recovery.snapshot().capabilities.database.restartRequired) return false
   if ([...globalEkkoAgents.values()].some(agent => !agent.isIdleForSetupReload())) return false
@@ -259,6 +263,9 @@ function reloadGlobalEkkoSetupAfterRecovery(): boolean {
 export function setupGlobalEkkoAgent(
   options: SetupGlobalEkkoAgentOptions = {},
 ): EkkoAgentSetup {
+  if (!isGlobalEkkoAgentEnabled()) {
+    throw new Error('Ekko is disabled. To enable it, start Studio with HERMES_WEB_UI_ENABLE_EKKO_AGENT=1. Existing Ekko sessions are not switched to Hermes.')
+  }
   reloadGlobalEkkoSetupAfterRecovery()
   if (globalEkkoSetup) return globalEkkoSetup
   if (!globalEkkoSetupOptions) {
