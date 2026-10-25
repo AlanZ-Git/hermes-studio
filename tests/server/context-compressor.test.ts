@@ -5,6 +5,7 @@ const saveCompressionSnapshotMock = vi.fn()
 const deleteCompressionSnapshotMock = vi.fn()
 const bridgeRequestMock = vi.fn()
 const bridgeDestroyMock = vi.fn()
+const bridgeAckMock = vi.fn(async () => true)
 const ekkoRuntimeOptionsMock = vi.fn()
 const ekkoRuntimeRunMock = vi.fn()
 const getGlobalEkkoAgentMock = vi.fn()
@@ -60,6 +61,7 @@ vi.mock('../../packages/server/src/modules/studio/public/chat-agent-runtime', ()
   createPrimaryAgentBridge: vi.fn(() => ({
     request: bridgeRequestMock,
     destroy: bridgeDestroyMock,
+    ackResult: bridgeAckMock,
   })),
   getChatEkkoAgent: getGlobalEkkoAgentMock,
   createChatEkkoModelClient: createModelClientMock,
@@ -72,6 +74,7 @@ describe('ChatContextCompressor', () => {
 
   beforeEach(() => {
     originalFetch = global.fetch
+    bridgeAckMock.mockClear()
     getCompressionSnapshotMock.mockReset()
     saveCompressionSnapshotMock.mockReset()
     deleteCompressionSnapshotMock.mockReset()
@@ -221,6 +224,21 @@ describe('ChatContextCompressor', () => {
     expect(result).toBe('hermes fallback summary')
     expect(ekkoRuntimeRunMock).toHaveBeenCalledTimes(1)
     expect(bridgeRequestMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([false, true])('ACKs the synchronous Hermes result only after snapshot persistence succeeds (failure=%s)', async fail => {
+    const { ChatContextCompressor } = await import('../../packages/server/src/modules/studio/services/context-compressor')
+    getCompressionSnapshotMock.mockReturnValue(null)
+    const order: string[] = []
+    bridgeRequestMock.mockResolvedValue({ run_id: 'summary-r', status: 'complete', deltas: ['summary'], events: [{event:'done'}], result: { final_response: 'summary' } })
+    saveCompressionSnapshotMock.mockImplementation(() => { order.push('persist'); if (fail) throw new Error('snapshot failed') })
+    bridgeAckMock.mockImplementation(async (...args: any[]) => { order.push('ack'); expect(args).toEqual(['summary-r',1,1]); return true })
+    const compressor = new ChatContextCompressor({ config: { headMessageCount: 0, tailMessageCount: 0 } })
+    const run = compressor.compress([{role:'user',content:'synthetic long context'}], '', undefined, 's1', {profile:'default',force:true})
+    if (fail) await expect(run).rejects.toThrow('snapshot failed')
+    else await run
+    expect(order).toEqual(fail ? ['persist'] : ['persist','ack'])
+    if (fail) expect(bridgeAckMock).not.toHaveBeenCalled()
   })
 
   it.each([false, true])('reports manual summarizer failure without replacing the snapshot (incremental=%s)', async incremental => {

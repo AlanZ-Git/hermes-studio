@@ -33,12 +33,20 @@ export function isSqliteAvailable(): boolean {
 // --- SQLite backend ---
 
 let _db: DatabaseSync | null = null
+let maintenancePath: string | undefined
+
+export function withMaintenanceDatabase(path: string, initialize: () => void): void {
+  if (_db || maintenancePath) throw new Error('maintenance requires unopened database')
+  maintenancePath = path
+  try { initialize() } finally { closeDb(); maintenancePath = undefined }
+}
 
 export function getDb(): DatabaseSync | null {
   if (!SQLITE_AVAILABLE) return null
   if (!_db) {
-    mkdirSync(DB_DIR, { recursive: true })
-    const candidate = new DatabaseSync(DB_PATH)
+    const path = maintenancePath || DB_PATH
+    mkdirSync(resolve(path, '..'), { recursive: true })
+    const candidate = new DatabaseSync(path)
     try {
       // Install the busy handler before changing journal mode so a transient
       // lock during startup does not immediately abort the whole bootstrap.

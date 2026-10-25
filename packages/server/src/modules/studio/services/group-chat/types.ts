@@ -93,7 +93,7 @@ export interface GatewayCaller {
         roomId: string,
         profile: string,
         previousSummary?: string,
-    ): Promise<{ summary: string; sessionId: string }>
+    ): Promise<{ summary: string; sessionId: string; acknowledge?: () => Promise<unknown> }>
 }
 
 export type SessionCleaner = (sessionId: string) => void

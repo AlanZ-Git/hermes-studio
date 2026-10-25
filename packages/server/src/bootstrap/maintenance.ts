@@ -3,6 +3,7 @@ import { createServer } from 'node:http'
 import { readFileSync, writeFileSync, openSync, closeSync, fsyncSync, lstatSync, existsSync, realpathSync, createReadStream } from 'node:fs'
 import { resolve } from 'node:path'
 import { createHash } from 'node:crypto'
+import { prepareState } from './maintenance-state'
 
 function readPrivate(path: string): any {
   const s = lstatSync(path)
@@ -15,20 +16,7 @@ function writeOnce(path: string, value: unknown): void {
   const dir = openSync(resolve(path, '..'), 'r')
   try { fsyncSync(dir) } finally { closeSync(dir) }
 }
-async function confirmWrites(request: any): Promise<Record<string, unknown>> {
-  const rows: Record<string, unknown> = {}
-  for (const path of request.write_sets.webui) {
-    if (!existsSync(path)) { rows[path] = { type: 'absent' }; continue }
-    const s = lstatSync(path)
-    if (!s.isFile()) throw new Error('maintenance target must be regular')
-    const fd = openSync(path, 'r')
-    try { fsyncSync(fd) } finally { closeSync(fd) }
-    const hash = createHash('sha256')
-    for await (const chunk of createReadStream(path)) hash.update(chunk)
-    rows[path] = { type: 'file', sha256: hash.digest('hex'), mode: s.mode & 0o777, bytes: s.size }
-  }
-  return rows
-}
+
 async function gate(attempt: string): Promise<void> {
   const root = resolve(attempt)
   const s = lstatSync(root)
@@ -43,14 +31,18 @@ async function gate(attempt: string): Promise<void> {
   }
   if (existsSync(resolve(root, 'webui.ready.json'))) throw new Error('unreleased maintenance restart requires recovery')
   const { initAllStores } = await import('../modules/studio/infrastructure/database/init')
-  const { closeDb } = await import('../modules/studio/infrastructure/database/index')
-  try { initAllStores(); closeDb() }
+  const { withMaintenanceDatabase } = await import('../modules/studio/infrastructure/database/index')
+  const writes: Parameters<typeof prepareState>[2] = {}
+  try {
+    await prepareState(root, request.write_sets.webui, writes, stage => {
+      withMaintenanceDatabase(resolve(stage, 'hermes-web-ui.db'), initAllStores)
+    })
+  }
   catch (error) {
-    closeDb()
-    writeOnce(resolve(root, 'webui.failed.json'), { status: 'maintenance_failed', attempt: request.attempt, nonce: request.nonce, pair: request.pair, role: 'webui', writes: await confirmWrites(request) })
+    writeOnce(resolve(root, 'webui.failed.json'), { status: 'maintenance_failed', attempt: request.attempt, nonce: request.nonce, pair: request.pair, role: 'webui', writes, declared_paths: request.write_sets.webui })
     throw error
   }
-  const status = { status: 'maintenance_ready', attempt: request.attempt, nonce: request.nonce, pair: request.pair, role: 'webui', pid: process.pid, business_started: false, writes: await confirmWrites(request), start_time: readFileSync('/proc/self/stat', 'utf8').split(') ').pop()!.split(' ')[19] }
+  const status = { status: 'maintenance_ready', attempt: request.attempt, nonce: request.nonce, pair: request.pair, role: 'webui', pid: process.pid, business_started: false, writes, declared_paths: request.write_sets.webui, start_time: readFileSync('/proc/self/stat', 'utf8').split(') ').pop()!.split(' ')[19] }
   const server = createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/health/cutover') { res.writeHead(200); res.end(JSON.stringify(status)); return }
     res.writeHead(503); res.end('maintenance')

@@ -83,6 +83,7 @@ vi.mock('../../packages/server/src/modules/studio/public/logging', () => ({
 }))
 
 vi.mock('../../packages/server/src/modules/studio/services/chat-run/compression', () => ({
+  getOrCreateSession: (sessions: Map<string,any>, id: string) => sessions.get(id),
   buildCompressedHistory: buildCompressedHistoryMock,
   buildDbHistory: buildDbHistoryMock,
   buildSnapshotAwareHistory: buildSnapshotAwareHistoryMock,
@@ -162,11 +163,42 @@ function makeState() {
 }
 
 describe('bridge run final context usage', () => {
+  it.each([false, true])('resume acknowledges exact cursors only after persistence succeeds (failure=%s)', async fail => {
+    const order: string[] = []
+    flushBridgePendingToDbMock.mockImplementation((state:any) => { if (!state.bridgePendingAssistantContent) return; order.push('persist'); if(fail) throw new Error('fixture persistence failed');state.bridgePendingAssistantContent='' })
+    const bridge = {
+      ackResult: vi.fn(async (...args:any[]) => { order.push('ack'); expect(args).toEqual(['resume-r',3,7]); return true }),
+      getResult: vi.fn(async () => ({deltas:[],events:[]})),
+      getOutput: vi.fn(async () => ({run_id:'resume-r',session_id:'session-1',done:true,status:'complete',delta:'answer',output:'answer',cursor:3,event_cursor:7,events:[]})),
+      request: vi.fn(async () => ({})),
+    } as any
+    const { resumeBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
+    await resumeBridgeRun(makeNamespace(vi.fn()),makeSocket(),{sessionId:'session-1',runId:'resume-r',profile:'default',instructions:''},new Map([['session-1',makeState()]]),bridge,vi.fn())
+    expect(order).toEqual(fail ? ['persist'] : ['persist','ack'])
+    if(fail) expect(bridge.ackResult).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('chat acknowledges exact cursors only after persistence succeeds (failure=%s)', async fail => {
+    const order: string[] = []
+    flushBridgePendingToDbMock.mockImplementation((state:any) => { if (!state.bridgePendingAssistantContent) return; order.push('persist'); if(fail) throw new Error('fixture persistence failed');state.bridgePendingAssistantContent='' })
+    const bridge = {
+      ackResult: vi.fn(async (...args:any[]) => { order.push('ack'); expect(args).toEqual(['chat-r',4,9]); return true }),
+      chat: vi.fn(async () => ({run_id:'chat-r'})),
+      contextEstimate: vi.fn(async () => ({token_count:10,fixed_context_tokens:0})),
+      streamOutput: vi.fn(async function* () { yield {run_id:'chat-r',session_id:'session-1',done:true,status:'complete',delta:'answer',output:'answer',cursor:4,event_cursor:9,events:[]} }),
+      request: vi.fn(async () => ({})),
+    } as any
+    const { handleBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
+    const run=handleBridgeRun(makeNamespace(vi.fn()),makeSocket(),{session_id:'session-1',input:'synthetic'},'default',new Map([['session-1',makeState()]]),bridge,false,vi.fn(),vi.fn())
+    if(fail) { await expect(run).rejects.toThrow('fixture persistence failed'); expect(order.length).toBeGreaterThan(0);expect(order.every(x=>x==='persist')).toBe(true);expect(bridge.ackResult).not.toHaveBeenCalled() }
+    else { await run;expect(order).toEqual(['persist','ack']) }
+  })
   beforeEach(() => {
     const home = mkdtempSync(join(tmpdir(), 'hermes-bridge-run-token-'))
     homes.push(home)
     process.env.HERMES_WEB_UI_HOME = home
     vi.clearAllMocks()
+    flushBridgePendingToDbMock.mockReset()
     getSystemPromptMock.mockReturnValue('system prompt')
     issueModelRunJwtMock.mockResolvedValue('model-run-token')
     getSessionMock.mockReturnValue({ id: 'session-1', profile: 'default', model: '', provider: '' })
@@ -242,6 +274,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-claude', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 100,
@@ -309,6 +342,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const terminal = { event: 'approval.resolved', approval_id: 'approval-1', choice: null, resolved: false, terminal: true, outcome: 'timeout' }
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({ token_count: 100 }),
       streamOutput: vi.fn(async function* () {
@@ -337,6 +371,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -403,6 +438,7 @@ describe('bridge run final context usage', () => {
     const socket = makeSocket()
     const sessionMap = new Map([['session-1', makeState()]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({ token_count: 1, fixed_context_tokens: 1, message_count: 1, tool_count: 0, system_prompt_chars: 1 }),
       streamOutput: vi.fn(async function* () {
@@ -475,6 +511,7 @@ describe('bridge run final context usage', () => {
     let cachedSystem = ''
     const contexts: string[] = []
     const bridge = {
+      ackResult: vi.fn(async () => true),
       contextEstimate: vi.fn().mockResolvedValue({ token_count: 10, fixed_context_tokens: 10 }),
       chat: vi.fn(async (_sid, message, _history, system, _profile, options) => {
         cachedSystem ||= system // Emulate Hermes retaining its first system prompt.
@@ -544,6 +581,7 @@ describe('bridge run final context usage', () => {
       })
     }
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'old-run', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({ fixed_context_tokens: 10 }),
       streamOutput: vi.fn(async function* () {
@@ -577,6 +615,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -646,6 +685,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -738,6 +778,7 @@ describe('bridge run final context usage', () => {
     })
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -811,6 +852,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -894,6 +936,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -940,6 +983,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -1001,6 +1045,7 @@ describe('bridge run final context usage', () => {
       throw new Error('workflow synthetic completion must not judge standing goals')
     })
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -1059,6 +1104,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -1106,6 +1152,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const order: string[] = []
     const bridge = {
+      ackResult: vi.fn(async () => true),
       contextEstimate: vi.fn().mockResolvedValue({ token_count: 10, fixed_context_tokens: 5 }),
       chat: vi.fn(async () => { order.push('chat'); throw new Error('response lost after send') }),
     } as any
@@ -1129,6 +1176,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 42,
@@ -1169,6 +1217,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['workflow-session', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-workflow', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 42,
@@ -1228,6 +1277,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['workflow-session', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-workflow', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 42,
@@ -1286,6 +1336,7 @@ describe('bridge run final context usage', () => {
       const sessionMap = new Map([['workflow-session', state]])
       const dequeueNextQueuedRun = vi.fn()
       const bridge = {
+      ackResult: vi.fn(async () => true),
         chat: vi.fn().mockResolvedValue({ run_id: 'run-workflow', status: 'started' }),
         contextEstimate: vi.fn().mockResolvedValue({
           token_count: 42,
@@ -1347,6 +1398,7 @@ describe('bridge run final context usage', () => {
       const sessionMap = new Map([['ordinary-session', state]])
       const dequeueNextQueuedRun = vi.fn()
       const bridge = {
+      ackResult: vi.fn(async () => true),
         chat: vi.fn().mockResolvedValue({ run_id: `run-${runSource}`, status: 'started' }),
         contextEstimate: vi.fn().mockResolvedValue({
           token_count: 42,
@@ -1406,6 +1458,7 @@ describe('bridge run final context usage', () => {
     const dequeueNextQueuedRun = vi.fn()
     addMessageMock.mockReturnValue(42)
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -1480,6 +1533,7 @@ describe('bridge run final context usage', () => {
     const dequeueNextQueuedRun = vi.fn()
     addMessageMock.mockReturnValue(43)
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       command: vi.fn(),
       contextEstimate: vi.fn().mockResolvedValue({
@@ -1537,6 +1591,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn(),
       streamOutput: vi.fn(async function* () {
@@ -1606,6 +1661,7 @@ describe('bridge run final context usage', () => {
       return { inputTokens: 28_000, outputTokens: 0 }
     })
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn(),
       streamOutput: vi.fn(async function* () {
@@ -1684,6 +1740,7 @@ describe('bridge run final context usage', () => {
     })
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -1758,6 +1815,7 @@ describe('bridge run final context usage', () => {
       })
       completeWorkspaceRunCheckpointMock.mockReturnValue(change)
       const bridge = {
+      ackResult: vi.fn(async () => true),
         chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
         contextEstimate: vi.fn().mockResolvedValue({
           token_count: 12345,
@@ -1830,6 +1888,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -1894,6 +1953,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -1956,6 +2016,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -2018,6 +2079,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockRejectedValue(new Error('bridge timeout')),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 54321,
@@ -2063,6 +2125,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({
         token_count: 12345,
@@ -2131,6 +2194,7 @@ describe('bridge run final context usage', () => {
       { role: 'assistant', content: 'The background task is running.' },
     ]
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'origin-run', status: 'started' }),
       contextEstimate: vi.fn().mockResolvedValue({ token_count: 100, message_count: 2 }),
       streamOutput: vi.fn(async function* () {
@@ -2213,6 +2277,7 @@ describe('bridge run final context usage', () => {
     state.backgroundContinuationContexts = { 'delegation-1': callbackContext }
     resolveBridgeRunModelConfigMock.mockResolvedValueOnce({ model: 'origin-model', provider: 'origin-provider' })
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn().mockResolvedValue({ run_id: 'callback-run', status: 'started' }),
       completeBackgroundNotification: vi.fn().mockResolvedValue(undefined),
       contextEstimate: vi.fn().mockResolvedValue({ token_count: 100, message_count: 2 }),
@@ -2273,6 +2338,7 @@ describe('bridge run final context usage', () => {
     addMessageMock.mockReturnValueOnce(101)
     buildCompressedHistoryMock.mockResolvedValueOnce(previous)
     const bridge = {
+      ackResult: vi.fn(async () => true),
       contextEstimate: vi.fn().mockResolvedValue({ token_count: 100 }),
       chat: vi.fn().mockImplementation(async () => {
         expect(addMessageMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -2304,6 +2370,7 @@ describe('bridge run final context usage', () => {
     const state = makeState()
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
+      ackResult: vi.fn(async () => true),
       chat: vi.fn(),
       completeBackgroundNotification: vi.fn().mockResolvedValue(undefined),
     } as any

@@ -250,6 +250,7 @@ export class ContextEngine {
             if (result.summary) {
                 const lastMsg = newMessages[newMessages.length - 1]
                 this.messageFetcher.saveContextSnapshot(input.roomId, result.summary, lastMsg.id, lastMsg.timestamp)
+                await result.acknowledge?.()
 
                 meta.summaryTokenEstimate = this.countTokens(result.summary)
                 const history = this.buildHistory(result.summary, newMessages, input.agentId, input.agentSocketId, input.agentName)
@@ -368,6 +369,7 @@ export class ContextEngine {
             const lastCompressedMsg = toCompress[toCompress.length - 1]
 
             this.messageFetcher.saveContextSnapshot(input.roomId, result.summary, lastCompressedMsg.id, lastCompressedMsg.timestamp)
+            await result.acknowledge?.()
 
             meta.summaryTokenEstimate = this.countTokens(result.summary)
             const history = this.buildHistory(result.summary, tail, input.agentId, input.agentSocketId, input.agentName)
@@ -433,6 +435,7 @@ export class ContextEngine {
             const lastCompressedMsg = toCompress[toCompress.length - 1]
 
             this.messageFetcher.saveContextSnapshot(roomId, result.summary, lastCompressedMsg.id, lastCompressedMsg.timestamp)
+            await result.acknowledge?.()
             logger.debug(`[ContextEngine] forceCompress DONE in ${elapsed}ms`)
             if (result.sessionId) this.sessionCleaner?.(result.sessionId)
             return result.summary
@@ -466,7 +469,7 @@ export class ContextEngine {
         apiKey: string | null,
         profile: string,
         previousSummary?: string,
-    ): Promise<{ summary: string | null; sessionId: string | null }> {
+    ): Promise<{ summary: string | null; sessionId: string | null; acknowledge?: () => Promise<unknown> }> {
         if (messages.length === 0 && !previousSummary) return { summary: null, sessionId: null }
 
         try {
@@ -479,7 +482,7 @@ export class ContextEngine {
                 profile,
                 previousSummary,
             )
-            return { summary: result.summary, sessionId: result.sessionId }
+            return { summary: result.summary, sessionId: result.sessionId, acknowledge: result.acknowledge }
         } catch (err: any) {
             logger.warn(`[ContextEngine] Summarization failed for room ${roomId}: ${err.message}`)
             return { summary: null, sessionId: null }

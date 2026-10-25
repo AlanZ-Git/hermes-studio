@@ -38,6 +38,7 @@ const bridgeMock = vi.hoisted(() => ({
     }
   }),
   contextEstimate: vi.fn(),
+  ackResult: vi.fn(async () => true),
   request: vi.fn(),
   interrupt: vi.fn(),
   destroy: vi.fn(),
@@ -1520,6 +1521,22 @@ describe('group chat agent workspace bridge runs', () => {
       complete.mockRestore()
       client?.disconnect()
     }
+  })
+
+  it.each([false, true])('acknowledges group terminal output only after Room persistence (failure=%s)', async fail => {
+    const order: string[] = []
+    bridgeMock.ackResult.mockImplementation(async (...args:any[]) => { order.push('ack'); expect(args).toEqual(['bridge-run-id',1,0]); return true })
+    mockSocket.emit.mockImplementation((event:string,data?:any,ack?:Function) => {
+      if(event==='message') { order.push('persist'); ack?.(fail ? {error:'Room persistence failed'} : {id:data?.id || 'fixture'}) }
+      return mockSocket
+    })
+    const client=await createClient('')
+    await client.replyToMention('room-1',{messageId:'fixture',content:'@Worker answer',senderName:'Human',senderId:'human-1',timestamp:1,role:'user'})
+    expect(order).toContain('persist')
+    if(fail) expect(bridgeMock.ackResult).not.toHaveBeenCalled()
+    else { expect(bridgeMock.ackResult).toHaveBeenCalledOnce();expect(order.indexOf('ack')).toBeGreaterThan(order.indexOf('persist')) }
+    client.disconnect()
+    bridgeMock.ackResult.mockImplementation(async () => true)
   })
 
   async function createClient(

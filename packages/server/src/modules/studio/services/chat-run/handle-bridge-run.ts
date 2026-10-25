@@ -975,6 +975,7 @@ export async function handleBridgeRun(
         shouldPersistUserMessage && displayRole === 'user',
         data.model_groups,
         runMetadata,
+        false,
       )
     }
   } catch (err: any) {
@@ -1343,6 +1344,7 @@ async function applyBridgeChunkAsync(
   currentInputIncludedInDb = true,
   modelGroups?: RunModelGroup[],
   runMetadata?: BridgeRunMetadata,
+  acknowledgeTerminal = true,
 ): Promise<void> {
   if (sessionMap.get(sessionId) !== state || state.activeRunMarker !== runMarker) {
     bridgeLogger.info({
@@ -1797,6 +1799,7 @@ async function applyBridgeChunkAsync(
       true,
       runMarker,
     )
+    if (acknowledgeTerminal) await bridge.ackResult(chunk.run_id, chunk.cursor, chunk.event_cursor)
     return
   }
 
@@ -1825,6 +1828,7 @@ async function applyBridgeChunkAsync(
   flushPendingToolMarkupToAssistant(state, runMarker, chunk.run_id, emit)
   flushBridgePendingToDb(state, sessionId, runMarker)
   finalResponse = bridgeFinalResponse(chunk, state, useMoaFinalResponse)
+  if (acknowledgeTerminal) await bridge.ackResult(chunk.run_id, chunk.cursor, chunk.event_cursor)
   state.bridgePendingToolCallMarkup = undefined
   if (runMetadata?.backgroundDelegationIds.size) {
     const exactMessages = resultMessages(chunk.result)

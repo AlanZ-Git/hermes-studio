@@ -27,6 +27,7 @@ export function flushBridgePendingToDb(state: SessionState, sessionId: string, r
       timestamp: Math.floor(Date.now() / 1000),
     }],
   })
+  if (persistedId == null) throw new Error('Bridge result was not persisted; acknowledgement withheld')
   state.bridgePendingAssistantContent = ''
   state.bridgePendingReasoningContent = ''
   if (persistedId != null) {

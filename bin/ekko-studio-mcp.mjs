@@ -248,7 +248,27 @@ async function fetchMobileConsent(url, options) {
   })
 }
 
+function enforceCurrentSessionLoop(path, options = {}, document = false) {
+  if (process.env.HERMES_WEB_UI_API_SCOPE !== 'current-session-loop') return
+  const session = process.env.HERMES_STUDIO_SESSION_ID
+  const profile = options.profile === undefined ? defaultProfile() : options.profile
+  const method = options.method || 'GET'
+  const reject = () => { throw new Error('Current-session loop API scope rejected') }
+  if (!MODEL_RUN_BINDING || !session || profile !== MODEL_RUN_BINDING.profile || defaultProfile() !== MODEL_RUN_BINDING.profile) reject()
+  if (options.token !== undefined || options.query && Object.keys(options.query).length || options.headers && Object.keys(options.headers).length) reject()
+  if (path === '/api/openapi.json' && method === 'GET' && options.body === undefined && document) return
+  if (path !== '/api/studio/chat-run/runs' || method !== 'POST' || !isRecord(options.body)) reject()
+  const body = options.body
+  if (Object.keys(body).some(key => !['session_id', 'profile', 'input', 'timeout_ms', 'include_events'].includes(key))
+    || body.session_id !== session || body.profile !== MODEL_RUN_BINDING.profile
+    || typeof body.input !== 'string' || !/^\/loop(?:\s|$)/.test(body.input) || body.input.includes('\0')
+    || body.timeout_ms !== undefined && (!Number.isSafeInteger(body.timeout_ms) || body.timeout_ms < 1 || body.timeout_ms > 1800000)
+    || body.include_events !== undefined && typeof body.include_events !== 'boolean') reject()
+}
+
 async function requestEnvelope(path, options = {}) {
+  // Must precede credential access and every fetch, including schema lookup.
+  enforceCurrentSessionLoop(path, options, true)
   const profile = typeof options.profile === 'string' && options.profile.trim()
     ? options.profile.trim()
     : defaultProfile()
@@ -1937,12 +1957,16 @@ async function callToolInner(name, args = {}, signal) {
     case 'ekko_studio_browser_console':
       return jsonText(await browserRequest(args.action === 'clear' ? 'console.clear' : 'console.read', { tab_id: args.tab_id }))
     case 'ekko_studio_api_openapi_get':
+      enforceCurrentSessionLoop('/api/openapi.json', withAuthArgs(args), true)
       return jsonText(compactOpenApiDocument(await openApiDocument(withAuthArgs(args)), args))
     case 'ekko_studio_api_request': {
       const method = normalizeApiMethod(args.method)
       const path = normalizeApiPath(args.path)
       if (!method) return errorText('Invalid method. Allowed: GET, POST, PUT, PATCH, DELETE, HEAD.')
       if (!path) return errorText('Invalid path. Use a relative /api/... or /health path from ekko_studio_api_openapi_get; full URLs are not allowed.')
+      if (process.env.HERMES_WEB_UI_API_SCOPE === 'current-session-loop'
+        && Object.keys(args).some(key => !['method', 'path', 'profile', 'body', 'query', 'headers'].includes(key))) throw new Error('Current-session loop API fields rejected')
+      enforceCurrentSessionLoop(path, { ...args, method }, true)
       const validationError = await validateApiRequest(method, path, args)
       if (validationError) return errorText(`Invalid API request for ${method} ${pathWithoutQuery(path)}: ${validationError}. Use ekko_studio_api_openapi_get to inspect required parameters and requestBody.`)
       const options = withAuthArgs(args, {

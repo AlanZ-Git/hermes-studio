@@ -93,6 +93,7 @@ export interface SummarizerOptions {
   historyRevision?: number
   workerKey?: string
   allowHermesFallback?: boolean
+  deferResultAck?: (acknowledge: () => Promise<unknown>) => void
 }
 
 type SummarizerConversationMessage = {
@@ -721,6 +722,14 @@ async function callHermesSummarizer(
     if (/^API call failed(?: after \d+ retries)?:/i.test(output)) {
       throw new Error('Invalid summarization response: provider failure text')
     }
+    if (result.status === 'running') throw new Error('Summarization finalizer is still active')
+    const snapshot = result as unknown as { run_id: string; deltas: unknown[]; events: unknown[] }
+    const acknowledge = async () => {
+      if (!snapshot.run_id || !Array.isArray(snapshot.deltas) || !Array.isArray(snapshot.events)) return false
+      return bridge.ackResult(snapshot.run_id, snapshot.deltas.length, snapshot.events.length)
+    }
+    if (options.deferResultAck) options.deferResultAck(acknowledge)
+    else await acknowledge()
     return output
   } finally {
     try {
@@ -909,12 +918,14 @@ export class ChatContextCompressor {
     )
 
     let summary: string | null = null
+    let acknowledge: (() => Promise<unknown>) | undefined
     try {
       const contentToSummarize = serializeForSummary(toCompress)
       const prompt = buildIncrementalPrompt(previousSummary, contentToSummarize, this.config.summaryBudget)
 
       const t0 = Date.now()
-      const summaryOptions = { ...(typeof summarizer === 'string' ? { profile: summarizer } : summarizer), sessionId }
+      const summaryOptions = { ...(typeof summarizer === 'string' ? { profile: summarizer } : summarizer), sessionId,
+        deferResultAck: (ack: () => Promise<unknown>) => { acknowledge = ack } }
       summary = await callSummarizer(upstream, apiKey, prompt, [], this.config.summarizationTimeoutMs, previousSummary, summaryOptions)
       logger.info('[context-compressor] incremental-llm done in %dms, %d chars', Date.now() - t0, summary.length)
     } catch (err: any) {
@@ -980,6 +991,7 @@ export class ChatContextCompressor {
       if (saved === false) throw new Error('Compression snapshot changed while summarizing')
     }
 
+    await acknowledge?.()
     return {
       messages: result,
       meta: {
@@ -1030,9 +1042,11 @@ export class ChatContextCompressor {
     const prompt = buildFullPrompt(contentToSummarize, this.config.summaryBudget)
 
     let summary: string | null = null
+    let acknowledge: (() => Promise<unknown>) | undefined
     try {
       const t0 = Date.now()
-      const summaryOptions = { ...(typeof summarizer === 'string' ? { profile: summarizer } : summarizer), sessionId }
+      const summaryOptions = { ...(typeof summarizer === 'string' ? { profile: summarizer } : summarizer), sessionId,
+        deferResultAck: (ack: () => Promise<unknown>) => { acknowledge = ack } }
       summary = await callSummarizer(upstream, apiKey, prompt, [], this.config.summarizationTimeoutMs, undefined, summaryOptions)
       logger.info('[context-compressor] full-llm done in %dms, %d chars', Date.now() - t0, summary.length)
     } catch (err: any) {
@@ -1069,6 +1083,7 @@ export class ChatContextCompressor {
       if (saved === false) throw new Error('Compression snapshot changed while summarizing')
     }
 
+    await acknowledge?.()
     result.push(...tail)
     const budgetedResult = enforceCompressedBudget(result, this.config.triggerTokens, head.length)
 

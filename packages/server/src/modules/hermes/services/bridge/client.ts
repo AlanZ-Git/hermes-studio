@@ -324,7 +324,7 @@ export class AgentBridgeClient {
   }
 
   async close(): Promise<void> {
-    return undefined
+    await this.flushResultAcks()
   }
 
   private connectSocketOnce(): Promise<Socket> {
@@ -636,6 +636,32 @@ export class AgentBridgeClient {
     }
   }
 
+  /** Explicit consumer boundary. Reads alone never acknowledge a result. */
+  private readonly resultAcks = new Map<string, { cursor: number; event_cursor: number }>()
+
+  async ackResult(runId: string, cursor: number, eventCursor: number): Promise<boolean> {
+    if (!Number.isSafeInteger(cursor) || cursor < 0 || !Number.isSafeInteger(eventCursor) || eventCursor < 0) return false
+    const pending = { cursor, event_cursor: eventCursor }
+    this.resultAcks.set(runId, pending)
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const response = await this.request({ action: 'result_ack', run_id: runId, ...pending }, { timeoutMs: 2000 })
+        if (response.acknowledged === true) {
+          if (this.resultAcks.get(runId) === pending) this.resultAcks.delete(runId)
+          return true
+        }
+      } catch (error) {
+        bridgeLogger.warn({ runId, attempt, error }, '[agent-bridge-client] consumed result ACK retained for retry')
+      }
+      if (attempt < 2) await delay(100 * (attempt + 1))
+    }
+    return false
+  }
+
+  async flushResultAcks(): Promise<void> {
+    for (const [runId, pending] of this.resultAcks) await this.ackResult(runId, pending.cursor, pending.event_cursor)
+  }
+
   async chatStream(
     sessionId: string,
     message: AgentBridgeMessage,
@@ -646,9 +672,10 @@ export class AgentBridgeClient {
     let last: AgentBridgeOutput | null = null
     for await (const chunk of this.streamOutput(started.run_id, options)) {
       last = chunk
-      if (chunk.delta) await onDelta(chunk.delta, chunk)
+      if (chunk.delta || chunk.done || chunk.events?.length) await onDelta(chunk.delta, chunk)
     }
     if (!last) throw new Error(`Agent bridge run ${started.run_id} produced no output state`)
+    if (last.done) await this.ackResult(last.run_id, last.cursor, last.event_cursor)
     return last
   }
 

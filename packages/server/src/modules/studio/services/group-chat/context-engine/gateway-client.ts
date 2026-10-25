@@ -26,7 +26,7 @@ export class GatewaySummarizer implements GatewayCaller {
         roomId: string,
         profile: string,
         previousSummary?: string,
-    ): Promise<{ summary: string; sessionId: string }> {
+    ): Promise<{ summary: string; sessionId: string; acknowledge?: () => Promise<unknown> }> {
         const history: Array<{ role: string; content: string }> = messages.map(m => ({
             role: 'user',
             content: summarizeMessageForPrompt(m),
@@ -68,9 +68,12 @@ export class GatewaySummarizer implements GatewayCaller {
             const payload = result.result as any
             const output = String(payload?.final_response || result.output || '').trim()
             if (!output) throw new Error('Empty summarization response')
+            const snapshot = result
+            if (snapshot.status === 'running') throw new Error('Summarization finalizer is still active')
 
             logger.debug(`[GatewaySummarizer] Bridge compression completed for room ${roomId} (profile=${profile})`)
-            return { summary: output, sessionId }
+            return { summary: output, sessionId,
+                acknowledge: () => bridge.ackResult(snapshot.run_id, snapshot.deltas.length, snapshot.events.length) }
         } finally {
             await bridge.destroy(sessionId, profile).catch(() => undefined)
         }

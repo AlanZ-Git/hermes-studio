@@ -75,6 +75,7 @@ export function persistRunMessages(
   const ids = atomic
     ? addMessages(rows).map(id => id as number | undefined)
     : rows.map(row => addMessage(row))
+  if (ids.length !== rows.length || ids.some(id => id == null)) throw new Error('Run messages were not persisted')
 
   messages.forEach((message, index) => {
     const persistedId = ids[index]

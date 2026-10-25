@@ -1674,6 +1674,7 @@ export class AgentClient implements GroupAgentExecutor {
                     return
                 }
                 await this.sendAgentErrorMessage(roomId, streamMessageId, lastChunk.error || 'Run failed', msg, reasoningContent, sessionId, runMessageId)
+                if (lastChunk.done) await bridge.ackResult(lastChunk.run_id, lastChunk.cursor, lastChunk.event_cursor)
                 await this.finalizeWorkspaceDiffOnce(workspaceRunState, 'failed', streamStarted ? streamMessageId : null)
                 this.emitMessageStreamEnd(roomId, streamMessageId, sessionId)
                 this.stopTyping(roomId)
@@ -1706,6 +1707,7 @@ export class AgentClient implements GroupAgentExecutor {
                     reasoning_content: reasoningContent || null,
                 }, sessionId)
                 this.emitMessageStreamEnd(roomId, streamMessageId, sessionId)
+                if (lastChunk?.done) await bridge.ackResult(lastChunk.run_id, lastChunk.cursor, lastChunk.event_cursor)
                 await this.finalizeWorkspaceDiffOnce(workspaceRunState, 'completed', streamMessageId)
                 reportStatus('ready')
                 return
@@ -1717,6 +1719,7 @@ export class AgentClient implements GroupAgentExecutor {
             }
             this.emitMessageStreamEnd(roomId, streamMessageId, sessionId)
             await this.finalizeWorkspaceDiffOnce(workspaceRunState, 'completed', streamStarted ? streamMessageId : null)
+            if (lastChunk?.done) await bridge.ackResult(lastChunk.run_id, lastChunk.cursor, lastChunk.event_cursor)
             this.stopTyping(roomId)
             reportStatus('ready')
         } catch (err: any) {
