@@ -1780,6 +1780,16 @@ async function applyBridgeChunkAsync(
   if (!chunk.done) return
   if (!state.isWorking) return
   if (state.isAborting) {
+    // Abort usage is best-effort, but terminal text must be durable before
+    // completion can release the run and ACK its consumption responsibility.
+    try {
+      flushPendingToolMarkupToAssistant(state, runMarker, chunk.run_id, emit)
+      flushBridgePendingToDb(state, sessionId, runMarker)
+    } catch (err) {
+      bridgeLogger.warn({ err, sessionId, runId: chunk.run_id },
+        '[chat-run-socket][abort] terminal persistence failed; retaining run for resume without ACK')
+      return
+    }
     bridgeLogger.info({
       sessionId,
       runId: chunk.run_id,

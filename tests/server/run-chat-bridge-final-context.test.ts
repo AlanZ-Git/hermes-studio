@@ -163,6 +163,48 @@ function makeState() {
 }
 
 describe('bridge run final context usage', () => {
+it.each([false,true])('abort terminal requires actual message persistence (failure=%s)', async fail => {
+  const order: string[] = []
+  const real = await vi.importActual<any>('../../packages/server/src/modules/studio/services/chat-run/bridge-message')
+  addMessageMock.mockImplementation(() => fail ? undefined : 42)
+  flushBridgePendingToDbMock.mockImplementation((...args:any[]) => {
+    if(args[0].bridgePendingAssistantContent) order.push('persist')
+    return real.flushBridgePendingToDb(...args)
+  })
+  const state:any = makeState(); state.isAborting = true
+  const bridge:any = {
+    ackResult: vi.fn(async () => { order.push('ack'); return true }),
+    getResult: vi.fn(async () => ({deltas:[],events:[]})),
+    getOutput: vi.fn(async () => ({run_id:'abort-r',session_id:'session-1',done:true,status:'interrupted',delta:'late abort text',output:'late abort text',cursor:1,event_cursor:0,events:[]})),
+    request: vi.fn(async () => ({})),
+  }
+  const { resumeBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
+  await resumeBridgeRun(makeNamespace(vi.fn()),makeSocket(),{sessionId:'session-1',runId:'abort-r',profile:'default',instructions:''},new Map([['session-1',state]]),bridge,vi.fn())
+  console.log('REVIEW_ABORT_REAL_FACT', JSON.stringify({order,pending:state.bridgePendingAssistantContent,acks:bridge.ackResult.mock.calls,repositoryWrites:addMessageMock.mock.calls.length}))
+  expect(order).toEqual(fail ? ['persist'] : ['persist','ack'])
+  if (fail) {
+    expect(bridge.ackResult).not.toHaveBeenCalled()
+    expect(state.bridgePendingAssistantContent).toBe('late abort text')
+    expect(state.isAborting).toBe(true)
+    expect(state.runId).toBe('abort-r')
+    expect(state.activeRunMarker).toBeTruthy()
+    addMessageMock.mockReturnValue(42)
+    bridge.getResult.mockResolvedValue({ deltas: ['late abort text'], output: 'late abort text', events: [] })
+    bridge.getOutput.mockResolvedValue({ run_id: 'abort-r', session_id: 'session-1', done: true,
+      status: 'interrupted', delta: '', output: 'late abort text', cursor: 1, event_cursor: 0, events: [] })
+    await resumeBridgeRun(makeNamespace(vi.fn()), makeSocket(),
+      { sessionId: 'session-1', runId: 'abort-r', profile: 'default', instructions: '' },
+      new Map([['session-1', state]]), bridge, vi.fn())
+    expect(order).toEqual(['persist', 'persist', 'ack'])
+    expect(state.bridgePendingAssistantContent).toBe('')
+    expect(state.isAborting).toBe(false)
+    expect(bridge.ackResult.mock.calls).toEqual([['abort-r', 1, 0]])
+    expect(addMessageMock.mock.calls[1][0].content).toBe('late abort text')
+  } else {
+    expect(bridge.ackResult.mock.calls).toEqual([['abort-r', 1, 0]])
+  }
+})
+
   it.each([false, true])('resume acknowledges exact cursors only after persistence succeeds (failure=%s)', async fail => {
     const order: string[] = []
     flushBridgePendingToDbMock.mockImplementation((state:any) => { if (!state.bridgePendingAssistantContent) return; order.push('persist'); if(fail) throw new Error('fixture persistence failed');state.bridgePendingAssistantContent='' })
