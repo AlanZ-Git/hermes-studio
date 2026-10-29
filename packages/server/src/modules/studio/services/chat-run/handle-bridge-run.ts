@@ -1,3 +1,4 @@
+import { beginKanbanConsumption, completeKanbanConsumption, consumeStoppedKanbanNotification, kanbanNotificationReceipt, settleKanbanConsumption } from '../../repositories/kanban-notification-store'
 import { studioSessionAccount } from '../../contracts/runs/usage'
 import { completeRunUsage } from '../../repositories/run-usage-store'
 import { hermesStudioMcpCapabilities } from './studio-mcp'
@@ -731,18 +732,41 @@ export async function handleBridgeRun(
   }
 
   let backgroundNotificationAccepted = false
+  const kanbanDelivery = data.background_notification_kind === 'kanban' ? data.background_delegation_id : undefined
+  let kanbanDispatched = false
+  let kanbanSettled = false
+  const finishWithoutModel = () => {
+    if (state.activeRunMarker !== runMarker) return
+    state.isWorking = false
+    state.activeRunMarker = undefined
+    state.bridgeRunPollMarker = undefined
+    state.runId = undefined
+    state.profile = undefined
+    if (state.queue.length) dequeueNextQueuedRun(socket, session_id, profile)
+  }
 
   state.bridgeRunPollMarker = runMarker
   let modelRunAuth: ModelRunAuth | undefined
   // Inside the run's failure cleanup: a pre-run error (e.g. context window too small) must settle this run.
   try {
     data.loopAuthorize?.()
-    if (!shouldPersistUserMessage && data.background_notification_kind === 'kanban') {
-      const id = addMessage({ session_id, role: 'user', content: actualInputStr,
-        display_role: 'internal', display_content: '', run_marker: runMarker, timestamp: now })
-      if (id == null) throw new Error('Cannot persist Kanban notification input')
-      state.messages.push({ id, session_id, role: 'user', content: actualInputStr,
-        display_role: 'internal', display_content: '', runMarker, run_marker: runMarker, timestamp: now })
+    if (kanbanDelivery) {
+      const receipt = kanbanNotificationReceipt(kanbanDelivery)
+      if (!receipt || receipt.session_id !== session_id || receipt.profile !== profile) throw new Error('Kanban receipt target changed')
+      const notification = JSON.parse(receipt.notification)
+      const current = await bridge.request({ action: 'background_notification_status', session_id,
+        profile, delegation_id: kanbanDelivery, notification_identity: notification.identity,
+        board_db_identity: notification.board_db_identity })
+      if (!current.current) throw new Error('Kanban notification source identity must be reconciled before consumption')
+      if (current.execution_stopped) {
+        kanbanSettled = consumeStoppedKanbanNotification(kanbanDelivery, session_id)
+        finishWithoutModel()
+        return
+      }
+    }
+    if (kanbanDelivery && kanbanNotificationReceipt(kanbanDelivery)?.consumer_state !== 'pending') {
+      finishWithoutModel()
+      return
     }
     modelRunAuth = await createModelRunSource(socketUser, profile, runMarker)
     state.modelRunAuth = modelRunAuth
@@ -835,6 +859,13 @@ export async function handleBridgeRun(
     if (sessionMap.get(session_id) !== state || state.activeRunMarker !== runMarker) return
     data.loopAuthorize?.()
     data.loopDispatchConfirmed?.()
+    // Stay recoverably pending throughout preparation. Once dispatch may have
+    // happened, never return to pending: external side effects can be unknown.
+    if (kanbanDelivery && !beginKanbanConsumption(kanbanDelivery, session_id, runMarker)) {
+      finishWithoutModel()
+      return
+    }
+    kanbanDispatched = Boolean(kanbanDelivery)
     const started = await bridge.chat(
       session_id,
       bridgeInput as AgentBridgeMessage,
@@ -858,7 +889,7 @@ export async function handleBridgeRun(
     )
     if (sessionMap.get(session_id) !== state || state.activeRunMarker !== runMarker) return
     state.runId = started.run_id
-    if (data.background_delegation_id && data.background_claim_id) {
+    if (data.background_delegation_id && data.background_claim_id && !kanbanDelivery) {
       await bridge.completeBackgroundNotification(
         session_id,
         profile,
@@ -931,11 +962,22 @@ export async function handleBridgeRun(
         runMetadata,
       )
       if (chunk.done) {
+        if (kanbanDelivery) {
+          if (chunk.status === 'complete' && !chunk.error) {
+            completeKanbanConsumption(kanbanDelivery, session_id, runMarker)
+            kanbanSettled = true
+          } else {
+            // Model failure is still an obligation, never successful consumption.
+            settleKanbanConsumption(kanbanDelivery, session_id, runMarker, 'uncertain', chunk.error || chunk.status)
+            kanbanSettled = true
+          }
+        }
         sawTerminalChunk = true
         void pollBridgeGeneratedTitleAfterRun(bridge, session_id, profile, emit)
         break
       }
     }
+    if (!sawTerminalChunk && kanbanDelivery) throw new Error('Kanban consumer ended without a proven terminal result')
     if (!sawTerminalChunk && state.activeRunMarker === runMarker && state.isWorking) {
       bridgeLogger.warn({
         sessionId: session_id,
@@ -979,7 +1021,10 @@ export async function handleBridgeRun(
       )
     }
   } catch (err: any) {
-    if (data.background_delegation_id && data.background_claim_id && !backgroundNotificationAccepted) {
+    if (kanbanDelivery && kanbanDispatched && !kanbanSettled) {
+      settleKanbanConsumption(kanbanDelivery, session_id, runMarker, 'uncertain', String(err))
+    }
+    if (data.background_delegation_id && data.background_claim_id && !kanbanDelivery && !backgroundNotificationAccepted) {
       void bridge.releaseBackgroundNotification(
         session_id,
         profile,

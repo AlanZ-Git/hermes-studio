@@ -246,7 +246,7 @@ class WorkerProcess:
 # Maintenance must neither refresh business idle nor resurrect an old generation.
 MAINTENANCE_ACTIONS = frozenset({
     "ping", "list", "status", "get_history", "get_session_title", "get_result", "get_output",
-    "background_poll", "background_notification_complete", "background_notification_release",
+    "background_poll", "background_notification_complete", "background_notification_release", "background_notification_status",
     "result_ack", "background_events_ack", "prepare_retire", "lifecycle_snapshot",
 })
 

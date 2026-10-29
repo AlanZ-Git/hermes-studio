@@ -1,3 +1,4 @@
+import { pendingKanbanNotifications, receiveKanbanNotification } from '../repositories/kanban-notification-store'
 import { isNativeCodingAgent } from '../contracts/agents/native-coding-agents'
 import { withRunUsage, onRunUsageUpdated } from '../repositories/run-usage-store'
 import { agentFamilyForRuntime, isAgentRuntime } from '../contracts/agents/runtime'
@@ -2004,13 +2005,14 @@ export class ChatRunSocket {
     return this.loopRuntime.recoveryOperation(marker, user, sessionId, profile, recovery)
   }
 
-  private async scheduleBackgroundNotification(notification: AgentBridgeBackgroundNotification) {
+  private async scheduleBackgroundNotification(notification: AgentBridgeBackgroundNotification, recovered = false) {
     const sessionId = String(notification.session_id || '').trim()
     const delegationId = String(notification.delegation_id || '').trim()
     const claimId = String(notification.claim_id || '').trim()
     if (!sessionId || !delegationId || !claimId || !notification.message) return
 
-    const releaseClaim = () => this.backgroundBridge.releaseBackgroundNotification(
+    let claimAccepted = recovered
+    const releaseClaim = () => claimAccepted ? Promise.resolve({ released: false }) : this.backgroundBridge.releaseBackgroundNotification(
       sessionId,
       notification.profile,
       delegationId,
@@ -2023,13 +2025,8 @@ export class ChatRunSocket {
 
     const session = getSession(sessionId)
     if (!session) {
-      logger.warn('[chat-run-socket] acknowledging orphaned background delegation %s for missing session %s', delegationId, sessionId)
-      await this.backgroundBridge.completeBackgroundNotification(
-        sessionId,
-        notification.profile,
-        delegationId,
-        claimId,
-      )
+      // No target persistence means no delivery receipt, including Kanban.
+      await releaseClaim()
       return
     }
 
@@ -2046,7 +2043,39 @@ export class ChatRunSocket {
       await releaseClaim()
       return
     }
-    if (state.backgroundWakeStopped) {
+    if (notification.notification_kind === 'kanban') {
+      try {
+        const wake = ['notify+wake', 'wake'].includes(notification.delivery_mode)
+          && !notification.execution_stopped
+        const { receipt, message } = receiveKanbanNotification(notification, wake)
+        if (!state.messages.some(item => item.id === message.id)) state.messages.push(message)
+        this.emitExternalEvent(sessionId, 'delegation.updated', { event: 'delegation.updated',
+          profile: notification.profile, delegation_id: delegationId, status: notification.status,
+          delivery_status: receipt.consumer_state, message_id: message.id,
+          background_pending: this.backgroundPendingCount(state) })
+        // Durable visible acceptance is independent of every consumer state.
+        // Pending responsibility is recovered below through the existing poll,
+        // so a supervision pause cannot pin the source cursor and hide E2.
+        if (!recovered) {
+          const ack = await this.backgroundBridge.completeBackgroundNotification(sessionId, notification.profile, delegationId, claimId)
+          claimAccepted = Boolean(ack?.completed)
+          if (!claimAccepted) await releaseClaim()
+        }
+        if (receipt.consumer_state !== 'pending') {
+          state.queue = state.queue.filter(item => item.backgroundDelegationId !== delegationId)
+          return
+        }
+        if (state.backgroundWakeStopped) return
+        const queued = state.queue.find(item => item.backgroundDelegationId === delegationId)
+        if (queued) {
+          queued.backgroundClaimId = claimId
+          return
+        }
+      } catch (error) {
+        await releaseClaim()
+        throw error
+      }
+    } else if (state.backgroundWakeStopped) {
       await this.backgroundBridge.completeBackgroundNotification(sessionId, notification.profile, delegationId, claimId)
       return
     }
@@ -2121,9 +2150,10 @@ export class ChatRunSocket {
   }
 
   private backgroundRecoveryRoutes() {
-    const cutoff = Math.floor(Date.now() / 1000) - 8 * 24 * 60 * 60
     const sessionsByProfile = new Map<string, string[]>()
-    for (const session of listRecoverySessionMetadata(cutoff)) {
+    // A subscription can outlive recent chat activity. Metadata age/pagination
+    // must not hide its target indefinitely; no message previews are loaded.
+    for (const session of listRecoverySessionMetadata(0, -1)) {
       if (!isHermesWorkerBackedSession(session)) continue
       const profile = session.profile || 'default'
       const ids = sessionsByProfile.get(profile) || []
@@ -2173,6 +2203,11 @@ export class ChatRunSocket {
       }
       for (const notification of result.notifications || []) {
         await this.scheduleBackgroundNotification(notification)
+      }
+      // The same receipt that accepted the source event owns a pending model
+      // obligation even after its source cursor advances or the Web process dies.
+      for (const notification of pendingKanbanNotifications()) {
+        await this.scheduleBackgroundNotification(notification, true)
       }
     } catch (err) {
       this.backgroundPollRetryAt = Date.now() + 5000

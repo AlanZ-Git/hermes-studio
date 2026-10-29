@@ -456,7 +456,19 @@ class BridgeBroker:
                 "notifications": notifications,
             }
 
-        if action in {"background_notification_complete", "background_notification_release"}:
+        if action == 'background_notification_status' and req.get('notification_identity') is not None:
+            identity = req['notification_identity']
+            profile = self._normalize_profile(req.get('profile'))
+            if (not isinstance(identity, list) or len(identity) != 8
+                    or identity[4] != profile or identity[6] != str(req.get('session_id') or '')):
+                raise ValueError('Notification identity session/profile mismatch')
+            if req.get('worker_key') is not None or req.get('model_run_auth') is not None:
+                raise ValueError('Notification identity route override forbidden')
+            # Read-only preflight through the existing profile maintenance
+            # worker, including after source ACK or a broker generation change.
+            return self._forward(profile, req, profile)
+
+        if action in {"background_notification_complete", "background_notification_release", "background_notification_status"}:
             claim_key = (str(req.get("delegation_id") or ""), str(req.get("claim_id") or ""))
             with self._lock:
                 route = self._background_claim_routes.get(claim_key)
@@ -475,8 +487,8 @@ class BridgeBroker:
                 if self._workers.get(worker_key) is not worker or not worker.running:
                     raise ValueError("background notification claim worker has ended")
             resp = self._forward(profile, req, worker_key)
-            outcome = "completed" if action == "background_notification_complete" else "released"
-            if resp.get(outcome) is True:
+            outcome = {"background_notification_complete": "completed", "background_notification_release": "released"}.get(action)
+            if outcome and resp.get(outcome) is True:
                 with self._lock:
                     if self._background_claim_routes.get(claim_key) is route:
                         self._background_claim_routes.pop(claim_key, None)

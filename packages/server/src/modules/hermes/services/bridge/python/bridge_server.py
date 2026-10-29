@@ -330,6 +330,15 @@ class BridgeServer:
             session_ids = req.get("session_ids")
             return self.pool.poll_background(session_ids if isinstance(session_ids, list) else None)
 
+        if action == "background_notification_status":
+            delegation_id = str(req.get("delegation_id") or "").strip()
+            claim_id = str(req.get("claim_id") or "").strip()
+            if not delegation_id or (not claim_id and req.get('notification_identity') is None):
+                raise ValueError("delegation_id and a claim or durable identity are required")
+            return self.pool.background_notification_status(delegation_id, claim_id,
+                identity=req.get('notification_identity'), db_identity=req.get('board_db_identity'),
+                session_id=str(req.get('session_id') or ''))
+
         if action == "background_notification_complete":
             delegation_id = str(req.get("delegation_id") or "").strip()
             claim_id = str(req.get("claim_id") or "").strip()

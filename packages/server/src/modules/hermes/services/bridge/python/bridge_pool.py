@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
 import json
 import os
@@ -47,6 +48,19 @@ from bridge_runtime import (
 )
 
 CLARIFY_TIMEOUT_SECONDS = 300
+
+# Known board bookkeeping is not a notification. Unknown notification kinds
+# remain deliverable; neither prose similarity nor current task status filters
+# them. Explicit notification policies are applied separately below.
+_KANBAN_AUDIT_KINDS = frozenset({
+    'created', 'assigned', 'commented', 'linked', 'unlinked', 'attached', 'attachment_removed',
+    'heartbeat', 'claim_extended', 'claimed', 'claim_rejected', 'spawned', 'worker_registered',
+    'worker_bound', 'owner_admitted', 'worker_result', 'promoted', 'specified', 'decomposed',
+    'edited', 'reprioritized', 'model_override_set', 'reasoning_effort_set', 'pr_acceptance',
+    'terminal_worker_reaped', 'archive_worker_termination', 'stop_worker_termination',
+    'tip_scratch_workspace', 'workspace_cleanup_deferred_shared', 'respawn_guarded',
+    'skipped_nonspawnable', 'reclaim_deferred', 'reconciled',
+})
 
 
 def _bind_session_workspace_cwd(session_id: str, workspace: str | None) -> bool:
@@ -1305,11 +1319,8 @@ class AgentPool:
         except Exception:
             return []
 
-        terminal_kinds = (
-            "completed", "blocked", "gave_up", "crashed", "timed_out",
-            "status", "archived", "unblocked", "block_loop_detected",
-            "review_requested", "changes_requested",
-        )
+        # Unknown event kinds are data, not permission to discard a notification.
+        # One event per subscription stays pending in task_events until consumer ACK.
         notifications: list[dict[str, Any]] = []
         try:
             boards = kb.list_boards(include_archived=False)
@@ -1349,47 +1360,56 @@ class AgentPool:
                     # later range could ACK before a failed earlier range rewinds.
                     ident = (resolved, sub['task_id'], sub['platform'], session_id, sub.get('thread_id') or '')
                     with self._lock:
+                        for key, pending in list(self._background_notification_claims.items()):
+                            if (pending.get('subscription_key') == ident
+                                    and time.monotonic() - pending.get('claimed_at', 0) >= 30):
+                                self._background_notification_claims.pop(key, None)
                         if any(c.get('subscription_key') == ident for c in self._background_notification_claims.values()):
                             continue
-                    task = kb.get_task(conn, sub["task_id"])
-                    policy = getattr(task, "notification_policy", "direct") if task else "direct"
-                    if policy == "silent":
+                    worker_profile = os.environ.get('HERMES_AGENT_BRIDGE_WORKER_PROFILE', 'default')
+                    profile = str(sub.get('notifier_profile') or worker_profile)
+                    if profile != worker_profile:
                         continue
-                    if policy == "final_only":
-                        old_cursor, state = notify.claim_final_only_graph_state(
-                            conn, root_id=sub['task_id'], platform=sub['platform'],
-                            chat_id=session_id, thread_id=sub.get('thread_id') or '',
-                        )
-                        if not state.get('claimed'):
-                            continue
-                        new_cursor = int(state.get('cursor') or old_cursor)
+                    task = kb.get_task(conn, sub["task_id"])
+                    policy = getattr(task, 'notification_policy', 'direct') if task else 'direct'
+                    if policy == 'silent':
+                        continue
+                    old_cursor = int(sub['last_event_id'])
+                    if policy == 'final_only':
+                        state = notify.final_only_graph_state(conn, sub['task_id'], after_event_id=old_cursor)
                         if state.get('all_terminal') and state.get('changed'):
-                            events = [kb.Event(id=new_cursor, task_id=sub['task_id'], kind='completed',
+                            events = [kb.Event(id=int(state['cursor']), task_id=sub['task_id'], kind='completed',
                                 payload={'summary': f"{int(state.get('descendant_count') or 0)} descendants completed"}, created_at=0)]
-                        else:
+                        elif state.get('blocking_event_id'):
                             payload = dict(state.get('blocking_payload') or {})
                             payload['reason'] = f"{int(state.get('blocking_count') or 0)} descendant task(s) need human action: {payload.get('reason') or 'human action required'}"
                             events = [kb.Event(id=int(state['blocking_event_id']), task_id=sub['task_id'],
                                 kind='blocked', payload=payload, created_at=0)]
+                        else:
+                            continue
                     else:
-                        old_cursor, new_cursor, events = notify.claim_unseen_events_for_sub(
+                        _, events = notify.unseen_events_for_sub(
                             conn, task_id=sub['task_id'], platform=sub['platform'], chat_id=session_id,
-                            thread_id=sub.get('thread_id') or '', kinds=terminal_kinds,
+                            thread_id=sub.get('thread_id') or '',
                         )
+                        events = [event for event in events if event.kind not in _KANBAN_AUDIT_KINDS]
                     if not events:
                         continue
+                    # No durable cursor change at claim. A killed bridge simply replays;
+                    # the target's persisted exact receipt makes replay idempotent.
+                    events = events[:1]
+                    new_cursor = int(state['cursor']) if policy == 'final_only' else int(events[0].id)
                     task = kb.get_task(conn, sub["task_id"])
                     messages = [self._format_kanban_notification(slug, task, event) for event in events]
                     message = "\n".join(text for text in messages if text)
                     if not message:
-                        notify.rewind_notify_cursor(
-                            conn,
-                            task_id=sub["task_id"], platform=sub["platform"],
-                            chat_id=session_id, thread_id=sub.get("thread_id") or "",
-                            claimed_cursor=new_cursor, old_cursor=old_cursor,
-                        )
                         continue
-                    delivery_id = f"kanban:{slug}:{sub['task_id']}:{new_cursor}"
+                    identity = [resolved, sub['task_id'], new_cursor,
+                                getattr(events[0], 'run_id', None), profile,
+                                sub['platform'], session_id, sub.get('thread_id') or '']
+                    delivery_id = 'kanban:' + hashlib.sha256(
+                        json.dumps(identity, ensure_ascii=False, separators=(',', ':')).encode()
+                    ).hexdigest()
                     claim_id = uuid.uuid4().hex
                     claim = {
                         "notification_kind": "kanban",
@@ -1397,19 +1417,29 @@ class AgentPool:
                         "db_path": resolved,
                         "db_identity": (Path(resolved).stat().st_dev, Path(resolved).stat().st_ino),
                         "subscription_key": ident,
+                        "claimed_at": time.monotonic(),
                         "task_id": sub["task_id"],
                         "platform": sub["platform"],
                         "chat_id": session_id,
                         "thread_id": sub.get("thread_id") or "",
                         "old_cursor": old_cursor,
                         "new_cursor": new_cursor,
-                        "final_status": getattr(task, "status", "") == "archived",
                     }
                     with self._lock:
                         self._background_notification_claims[(delivery_id, claim_id)] = claim
                     last_event = events[-1]
+                    try:
+                        from hermes_cli.kanban_stop import execution_stopped
+                        stopped = execution_stopped(conn, sub['task_id'])
+                    except ImportError:
+                        stopped = False  # compatible with a Core predating task-set stop
                     notifications.append({
+                        "execution_stopped": stopped,
                         "notification_kind": "kanban",
+                        "identity": identity,
+                        "board_db_identity": claim['db_identity'],
+                        "delivery_mode": sub.get('delivery_mode') or 'notify',
+                        "profile": profile,
                         "delegation_id": delivery_id,
                         "session_id": session_id,
                         "claim_id": claim_id,
@@ -1421,6 +1451,10 @@ class AgentPool:
                             "task_id": sub["task_id"],
                             "event_id": getattr(last_event, "id", new_cursor),
                             "kind": getattr(last_event, "kind", "status"),
+                            "run_id": getattr(last_event, "run_id", None),
+                            "payload": getattr(last_event, "payload", None),
+                            "thread_id": sub.get('thread_id') or '',
+                            "profile": profile,
                         },
                         "board": slug,
                         "task_id": sub["task_id"],
@@ -1447,7 +1481,58 @@ class AgentPool:
             return f"⛔ {label} blocked: {payload.get('reason') or ''}".rstrip()
         if kind == "review_requested":
             return f"🔎 {label} requested review"
-        return f"🔄 {label} → {getattr(task, 'status', '') or kind}"
+        detail = json.dumps(payload, ensure_ascii=False, sort_keys=True) if payload else ''
+        return f"🔄 {label} → {kind}: {detail}".rstrip(': ')
+
+    def background_notification_status(self, delegation_id: str, claim_id: str, *,
+                                       identity=None, db_identity=None, session_id=None) -> dict[str, Any]:
+        if identity is not None:
+            # A durable receiver may have ACKed the source before its consumer
+            # resumes. Validate the exact original event/target, not a dead lease.
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.kanban_stop import execution_fenced
+            profile = os.environ.get('HERMES_AGENT_BRIDGE_WORKER_PROFILE', 'default')
+            if (not isinstance(identity, list) or len(identity) != 8
+                    or identity[4] != profile or identity[5] != 'tui' or identity[6] != session_id):
+                raise ValueError('Notification identity session/profile mismatch')
+            digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+            if delegation_id != 'kanban:' + digest:
+                raise ValueError('Notification identity mismatch')
+            boards = kb.list_boards(include_archived=False)
+            paths = {str(Path(b.get('db_path') or kb.kanban_db_path(b.get('slug') or kb.DEFAULT_BOARD)).resolve()) for b in boards}
+            if identity[0] not in paths:
+                return {'current': False}
+            stat = Path(identity[0]).stat()
+            conn = self._open_kanban_claim_db({'db_path': identity[0],
+                'db_identity': db_identity or (stat.st_dev, stat.st_ino)})
+            try:
+                sub = conn.execute('SELECT notifier_profile FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?',
+                                   (identity[1], identity[5], identity[6], identity[7])).fetchone()
+                event = conn.execute('SELECT task_id, run_id FROM task_events WHERE id=?', (identity[2],)).fetchone()
+                task = kb.get_task(conn, identity[1])
+                if not sub or (sub['notifier_profile'] or profile) != profile or not event or not task:
+                    return {'current': False}
+                if task.notification_policy == 'final_only':
+                    graph = conn.execute('WITH RECURSIVE graph(id) AS (SELECT ? UNION SELECT l.child_id FROM task_links l JOIN graph g ON l.parent_id=g.id) SELECT 1 FROM graph WHERE id=?',
+                                         (identity[1], event['task_id'])).fetchone()
+                    if not graph or identity[3] is not None:
+                        return {'current': False}
+                elif event['task_id'] != identity[1] or event['run_id'] != identity[3]:
+                    return {'current': False}
+                return {'current': True, 'execution_stopped': execution_fenced(conn, identity[1])}
+            finally:
+                conn.close()
+        with self._notification_lock:
+            with self._lock:
+                claim = self._background_notification_claims.get((delegation_id, claim_id))
+            if not claim or claim.get('notification_kind') != 'kanban':
+                return {'current': False}
+            from hermes_cli.kanban_stop import execution_fenced
+            conn = self._open_kanban_claim_db(claim)
+            try:
+                return {'current': True, 'execution_stopped': execution_fenced(conn, claim['task_id'])}
+            finally:
+                conn.close()
 
     def complete_background_notification(self, delegation_id: str, claim_id: str) -> dict[str, Any]:
         with self._notification_lock:
@@ -1457,22 +1542,22 @@ class AgentPool:
         with self._lock:
             claim = self._background_notification_claims.get((delegation_id, claim_id))
         if claim and claim.get("notification_kind") == "kanban":
-            completed = True
-            if claim.get("final_status"):
+            completed = False
+            try:
+                from hermes_cli import kanban_db as kb
+                conn = self._open_kanban_claim_db(claim)
                 try:
-                    from hermes_cli import kanban_db as kb
-                    conn = self._open_kanban_claim_db(claim)
-                    try:
-                        with kb.write_txn(conn):
-                            task = kb.get_task(conn, claim['task_id'])
-                            latest = conn.execute('SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?', (claim['task_id'],)).fetchone()[0]
-                            if task and task.status == 'archived' and latest <= claim['new_cursor']:
-                                conn.execute('DELETE FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND last_event_id=?',
-                                    (claim['task_id'], claim['platform'], claim['chat_id'], claim['thread_id'], claim['new_cursor']))
-                    finally:
-                        conn.close()
-                except Exception:
-                    completed = False
+                    with kb.write_txn(conn):
+                        conn.execute(
+                            'UPDATE kanban_notify_subs SET last_event_id = MAX(last_event_id, ?) '
+                            'WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?',
+                            (claim['new_cursor'], claim['task_id'], claim['platform'],
+                             claim['chat_id'], claim['thread_id']))
+                    completed = True
+                finally:
+                    conn.close()
+            except Exception:
+                completed = False
             if completed:
                 with self._lock:
                     self._background_notification_claims.pop((delegation_id, claim_id), None)
@@ -1501,25 +1586,11 @@ class AgentPool:
         with self._lock:
             claim = self._background_notification_claims.get((delegation_id, claim_id))
         if claim and claim.get("notification_kind") == "kanban":
-            released = False
-            try:
-                from hermes_cli import kanban_db_notify as notify
-                conn = self._open_kanban_claim_db(claim)
-                try:
-                    released = bool(notify.rewind_notify_cursor(
-                        conn,
-                        task_id=claim["task_id"], platform=claim["platform"],
-                        chat_id=claim["chat_id"], thread_id=claim["thread_id"],
-                        claimed_cursor=claim["new_cursor"], old_cursor=claim["old_cursor"],
-                    ))
-                finally:
-                    conn.close()
-            except Exception:
-                released = False
-            if released:
-                with self._lock:
-                    self._background_notification_claims.pop((delegation_id, claim_id), None)
-            return {"delegation_id": delegation_id, "released": released}
+            # Claim never advanced the durable cursor. Releasing only drops the
+            # process-local lease; a later poll/restart reads the same event.
+            with self._lock:
+                self._background_notification_claims.pop((delegation_id, claim_id), None)
+            return {"delegation_id": delegation_id, "released": True}
 
         if delegation_id.startswith('kanban:'):
             return {"delegation_id": delegation_id, "released": False}
