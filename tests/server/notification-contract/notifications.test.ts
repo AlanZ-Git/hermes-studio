@@ -45,6 +45,9 @@ it('persists visible exact events before ACK, survives reopening, and does not q
   store.createSession({ id: 'session-one', profile: 'default', source: 'cli' })
   const { obj, state } = handler()
   await obj.scheduleBackgroundNotification(notice('e1'))
+  expect(obj.emitExternalEvent).toHaveBeenCalledWith('session-one', 'delegation.updated', expect.objectContaining({
+    background_pending: 0,
+  }))
   database.closeDb()
   const first = store.getSessionDetail('session-one').messages
   expect(first.filter((m: any) => m.content === 'same text' && m.display_role !== 'internal')).toHaveLength(1)

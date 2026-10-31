@@ -7,6 +7,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from collections import deque
 from pathlib import Path
@@ -48,6 +49,11 @@ class BridgeBroker:
         self._compression_worker_key: dict[str, str] = {}
         # Claims are issued by a worker, never by the latest session route.
         self._background_claim_routes: dict[tuple[str, str], tuple[str, str, str, Any]] = {}
+        self._notification_generation = uuid.uuid4().hex
+        self._notification_maintenance = threading.Lock()
+        self._background_claim_bindings = {}
+        self._notification_receipts = {}
+        self._notification_reconciled = {}
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._last_gc = time.monotonic()
@@ -167,6 +173,7 @@ class BridgeBroker:
             self._compression_profile.clear()
             self._compression_worker_key.clear()
             self._background_claim_routes.clear()
+            self._background_claim_bindings.clear()
         for worker in workers:
             worker.stop()
 
@@ -291,6 +298,10 @@ class BridgeBroker:
 
         if self._stop.is_set() and action != "shutdown":
             raise RuntimeError("broker stopped")
+
+        if action in {"notification_retention_scan", "notification_retention_reconcile"}:
+            from bridge_notification_retention import handle_retention
+            return handle_retention(self, req)
 
         if action == "lifecycle_snapshot":
             # Existing local IPC trust, with full worker binding on the hop;
@@ -444,6 +455,12 @@ class BridgeBroker:
                             continue
                         claim_route = (profile, worker.key, str(notification.get("session_id") or ""), worker)
                         with self._lock:
+                            from bridge_notification_retention import worker_identity
+                            try:
+                                binding = worker_identity(self, worker)
+                            except Exception:
+                                binding = None
+                            self._background_claim_bindings.setdefault(claim_key, binding)
                             previous = self._background_claim_routes.setdefault(claim_key, claim_route)
                             if previous != claim_route:
                                 continue
@@ -473,6 +490,12 @@ class BridgeBroker:
             with self._lock:
                 route = self._background_claim_routes.get(claim_key)
                 if route is None:
+                    receipt = self._notification_receipts.get(claim_key)
+                    if (receipt == (req.get("profile"), req.get("session_id"))
+                            and req.get("worker_key") is None and req.get("model_run_auth") is None
+                            and action != "background_notification_status"):
+                        outcome = "completed" if action == "background_notification_complete" else "released"
+                        return {outcome: True, "reason": "already_settled"}
                     raise KeyError("unknown background notification claim")
                 profile, worker_key, session_id, worker = route
                 if self._workers.get(worker_key) is not worker or not worker.running:
@@ -486,13 +509,36 @@ class BridgeBroker:
                     raise KeyError("background notification claim already consumed")
                 if self._workers.get(worker_key) is not worker or not worker.running:
                     raise ValueError("background notification claim worker has ended")
-            resp = self._forward(profile, req, worker_key)
-            outcome = {"background_notification_complete": "completed", "background_notification_release": "released"}.get(action)
-            if outcome and resp.get(outcome) is True:
-                with self._lock:
-                    if self._background_claim_routes.get(claim_key) is route:
+            with self._lock:
+                # Pin admission and the original route through worker CAS. The
+                # client relinquishes only its delivery lease, never its result.
+                if (self._background_claim_routes.get(claim_key) is not route
+                        or self._workers.get(worker_key) is not worker):
+                    return {"completed": False, "released": False, "reason": "stale_snapshot"}
+                from bridge_notification_retention import worker_identity
+                binding = self._background_claim_bindings.get(claim_key)
+                try:
+                    current_binding = worker_identity(self, worker)
+                except Exception:
+                    current_binding = None
+                if binding is not None and binding != current_binding:
+                    return {"completed": False, "released": False, "reason": "worker_changed"}
+                # Legacy/TCP platforms can still ACK their current durable claim;
+                # lacking a complete process binding never permits obsolescence.
+                forwarded = {**req, "allow_obsolete": binding is not None
+                             and not bool(self._running_run_profile)}
+                resp = self._forward(profile, forwarded, worker_key)
+                outcome = {"background_notification_complete": "completed", "background_notification_release": "released"}.get(action)
+                if outcome and resp.get(outcome) is True and resp.get("ok") is not False:
+                    if (self._background_claim_routes.get(claim_key) is route and self._workers.get(worker_key) is worker
+                            and (binding is None or worker_identity(self, worker) == binding)):
+                        from bridge_notification_retention import remember
+                        remember(self, claim_key, profile, session_id)
                         self._background_claim_routes.pop(claim_key, None)
-            return resp
+                        self._background_claim_bindings.pop(claim_key, None)
+                    else:
+                        return {outcome: False, "reason": "stale_snapshot"}
+                return resp
 
         if action == "background_events_ack":
             profile = self._normalize_profile(req.get("profile"))
@@ -593,6 +639,7 @@ class BridgeBroker:
             destroyed = 0
             with self._lock:
                 self._background_claim_routes.clear()
+                self._background_claim_bindings.clear()
             for worker in workers:
                 try:
                     if worker.running:
@@ -627,6 +674,7 @@ class BridgeBroker:
                 self._compression_profile = {key: value for key, value in self._compression_profile.items() if value != profile}
                 self._compression_worker_key = {key: value for key, value in self._compression_worker_key.items() if key in self._compression_profile}
                 self._background_claim_routes = {key: route for key, route in self._background_claim_routes.items() if route[0] != profile}
+                self._background_claim_bindings = {k: v for k, v in self._background_claim_bindings.items() if k in self._background_claim_routes}
 
             if not workers:
                 return {"profile": profile, "destroyed": 0}
@@ -726,6 +774,7 @@ class BridgeBroker:
                     profiles.pop(identity, None)
         self._background_claim_routes = {claim: route for claim, route in self._background_claim_routes.items()
                                          if route[3] is not worker}
+        self._background_claim_bindings = {k: v for k, v in self._background_claim_bindings.items() if k in self._background_claim_routes}
 
     def _gc_idle_workers(self) -> None:
         now = time.monotonic()

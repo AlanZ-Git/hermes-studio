@@ -213,6 +213,11 @@ class AgentPool:
         self._gateway_approval_meta: dict[str, dict[str, Any]] = {}
         self._compression_requests: dict[str, queue.Queue[dict[str, Any]]] = {}
         self._background_notification_claims: dict[tuple[str, str], dict[str, Any]] = {}
+        self._notification_generation = uuid.uuid4().hex
+        self._notification_settlements = {}
+        self._notification_resolved = {}
+        self._notification_identities = {}
+        self._notification_consumer_settled = set()
         self._notification_lock = threading.RLock()
         self._notifications_closed = False
         self._suppressed_background_delegations: set[str] = set()
@@ -1278,6 +1283,10 @@ class AgentPool:
                             str(event.get("delegation_id") or ""),
                             claim_id,
                         )] = event
+                        from tools.async_delegation import capture_completion_delivery_identity
+                        self._notification_identities[(delegation_id, claim_id)] = {
+                            "profile": os.environ.get("HERMES_AGENT_BRIDGE_WORKER_PROFILE", "default"),
+                            "identity": capture_completion_delivery_identity(event, claim_id)}
                 for event in deferred:
                     process_registry.completion_queue.put(event)
             except Exception as exc:
@@ -1534,11 +1543,111 @@ class AgentPool:
             finally:
                 conn.close()
 
-    def complete_background_notification(self, delegation_id: str, claim_id: str) -> dict[str, Any]:
-        with self._notification_lock:
-            return self._complete_background_notification(delegation_id, claim_id)
+    def _remember_notification_settlement(self, key, outcome):
+        binding = self._notification_identities.get(key)
+        identity = (binding or {}).get("identity")
+        snapshot = None if not identity else {
+            "delegation_id": key[0], "claim_id": key[1], "profile": binding["profile"],
+            "session_id": identity["session_id"], "worker_generation": self._notification_generation,
+            "identity": identity}
+        # Lost responses must be retryable without retaining complete event text.
+        self._notification_settlements[key] = {"outcome": outcome, "snapshot": snapshot}
+        while len(self._notification_settlements) > 512:
+            self._notification_settlements.pop(next(iter(self._notification_settlements)))
 
-    def _complete_background_notification(self, delegation_id: str, claim_id: str) -> dict[str, Any]:
+    def _obsolete_notification(self, delegation_id, claim_id, *, apply=False, expected=None):
+        from tools.async_delegation import obsolete_completion_guard
+        from contextlib import ExitStack
+
+        key = (delegation_id, claim_id)
+        with self._notification_lock, self._lock:
+            resolved = self._notification_resolved.get(key)
+            if resolved is not None:
+                if expected is not None and expected != resolved:
+                    return {"obsolete": False, "reason": "stale_snapshot"}
+                return {**resolved, "obsolete": True, "reason": "already_reconciled", "snapshot": resolved}
+            claim = self._background_notification_claims.get(key)
+            settlement = self._notification_settlements.get(key) if claim is None else None
+            receipt = (settlement or {}).get("snapshot")
+            binding = self._notification_identities.get(key)
+            if receipt:
+                claim = {"delegation_id": delegation_id}
+                binding = {"profile": receipt["profile"], "identity": receipt["identity"]}
+            base = {"delegation_id": delegation_id, "claim_id": claim_id,
+                    "profile": os.environ.get("HERMES_AGENT_BRIDGE_WORKER_PROFILE", "default"),
+                    "session_id": str((receipt or {}).get("session_id") or (claim or {}).get("parent_session_id") or "")}
+            def outcome(reason, obsolete=False):
+                return {**base, "obsolete": obsolete, "reason": reason}
+            if not claim or not binding or binding["profile"] != base["profile"]:
+                return outcome("partial_identity")
+            # ACK/release is the receiver's explicit relinquishment. A durable
+            # delivery alone cannot discharge an unread/queued consumer lease.
+            if not receipt and key not in self._notification_consumer_settled:
+                return outcome("consumer_unsettled")
+            counts = self._retention_counts_locked()
+            if any(v for k, v in counts.items() if k != "notification_claim"):
+                return outcome("other_responsibility")
+            with obsolete_completion_guard(claim, claim_id, binding["identity"], reserve=apply, recorded_receipt=bool(receipt)) as proof:
+                if not proof["obsolete"]:
+                    return outcome(proof["reason"])
+                snapshot = {**base, "worker_generation": self._notification_generation, "identity": proof["identity"]}
+                if expected is not None and snapshot != expected:
+                    return outcome("stale_snapshot")
+                # Admission + pool lock exclude new runs and callbacks. Pin the
+                # independent registries too, including enqueue-before-pop races.
+                with ExitStack() as locks:
+                    registry = sys.modules.get("tools.async_delegation")
+                    if registry is not None:
+                        locks.enter_context(registry._records_lock)
+                        if any(r.get("status") in {"running", "stalling", "finalizing"} for r in registry._records.values()):
+                            return outcome("background_work")
+                    registry = sys.modules.get("tools.process_registry")
+                    if registry is not None:
+                        registry = registry.process_registry
+                        locks.enter_context(registry._lock)
+                        locks.enter_context(registry.completion_queue.mutex)
+                        if registry._running or registry.completion_queue._qsize():
+                            return outcome("tool_or_queue")
+                    if receipt:
+                        if key in self._background_notification_claims or self._notification_settlements.get(key) is not settlement:
+                            return outcome("stale_snapshot")
+                    elif self._background_notification_claims.get(key) is not claim:
+                        return outcome("stale_snapshot")
+                    if apply:
+                        from bridge_notification_retention import audit_worker
+                        try:
+                            audit_worker(snapshot, "verified_before_release")
+                            self._background_notification_claims.pop(key, None)
+                            audit_worker(snapshot, "released")
+                        except Exception:
+                            if not receipt:
+                                self._background_notification_claims[key] = claim
+                            return outcome("audit_unavailable")
+                        self._notification_resolved[key] = snapshot
+                        while len(self._notification_resolved) > 512:
+                            self._notification_resolved.pop(next(iter(self._notification_resolved)))
+                        self._notification_settlements.pop(key, None)
+                        self._notification_identities.pop(key, None)
+                        self._notification_consumer_settled.discard(key)
+                    return {**outcome("obsolete_delivered", True), "snapshot": snapshot}
+
+    def notification_retention(self, expected=None, claim_keys=None):
+        with self._notification_lock, self._lock:
+            if expected is not None:
+                return self._obsolete_notification(expected.get("delegation_id"), expected.get("claim_id"),
+                                                   apply=True, expected=expected)
+            keys = set(self._background_notification_claims)
+            for key in (claim_keys or [])[:64]:
+                if isinstance(key, (list, tuple)) and len(key) == 2 and all(isinstance(v, str) for v in key):
+                    keys.add(tuple(key))
+            return {"candidates": [self._obsolete_notification(*key) for key in sorted(keys)[:64]],
+                    "truncated": len(keys) > 64}
+
+    def complete_background_notification(self, delegation_id: str, claim_id: str, *, allow_obsolete=True) -> dict[str, Any]:
+        with self._notification_lock:
+            return self._complete_background_notification(delegation_id, claim_id, allow_obsolete=allow_obsolete)
+
+    def _complete_background_notification(self, delegation_id: str, claim_id: str, *, allow_obsolete=True) -> dict[str, Any]:
         with self._lock:
             claim = self._background_notification_claims.get((delegation_id, claim_id))
         if claim and claim.get("notification_kind") == "kanban":
@@ -1568,20 +1677,31 @@ class AgentPool:
 
         from tools.async_delegation import complete_completion_delivery
 
+        if claim is not None:
+            self._notification_consumer_settled.add((delegation_id, claim_id))
+        if self._notification_settlements.get((delegation_id, claim_id), {}).get("outcome") == "completed":
+            return {"delegation_id": delegation_id, "completed": True}
         completed = complete_completion_delivery(delegation_id, claim_id)
+        if not completed and allow_obsolete:
+            completed = self._obsolete_notification(delegation_id, claim_id, apply=True)["obsolete"]
         if completed:
             with self._lock:
                 self._background_notification_claims.pop((delegation_id, claim_id), None)
+        if completed:
+            if (delegation_id, claim_id) not in self._notification_resolved:
+                self._remember_notification_settlement((delegation_id, claim_id), "completed")
+            self._notification_identities.pop((delegation_id, claim_id), None)
+            self._notification_consumer_settled.discard((delegation_id, claim_id))
         return {"delegation_id": delegation_id, "completed": bool(completed)}
 
     def release_background_notification(
-        self, delegation_id: str, claim_id: str, *, requeue: bool = True
+        self, delegation_id: str, claim_id: str, *, requeue: bool = True, allow_obsolete=True
     ) -> dict[str, Any]:
         with self._notification_lock:
-            return self._release_background_notification(delegation_id, claim_id, requeue=requeue)
+            return self._release_background_notification(delegation_id, claim_id, requeue=requeue, allow_obsolete=allow_obsolete)
 
     def _release_background_notification(
-        self, delegation_id: str, claim_id: str, *, requeue: bool = True
+        self, delegation_id: str, claim_id: str, *, requeue: bool = True, allow_obsolete=True
     ) -> dict[str, Any]:
         with self._lock:
             claim = self._background_notification_claims.get((delegation_id, claim_id))
@@ -1597,13 +1717,27 @@ class AgentPool:
 
         from tools.async_delegation import release_completion_delivery
 
+        if claim is not None:
+            self._notification_consumer_settled.add((delegation_id, claim_id))
+        if self._notification_settlements.get((delegation_id, claim_id), {}).get("outcome") == "released":
+            return {"delegation_id": delegation_id, "released": True}
         released = release_completion_delivery(delegation_id, claim_id)
+        if not released and not allow_obsolete:
+            return {"released": False, "reason": "broker_responsibility"}
+        if not released:
+            obsolete = self._obsolete_notification(delegation_id, claim_id, apply=True)
+            return {"delegation_id": delegation_id, "released": obsolete["obsolete"],
+                    "reason": obsolete["reason"]}
         with self._lock:
             event = self._background_notification_claims.pop((delegation_id, claim_id), None) if released else None
         if released and requeue and event is not None:
             from tools.process_registry import process_registry
 
             process_registry.completion_queue.put(event)
+        if released:
+            self._remember_notification_settlement((delegation_id, claim_id), "released")
+            self._notification_identities.pop((delegation_id, claim_id), None)
+            self._notification_consumer_settled.discard((delegation_id, claim_id))
         return {"delegation_id": delegation_id, "released": bool(released)}
 
     @staticmethod
@@ -3426,6 +3560,9 @@ class AgentPool:
             "pending_interaction": sum(map(len, (self._approval_requests,
                 self._gateway_approval_requests, self._clarify_requests, self._compression_requests))),
             "notification_claim": len(self._background_notification_claims),
+            "session_background_work": sum(
+                str(t.get("status") or "").lower() in {"running", "stalling", "finalizing"}
+                for s in self._sessions.values() for t in s.background_tasks.values()),
             "background_events": sum(len(s.background_events) for s in self._sessions.values()),
         }
         try:

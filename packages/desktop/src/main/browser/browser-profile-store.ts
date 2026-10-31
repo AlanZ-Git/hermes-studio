@@ -125,6 +125,15 @@ export class BrowserProfileStore {
     await this.persist()
   }
 
+  async rememberDownloadDirectory(profileId: string, directory: string): Promise<void> {
+    if (!isAbsolute(directory)) return
+    const profile = this.requireProfile(profileId)
+    const normalized = resolve(directory)
+    if (profile.lastDownloadDirectory === normalized) return
+    profile.lastDownloadDirectory = normalized
+    await this.persist()
+  }
+
   async update(profileId: string, input: BrowserProfileUpdateInput): Promise<DesktopBrowserProfile> {
     const profile = this.requireProfile(profileId)
     const proxyMode = input.proxyMode === undefined ? profile.proxyMode : safeProxyMode(input.proxyMode)
@@ -174,6 +183,8 @@ export class BrowserProfileStore {
             rootPath,
             sessionPath: join(rootPath, 'data'),
             downloadPath: join(rootPath, 'download'),
+            lastDownloadDirectory: typeof profile.lastDownloadDirectory === 'string' && isAbsolute(profile.lastDownloadDirectory)
+              ? resolve(profile.lastDownloadDirectory) : undefined,
             proxyMode,
             proxyRules: safeProxyRules(profile.proxyRules, proxyMode),
             tabs: Array.isArray(profile.tabs) ? profile.tabs : ['about:blank'],
@@ -209,7 +220,7 @@ export class BrowserProfileStore {
 
   private async persist(): Promise<void> {
     const write = this.persistQueue.catch(() => undefined).then(async () => {
-      const tempPath = `${this.profilesFile}.${process.pid}.tmp`
+      const tempPath = `${this.profilesFile}.${process.pid}.${randomUUID()}.tmp`
       await mkdir(this.root, { recursive: true, mode: 0o700 })
       await writeFile(tempPath, `${JSON.stringify(this.requireDocument(), null, 2)}\n`, { mode: 0o600 })
       await rename(tempPath, this.profilesFile)

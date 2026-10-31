@@ -118,6 +118,34 @@ describe('group chat approval and context baseline', () => {
     } finally { clients.forEach(client => client.handlers.get('disconnect')!()) }
   })
 
+  it('does not let a Person interaction bypass the Hermes run binding', async () => {
+    const chat = Object.create(ChatRunSocket.prototype) as any
+    chat.sessionMap = new Map([['bound-session', {
+      profile: 'default', runId: 'run-1',
+      events: [{ event: 'approval.requested', data: { approval_id: 'bound-approval' } }],
+    }]])
+    chat.bridge = { approvalRespond: vi.fn(), request: vi.fn() }
+    chat.emitExternalEvent = vi.fn()
+    await expect(chat.respondPersonInteraction('bound-session', 'bound-approval', 'once', true))
+      .rejects.toThrow('Approval run binding is unavailable')
+    expect(chat.bridge.approvalRespond).not.toHaveBeenCalled()
+    expect(chat.bridge.request).not.toHaveBeenCalled()
+    expect(chat.emitExternalEvent).not.toHaveBeenCalled()
+  })
+
+  it('routes a Person Hermes approval through the existing same-run verifier', async () => {
+    const chat = Object.create(ChatRunSocket.prototype) as any
+    chat.sessionMap = new Map([['bound-session', {
+      profile: 'default', runId: 'run-1',
+      events: [{ event: 'approval.requested', data: { approval_id: 'bound-approval' } }],
+    }]])
+    chat.respondToBridgeApproval = vi.fn().mockResolvedValue({ resolved: true })
+    chat.emitExternalEvent = vi.fn()
+    await expect(chat.respondPersonInteraction('bound-session', 'bound-approval', 'once', true)).resolves.toBe(true)
+    expect(chat.respondToBridgeApproval).toHaveBeenCalledWith('bound-session', 'default', 'bound-approval', 'once', 'run-1')
+    expect(chat.sessionMap.get('bound-session').events).toEqual([])
+  })
+
   async function joinPair() {
     const agentSessionId = groupRuntimeSessionId('room-1', 'default', 'Agent')
     const agent = await connectGroupChatClient(port, 'agent-1', 'Agent', {

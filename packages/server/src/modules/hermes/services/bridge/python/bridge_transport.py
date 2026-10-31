@@ -248,6 +248,7 @@ MAINTENANCE_ACTIONS = frozenset({
     "ping", "list", "status", "get_history", "get_session_title", "get_result", "get_output",
     "background_poll", "background_notification_complete", "background_notification_release", "background_notification_status",
     "result_ack", "background_events_ack", "prepare_retire", "lifecycle_snapshot",
+    "notification_retention_scan", "notification_retention_reconcile",
 })
 
 

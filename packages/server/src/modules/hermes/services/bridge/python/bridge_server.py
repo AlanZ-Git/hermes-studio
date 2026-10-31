@@ -193,6 +193,12 @@ class BridgeServer:
                     "relogin_required": bool(getattr(exc, "relogin_required", False)),
                 }
 
+        if action in {"notification_retention_scan", "notification_retention_reconcile"}:
+            if action == "notification_retention_reconcile" and not isinstance(req.get("expected"), dict):
+                return {"obsolete": False, "reason": "partial_identity"}
+            return self.pool.notification_retention(req.get("expected") if action == "notification_retention_reconcile" else None,
+                                                    claim_keys=req.get("claim_keys"))
+
         if action == "lifecycle_snapshot":
             return self.pool.lifecycle_snapshot()
 
@@ -344,14 +350,14 @@ class BridgeServer:
             claim_id = str(req.get("claim_id") or "").strip()
             if not delegation_id or not claim_id:
                 raise ValueError("delegation_id and claim_id are required")
-            return self.pool.complete_background_notification(delegation_id, claim_id)
+            return self.pool.complete_background_notification(delegation_id, claim_id, allow_obsolete=req.get("allow_obsolete", True))
 
         if action == "background_notification_release":
             delegation_id = str(req.get("delegation_id") or "").strip()
             claim_id = str(req.get("claim_id") or "").strip()
             if not delegation_id or not claim_id:
                 raise ValueError("delegation_id and claim_id are required")
-            return self.pool.release_background_notification(delegation_id, claim_id)
+            return self.pool.release_background_notification(delegation_id, claim_id, allow_obsolete=req.get("allow_obsolete", True))
 
         if action == "destroy":
             return self.pool.destroy(str(req.get("session_id") or ""))
