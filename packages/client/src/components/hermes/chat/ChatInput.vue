@@ -15,6 +15,7 @@ import { deleteSkillBundleApi, fetchSkillBundles, type SkillBundleInfo } from '@
 import { NSpin, NButton, NTooltip, NModal, NInputNumber, NPopover, NSlider, NDropdown, useDialog, useMessage, type DropdownOption } from 'naive-ui'
 import { computed, ref, nextTick, onMounted, onUnmounted, watch, h } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useHermesReasoningDefault } from '@/composables/useHermesReasoningDefault'
 import { useToolTraceVisibility } from '@/composables/useToolTraceVisibility'
 import { extractClipboardFiles } from '@/utils/clipboard-files'
 import VoiceDialogueControls from './VoiceDialogueControls.vue'
@@ -79,16 +80,31 @@ const emit = defineEmits<{
 }>()
 
 const reasoningSession = computed(() => props.draft ? props.draftConfig : composerSession.value)
-const defaultReasoningEffortLabel = computed(() => t(props.reasoningEffortDisabled && isHermesSession(reasoningSession.value)
-  ? 'chat.reasoningEffort.options.default' : 'chat.reasoningEffort.options.none'))
 const isMoaSession = computed(() => reasoningSession.value?.provider === 'moa')
 const isGlobalCodingAgentSession = computed(() => reasoningSession.value?.codingAgentMode === 'global')
+const inheritsHermesReasoning = computed(() => isHermesSession(reasoningSession.value) && !isGlobalCodingAgentSession.value && !isMoaSession.value)
+const inheritedReasoning = useHermesReasoningDefault(computed(() => inheritsHermesReasoning.value && !props.reasoningEffortDisabled ? {
+  profile: reasoningSession.value?.profile || profilesStore.activeProfileName || 'default',
+  model: reasoningSession.value?.model || appStore.selectedModel || '',
+} : null))
+const defaultReasoningEffortLabel = computed(() => {
+  if (inheritsHermesReasoning.value && !props.reasoningEffortDisabled) {
+    const result = inheritedReasoning.value
+    const effort = result?.status === 'resolved' && result.effectiveEffort
+      ? effortLabel(result.effectiveEffort)
+      : t(result?.status === 'provider-default' ? 'chat.reasoningEffort.providerDefault' : 'chat.reasoningEffort.unknown')
+    return t('chat.reasoningEffort.inherited', { effort })
+  }
+  return t(props.reasoningEffortDisabled && isHermesSession(reasoningSession.value)
+    ? 'chat.reasoningEffort.options.default' : 'chat.reasoningEffort.options.none')
+})
 const isReadOnlyCodingAgentEffort = computed(() => !props.draft && isGlobalCodingAgentSession.value && isExternalCodingAgentSession(composerSession.value))
 function effortLabel(value: string) {
   return DEFAULT_REASONING_EFFORTS.includes(value) || ['ultra', 'disabled', 'enabled'].includes(value) ? t(`chat.reasoningEffort.options.${value}`) : value
 }
 const showReasoningEffort = ref(false)
-const reasoningEffortOptions = computed(() => agentReasoningEffortOptions(isGlobalCodingAgentSession.value && props.nativeEffortChoices
+const reasoningEffortOptions = computed(() => {
+  const options = isGlobalCodingAgentSession.value && props.nativeEffortChoices
   ? props.nativeEffortChoices.map(choice => ({ value: choice.effort,
     label: choice.effort ? effortLabel(choice.effort) : defaultReasoningEffortLabel.value })) : [
   { label: defaultReasoningEffortLabel.value, value: '' },
@@ -97,12 +113,14 @@ const reasoningEffortOptions = computed(() => agentReasoningEffortOptions(isGlob
     reasoningSession.value?.provider || appStore.selectedProvider || '',
     reasoningSession.value?.model || appStore.selectedModel || '',
   )).map(value => ({ label: effortLabel(value), value })),
-]))
+  ]
+  return inheritsHermesReasoning.value ? options : agentReasoningEffortOptions(options)
+})
 const requestedReasoningEffort = computed<string>(() =>
   ((props.draft || props.managedReasoningEffort) ? props.reasoningEffort : composerSession.value?.reasoningEffort
     || props.nativeEffortChoices?.find(choice => choice.model === composerSession.value?.model)?.effort) || ''
 )
-const currentReasoningEffort = computed(() => props.reasoningEffortDisabled || isReadOnlyCodingAgentEffort.value
+const currentReasoningEffort = computed(() => inheritsHermesReasoning.value || props.reasoningEffortDisabled || isReadOnlyCodingAgentEffort.value
   ? requestedReasoningEffort.value
   : agentReasoningEffortValue(requestedReasoningEffort.value, reasoningEffortOptions.value))
 const reasoningEffortSliderValue = computed(() => {
@@ -133,6 +151,7 @@ const reasoningEffortLabel = computed<string>(() => {
   const v = currentReasoningEffort.value
   if (!v) return defaultReasoningEffortLabel.value
   const opt = reasoningEffortOptions.value.find(o => o.value === v)
+  if (inheritsHermesReasoning.value && !props.reasoningEffortDisabled && !opt) return `${effortLabel(v)} — ${t('chat.reasoningEffort.unsupported')}`
   return opt?.label || effortLabel(v)
 })
 function onReasoningEffortChange(value: string | null | undefined) {
@@ -154,6 +173,7 @@ watch([reasoningEffortOptions, requestedReasoningEffort, canEditReasoningEffort]
     showReasoningEffort.value = false
     return
   }
+  if (inheritsHermesReasoning.value) return
   const fallback = agentReasoningEffortValue('', options)
   if ((!requested && fallback) || (!isGlobalCodingAgentSession.value && requested && !options.some(option => option.value === requested))) {
     if (!props.draft && !props.managedReasoningEffort) {
@@ -1446,6 +1466,9 @@ function openAttachmentPreview(attachment: Attachment) {
                 <span>{{ t('chat.reasoningEffort.tooltip') }}</span>
                 <strong>{{ reasoningEffortLabel }}</strong>
               </div>
+              <NButton v-if="inheritsHermesReasoning" class="reasoning-effort-reset" size="tiny" :disabled="!canEditReasoningEffort" @click="onReasoningEffortChange('')">
+                {{ defaultReasoningEffortLabel }}
+              </NButton>
               <NSlider
                 class="reasoning-effort-slider"
                 :class="{ 'reasoning-effort-slider--max': currentReasoningEffort === 'max' }"

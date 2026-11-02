@@ -74,7 +74,7 @@ vi.mock('@/utils/completion-sound', () => ({
 
 import { useChatStore, type Message, type Session } from '@/stores/hermes/chat'
 import { useSettingsStore } from '@/stores/hermes/settings'
-import {respondClarify} from '@/api/studio/chat'
+import {respondClarify, respondToolApproval} from '@/api/studio/chat'
 import { invalidateAuth } from '@/api/auth-invalidation'
 
 function makeSession(id: string): Session {
@@ -163,6 +163,147 @@ describe('chat store error handling - #1644', () => {
     expect(completionSoundMock.primeCompletionSound).not.toHaveBeenCalled()
   })
 
+  it('queues independent same-session approvals and clears only the exact terminal binding', () => {
+    const store = useChatStore()
+    store.activeSessionId = 'session-b'
+    const first = { event: 'approval.requested', session_id: 'session-b', approval_id: 'a', run_id: 'r1', request_id: 'q1', choices: ['once', 'deny'] }
+    chatApi.globalPendingHandler?.(first)
+    chatApi.globalPendingHandler?.({ ...first, approval_id: 'b' })
+    chatApi.globalPendingHandler?.({ ...first, run_id: 'r2', request_id: 'q2' })
+    expect(store.pendingApprovals.size).toBe(3)
+    expect(store.respondApprovalFor('session-b', 'a', 'once', { runId: 'wrong', requestId: 'q1' })).toBe('missing')
+    expect(store.respondApprovalFor('session-b', 'a', 'once')).toBe('missing')
+    expect(store.activePendingApproval).toMatchObject({ approvalId: 'a', runId: 'r1' })
+    chatApi.globalPendingHandler?.({ ...first, event: 'approval.resolved', resolved: true, run_id: 'wrong' })
+    expect(store.pendingApprovals.size).toBe(3)
+    chatApi.globalPendingHandler?.({ ...first, event: 'approval.resolved', resolved: false, terminal: true })
+    expect(store.pendingApprovals.size).toBe(2)
+    expect(store.activePendingApproval?.approvalId).toBe('b')
+    chatApi.globalPendingHandler?.({ ...first, event: 'approval.resolved', resolved: true })
+    expect(store.pendingApprovals.size).toBe(2)
+  })
+
+  it('preserves durable Person approval in-flight bindings across runtime switches and clears them on auth invalidation', () => {
+    const store = useChatStore()
+    const request = { event: 'approval.requested', session_id: 'person-main-1', approval_id: 'a', choices: ['once', 'deny'], durable: true }
+    chatApi.globalPendingHandler?.(request)
+    chatApi.globalPendingHandler?.({ ...request, approval_id: 'b' })
+    store.respondApprovalFor('person-main-1', 'a', 'once')
+    store.setRuntimeMode('global_agent')
+    expect(store.pendingApprovals.size).toBe(2)
+    store.respondApprovalFor('person-main-1', 'a', 'once')
+    expect(respondToolApproval).toHaveBeenCalledOnce()
+    invalidateAuth()
+    expect(store.pendingApprovals.size).toBe(0)
+    chatApi.globalPendingHandler?.(request)
+    store.respondApprovalFor('person-main-1', 'a', 'once')
+    expect(respondToolApproval).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not extend a replayed approval countdown, including zero remaining', () => {
+    const store = useChatStore()
+    store.activeSessionId = 'session-b'
+    const event = { event: 'approval.requested', session_id: 'session-b', approval_id: 'a', remaining_timeout_ms: 0, timeout_ms: 600000 }
+    chatApi.globalPendingHandler?.(event)
+    const deadline = store.activePendingApproval!.countdownDeadline
+    chatApi.globalPendingHandler?.({ ...event, remaining_timeout_ms: 600000 })
+    expect(store.activePendingApproval!.countdownDeadline).toBe(deadline)
+  })
+
+  it('retains submitted approvals until ACK and retries recoverable failures without cross-clearing', () => {
+    const store = useChatStore()
+    store.activeSessionId = 's'
+    const request = { event: 'approval.requested', session_id: 's', approval_id: 'a', run_id: 'r', request_id: 'q', choices: ['once', 'deny'] }
+    chatApi.globalPendingHandler?.(request)
+    chatApi.globalPendingHandler?.({ ...request, approval_id: 'b' })
+    expect(store.respondApproval('once')).toBe('submitted')
+    expect(store.pendingApprovals.size).toBe(2)
+    expect(store.activePendingApproval?.approvalId).toBe('a')
+    expect(store.respondApproval('once')).toBe('submitted')
+    expect(respondToolApproval).toHaveBeenCalledTimes(1)
+    const firstAttempt = (vi.mocked(respondToolApproval).mock.calls[0] as any)[4]
+    const ack = { ...request, event: 'approval.resolved', ...firstAttempt }
+    chatApi.globalPendingHandler?.({ ...ack, resolved: true, run_id: 'wrong' })
+    chatApi.globalPendingHandler?.({ ...ack, resolved: true, session_id: 'wrong' })
+    chatApi.globalPendingHandler?.({ ...ack, resolved: true, approval_id: 'wrong' })
+    chatApi.globalPendingHandler?.({ ...ack, resolved: true, request_id: 'wrong' })
+    expect(store.pendingApprovals.size).toBe(2)
+    chatApi.globalPendingHandler?.({ ...ack, resolved: false, terminal: false, outcome: 'notify_failed' })
+    expect(store.respondApproval('once')).toBe('submitted')
+    expect(respondToolApproval).toHaveBeenCalledTimes(2)
+    const retry = (vi.mocked(respondToolApproval).mock.calls[1] as any)[4]
+    chatApi.globalPendingHandler?.({ ...ack, resolved: false, terminal: false })
+    store.respondApproval('once')
+    expect(respondToolApproval).toHaveBeenCalledTimes(2)
+    chatApi.globalPendingHandler?.({ ...ack, ...retry, resolved: true })
+    chatApi.globalPendingHandler?.({ ...ack, ...retry, resolved: true })
+    expect(store.pendingApprovals.size).toBe(1)
+    expect(store.activePendingApproval?.approvalId).toBe('b')
+  })
+
+  it('sets in-flight bookkeeping before synchronous ACK and releases it on synchronous failure or throw', () => {
+    const store = useChatStore()
+    store.activeSessionId = 's'
+    const request = { event: 'approval.requested', session_id: 's', approval_id: 'a', choices: ['once', 'deny'], durable: true }
+    chatApi.globalPendingHandler?.(request)
+    vi.mocked(respondToolApproval).mockImplementationOnce((...args: any[]) => {
+      chatApi.globalPendingHandler?.({ ...request, ...args[4], event: 'approval.resolved', resolved: false, terminal: false })
+    })
+    store.respondApproval('once')
+    expect(store.activePendingApproval?.countdownDeadline).toBe(Infinity)
+    vi.mocked(respondToolApproval).mockImplementationOnce(() => { throw new Error('transport unavailable') })
+    expect(() => store.respondApproval('once')).toThrow('transport unavailable')
+    vi.mocked(respondToolApproval).mockImplementationOnce((...args: any[]) => {
+      chatApi.globalPendingHandler?.({ ...request, ...args[4], event: 'approval.resolved', resolved: true })
+    })
+    expect(store.respondApproval('once')).toBe('submitted')
+    expect(respondToolApproval).toHaveBeenCalledTimes(3)
+    expect(store.pendingApprovals.size).toBe(0)
+  })
+
+  it('cleans up only approvals belonging to a failed run through the streaming event path', async () => {
+    const store = useChatStore()
+    const session = makeSession('s')
+    store.sessions = [session]
+    store.activeSessionId = session.id
+    store.activeSession = session
+    await store.sendMessage('approval cleanup')
+    const onEvent = chatApi.startRunViaSocket.mock.calls[0][1]
+    for (const run_id of ['r1', 'r2']) onEvent({ event: 'approval.requested', session_id: 's', approval_id: run_id, run_id, choices: ['once', 'deny'] })
+    expect(store.pendingApprovals.size).toBe(2)
+    store.respondApprovalFor('s', 'r1', 'once')
+    store.respondApprovalFor('s', 'r2', 'once')
+    expect(respondToolApproval).toHaveBeenCalledTimes(2)
+    onEvent({ event: 'run.failed', session_id: 's', run_id: 'r1', error: 'Failed' })
+    expect([...store.pendingApprovals.values()].map(pending => pending.runId)).toEqual(['r2'])
+    expect(store.respondApprovalFor('s', 'r1', 'once')).toBe('missing')
+    store.respondApprovalFor('s', 'r2', 'once')
+    expect(respondToolApproval).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps parallel same-session submission bookkeeping independent and handles asynchronous ACKs', async () => {
+    const store = useChatStore()
+    store.activeSessionId = 's'
+    const request = { event: 'approval.requested', session_id: 's', run_id: 'r', choices: ['once', 'deny'] }
+    for (const approval_id of ['a', 'b']) chatApi.globalPendingHandler?.({ ...request, approval_id })
+    store.respondApprovalFor('s', 'a', 'once')
+    store.respondApprovalFor('s', 'b', 'once')
+    expect(respondToolApproval).toHaveBeenCalledTimes(2)
+    const firstAttempt = (vi.mocked(respondToolApproval).mock.calls[0] as any)[4]
+    chatApi.globalPendingHandler?.({ ...request, ...firstAttempt, event: 'approval.resolved', approval_id: 'a', resolved: false, terminal: false })
+    store.respondApprovalFor('s', 'b', 'once')
+    expect(respondToolApproval).toHaveBeenCalledTimes(2)
+    vi.mocked(respondToolApproval).mockImplementationOnce((...args: any[]) => {
+      queueMicrotask(() => chatApi.globalPendingHandler?.({ ...request, ...args[4], event: 'approval.resolved', approval_id: 'a', resolved: true }))
+    })
+    store.respondApprovalFor('s', 'a', 'once')
+    expect(store.pendingApprovals.size).toBe(2)
+    await Promise.resolve()
+    expect([...store.pendingApprovals.values()].map(pending => pending.approvalId)).toEqual(['b'])
+    store.respondApprovalFor('s', 'b', 'once')
+    expect(respondToolApproval).toHaveBeenCalledTimes(3)
+  })
+
   it('tracks an approval request from an inactive session through the global socket listener', () => {
     const store = useChatStore()
     const sessionA = makeSession('session-a')
@@ -179,7 +320,7 @@ describe('chat store error handling - #1644', () => {
       choices: ['once', 'deny'],
     })
 
-    expect(store.pendingApprovals.get('session-b')).toMatchObject({ approvalId: 'approval-b', command: 'pwd' })
+    expect([...store.pendingApprovals.values()].find(pending => pending.sessionId === 'session-b')).toMatchObject({ approvalId: 'approval-b', command: 'pwd' })
     expect(store.activePendingApproval).toBeNull()
   })
 
@@ -197,8 +338,8 @@ describe('chat store error handling - #1644', () => {
       question: 'Continue?', timeout_ms: 300_000, remaining_timeout_ms: 17_000,
     })
 
-    expect(store.pendingApprovals.get('session-b')!.countdownDeadline - now).toBeGreaterThanOrEqual(41_900)
-    expect(store.pendingApprovals.get('session-b')!.countdownDeadline - now).toBeLessThanOrEqual(42_100)
+    expect([...store.pendingApprovals.values()].find(pending => pending.sessionId === 'session-b')!.countdownDeadline - now).toBeGreaterThanOrEqual(41_900)
+    expect([...store.pendingApprovals.values()].find(pending => pending.sessionId === 'session-b')!.countdownDeadline - now).toBeLessThanOrEqual(42_100)
     expect(store.pendingClarifies.get('session-b')!.countdownDeadline - now).toBeGreaterThanOrEqual(16_900)
     expect(store.pendingClarifies.get('session-b')!.countdownDeadline - now).toBeLessThanOrEqual(17_100)
   })
@@ -212,21 +353,21 @@ describe('chat store error handling - #1644', () => {
     chatApi.globalPendingHandler?.({
       event: 'approval.resolved', session_id: 'session-b', approval_id: 'approval-b', resolved: false, terminal: true, outcome,
     })
-    expect(store.pendingApprovals.has('session-b')).toBe(false)
+    expect([...store.pendingApprovals.values()].some(pending => pending.sessionId === 'session-b')).toBe(false)
   })
 
   it('does not let an old terminal clear a newer approval in the same session', () => {
     const store = useChatStore()
     chatApi.globalPendingHandler?.({ event: 'approval.requested', session_id: 'session-b', approval_id: 'new', choices: ['once', 'deny'] })
     chatApi.globalPendingHandler?.({ event: 'approval.resolved', session_id: 'session-b', approval_id: 'old', terminal: true, resolved: false, outcome: 'timeout' })
-    expect(store.pendingApprovals.get('session-b')?.approvalId).toBe('new')
+    expect([...store.pendingApprovals.values()].find(pending => pending.sessionId === 'session-b')?.approvalId).toBe('new')
   })
 
   it.each(['binding_mismatch', 'invalid_scope', 'stale'])('keeps valid pending approvals after a non-terminal %s response', outcome => {
     const store = useChatStore()
     for (const sid of ['session-a', 'session-b']) chatApi.globalPendingHandler?.({ event: 'approval.requested', session_id: sid, approval_id: sid, choices: ['once', 'deny'] })
     chatApi.globalPendingHandler?.({ event: 'approval.resolved', session_id: 'session-a', approval_id: 'session-a', resolved: false, terminal: false, outcome })
-    expect([...store.pendingApprovals.keys()]).toEqual(['session-a', 'session-b'])
+    expect([...store.pendingApprovals.values()].map(pending => pending.sessionId)).toEqual(['session-a', 'session-b'])
   })
 
   it('keeps a pending approval when the authoritative response is unresolved', () => {
@@ -240,7 +381,7 @@ describe('chat store error handling - #1644', () => {
       event: 'approval.resolved', session_id: 'session-b', approval_id: 'approval-b', resolved: false, error: 'stale',
     })
 
-    expect(store.pendingApprovals.get('session-b')).toMatchObject({ approvalId: 'approval-b' })
+    expect([...store.pendingApprovals.values()].find(pending => pending.sessionId === 'session-b')).toMatchObject({ approvalId: 'approval-b' })
   })
 
   it('waits for the server to decide whether old approval and clarification prompts expired', () => {
@@ -254,17 +395,18 @@ describe('chat store error handling - #1644', () => {
     chatApi.globalPendingHandler?.({
       event: 'clarify.requested', session_id: 'session-b', clarify_id: 'clarify-b', question: 'Continue?', timeout_ms: 1,
     })
-    store.pendingApprovals.get('session-b')!.requestedAt = Date.now() - 10
+    const approval = [...store.pendingApprovals.values()].find(pending => pending.sessionId === 'session-b')!
+    approval.requestedAt = Date.now() - 10
     store.pendingClarifies.get('session-b')!.requestedAt = Date.now() - 10
 
     expect(store.respondApprovalFor('session-b', 'approval-b', 'once')).toBe('submitted')
     expect(store.respondToClarifyFor('session-b', 'clarify-b', 'Continue')).toBe('submitted')
-    expect(store.pendingApprovals.has('session-b')).toBe(true)
+    expect([...store.pendingApprovals.values()].some(pending => pending.sessionId === 'session-b')).toBe(true)
     expect(store.pendingClarifies.has('session-b')).toBe(true)
     expect(expired).not.toHaveBeenCalled()
 
     chatApi.globalPendingHandler?.({
-      event: 'approval.resolved', session_id: 'session-b', approval_id: 'approval-b', resolved: false,
+      event: 'approval.resolved', session_id: 'session-b', approval_id: 'approval-b', resolved: false, terminal: true,
       stale: true, error: 'Approval is no longer pending.',
     })
     chatApi.globalPendingHandler?.({
@@ -272,13 +414,13 @@ describe('chat store error handling - #1644', () => {
       stale: true, error: 'Clarification is no longer pending.',
     })
 
-    expect(store.pendingApprovals.has('session-b')).toBe(false)
+    expect([...store.pendingApprovals.values()].some(pending => pending.sessionId === 'session-b')).toBe(false)
     expect(store.pendingClarifies.has('session-b')).toBe(false)
     expect(expired).toHaveBeenCalledTimes(2)
     window.removeEventListener('hermes:pending-interaction-expired', expired)
   })
 
-  it('reports a server-confirmed stale response after optimistic local removal', () => {
+  it('reports a server-confirmed terminal stale response after retaining the submitted approval', () => {
     const store = useChatStore()
     const session = makeSession('session-b')
     const expired = vi.fn()
@@ -291,9 +433,9 @@ describe('chat store error handling - #1644', () => {
     })
 
     expect(store.respondApproval('once')).toBe('submitted')
-    expect(store.pendingApprovals.has(session.id)).toBe(false)
+    expect(store.pendingApprovals.size).toBe(1)
     chatApi.globalPendingHandler?.({
-      event: 'approval.resolved', session_id: session.id, approval_id: 'approval-b', resolved: false,
+      event: 'approval.resolved', session_id: session.id, approval_id: 'approval-b', resolved: false, terminal: true,
       stale: true, error: 'Approval is no longer pending.',
     })
 

@@ -234,6 +234,13 @@ export interface AgentBridgeBackgroundSession {
 }
 
 export interface AgentBridgeBackgroundNotification {
+  notification_kind?: 'kanban'
+  delivery_mode?: string
+  execution_stopped?: boolean
+  studio_auto_continue?: 'v1'
+  wake_eligible?: boolean
+  identity?: unknown[]
+  board_db_identity?: number[]
   delegation_id: string
   session_id: string
   profile: string
@@ -274,6 +281,15 @@ export class AgentBridgeClient {
   private summarizePayload(payload: Record<string, unknown>): Record<string, unknown> {
     const action = String(payload.action || '')
     const summary: Record<string, unknown> = { action }
+    if (action === 'loop_operation') {
+      for (const key of ['op', 'session_id', 'profile', 'tick_id', 'recovery_id', 'run_id']) {
+        if (typeof payload[key] === 'string') summary[key] = (payload[key] as string).slice(0, 128)
+      }
+      for (const key of ['generation', 'expected_generation']) {
+        if (Number.isSafeInteger(payload[key])) summary[key] = payload[key]
+      }
+      return summary
+    }
     for (const key of ['session_id', 'run_id', 'expected_run_id', 'request_id', 'approval_id', 'profile', 'worker_key']) {
       if (payload[key] != null) summary[key] = payload[key]
     }
@@ -462,7 +478,8 @@ export class AgentBridgeClient {
           bridgeLogger.warn({
             durationMs: Date.now() - startedAt,
             runtime: runtimeContext,
-            response: this.summarizeResponse(response as Record<string, unknown>),
+            response: action === 'loop_operation' ? { ok: Boolean(response.ok) } : this.summarizeResponse(response as Record<string, unknown>),
+            request: action === 'loop_operation' ? this.summarizePayload(payload) : undefined,
           }, '[agent-bridge-client] request rejected')
           throw error
         }
@@ -470,7 +487,8 @@ export class AgentBridgeClient {
           bridgeLogger.info({
             durationMs: Date.now() - startedAt,
             runtime: runtimeContext,
-            response: this.summarizeResponse(response as Record<string, unknown>),
+            response: action === 'loop_operation' ? { ok: Boolean(response.ok) } : this.summarizeResponse(response as Record<string, unknown>),
+            request: action === 'loop_operation' ? this.summarizePayload(payload) : undefined,
           }, '[agent-bridge-client] response')
         }
         return response as T
@@ -478,7 +496,7 @@ export class AgentBridgeClient {
         if (!(err instanceof AgentBridgeError) && action !== 'background_poll') {
           bridgeLogger.error({
             durationMs: Date.now() - startedAt,
-            err: { message: err?.message, name: err?.name },
+            err: action === 'loop_operation' ? { name: err?.name } : { message: err?.message, name: err?.name },
             runtime: runtimeContext,
             request: this.summarizePayload(payload),
           }, '[agent-bridge-client] request failed')

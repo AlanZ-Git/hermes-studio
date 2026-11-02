@@ -89,6 +89,60 @@ describe('resumeBridgeRun', () => {
     estimateUsageTokensFromMessagesMock.mockReturnValue({ inputTokens: 3, outputTokens: 2 })
   })
 
+  it.each([1000, 0])('forwards approval bindings and %i ms remaining without extending on resume', async remaining => {
+    const { resumeBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
+    const { buildResumeEvents } = await import('../../packages/server/src/modules/studio/services/chat-run/resume-payload')
+    const { nsp, emitted } = createNamespace()
+    const deadline = Date.now() + 600000
+    const sessionMap = new Map<string, any>([['session-resume', { messages: [], events: [], isWorking: true, queue: [] }]])
+    const bridge = {
+      getResult: vi.fn(async () => ({ ok: true, run_id: 'run-resume', status: 'running', deltas: [], events: [] })),
+      getOutput: vi.fn(async () => ({ ok: true, run_id: 'run-resume', status: 'complete', done: true, result: { final_response: '' }, events: [
+        { event: 'approval.requested', approval_id: 'a', request_id: 'req-a', run_id: 'run-resume', timeout_ms: 600000, remaining_timeout_ms: remaining, deadline_ms: deadline },
+        { event: 'approval.requested', approval_id: 'b', request_id: 'req-b', run_id: 'run-resume', timeout_ms: 600000, remaining_ms: remaining, deadline_ms: deadline },
+        { event: 'approval.resolved', approval_id: 'a', request_id: 'req-a', run_id: 'run-resume', resolved: false, terminal: false, outcome: 'binding_mismatch' },
+      ] })),
+      contextEstimate: vi.fn(async () => ({ ok: true, fixed_context_tokens: 0 })),
+    }
+    await resumeBridgeRun(nsp as any, { id: 'socket-1', connected: true, emit: vi.fn() } as any,
+      { sessionId: 'session-resume', runId: 'run-resume', profile: 'default', model: 'gpt-test', provider: 'openai' } as any,
+      sessionMap, bridge as any, vi.fn())
+    const requests = emitted.filter(e => e.event === 'approval.requested')
+    expect(requests).toHaveLength(2)
+    expect(requests[0].payload).toMatchObject({ remaining_timeout_ms: remaining, deadline_ms: deadline, request_id: 'req-a', run_id: 'run-resume' })
+    expect(requests[1].payload).toMatchObject({ remaining_timeout_ms: remaining, deadline_ms: deadline, request_id: 'req-b', run_id: 'run-resume' })
+    expect(emitted.find(e => e.event === 'approval.resolved')?.payload).toMatchObject({ request_id: 'req-a', run_id: 'run-resume' })
+    const replay = buildResumeEvents(requests.map(e => ({ event: e.event, data: e.payload })), deadline + 500)
+    expect(replay.map(e => e.data.remaining_timeout_ms)).toEqual([0, 0])
+    for (const request of requests) {
+      const [earlierReplay] = buildResumeEvents([{ event: request.event, data: request.payload }], request.payload.requested_at + 500)
+      expect(earlierReplay.data.remaining_timeout_ms).toBe(Math.max(0, remaining - 500))
+    }
+  })
+
+  it('replays bound approval snapshot events before advancing the bridge event cursor', async () => {
+    const { resumeBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
+    const { nsp, emitted } = createNamespace()
+    const sessionMap = new Map<string, any>([['session-resume', { messages: [], events: [], isWorking: true, queue: [] }]])
+    const storedRequests: string[] = []
+    const bridge = {
+      getResult: vi.fn(async () => ({ ok: true, deltas: [], events: [
+        { event: 'approval.requested', run_id: 'run-resume', approval_id: 'a', timeout_ms: 600000, deadline_ms: Date.now() - 1000 },
+        { event: 'approval.requested', run_id: 'run-resume', approval_id: 'b', timeout_ms: 600000, deadline_ms: Date.now() + 1000 },
+      ] })),
+      getOutput: vi.fn(async () => {
+        storedRequests.push(...sessionMap.get('session-resume').events.filter((e: any) => e.event === 'approval.requested').map((e: any) => e.data.approval_id))
+        return { ok: true, run_id: 'run-resume', done: true, status: 'complete', events: [], result: { final_response: '' } }
+      }),
+      contextEstimate: vi.fn(async () => ({ ok: true, fixed_context_tokens: 0 })),
+    }
+    await resumeBridgeRun(nsp as any, { id: 'socket-1', connected: true } as any,
+      { sessionId: 'session-resume', runId: 'run-resume', profile: 'default' } as any, sessionMap, bridge as any, vi.fn())
+    expect(emitted.filter(e => e.event === 'approval.requested').map(e => e.payload.approval_id)).toEqual(['a', 'b'])
+    expect(emitted.find(e => e.event === 'approval.requested')?.payload.remaining_timeout_ms).toBe(0)
+    expect(storedRequests).toEqual(['a', 'b'])
+  })
+
   it('continues polling a resumed workflow run without judging goals when a cli continuation is queued', async () => {
     const { resumeBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
     const { nsp, emitted } = createNamespace()

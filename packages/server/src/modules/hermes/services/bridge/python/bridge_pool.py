@@ -59,7 +59,13 @@ _KANBAN_AUDIT_KINDS = frozenset({
     'edited', 'reprioritized', 'model_override_set', 'reasoning_effort_set', 'pr_acceptance',
     'terminal_worker_reaped', 'archive_worker_termination', 'stop_worker_termination',
     'tip_scratch_workspace', 'workspace_cleanup_deferred_shared', 'respawn_guarded',
-    'skipped_nonspawnable', 'reclaim_deferred', 'reconciled',
+    'skipped_nonspawnable', 'reclaim_deferred', 'reconciled', 'notify_origin_changed', 'child_removed',
+})
+
+
+_STUDIO_KANBAN_CANDIDATES = frozenset({
+    'completed', 'review_requested', 'changes_requested', 'blocked',
+    'block_loop_detected', 'gave_up', 'crashed', 'timed_out',
 })
 
 
@@ -1361,6 +1367,7 @@ class AgentPool:
             except Exception:
                 continue
             try:
+                conn.execute('BEGIN')
                 for sub in notify.list_notify_subs(conn):
                     session_id = str(sub.get("chat_id") or "")
                     if (sub.get("platform") or "").lower() != "tui" or session_id not in loaded_session_ids:
@@ -1407,7 +1414,7 @@ class AgentPool:
                     # No durable cursor change at claim. A killed bridge simply replays;
                     # the target's persisted exact receipt makes replay idempotent.
                     events = events[:1]
-                    new_cursor = int(state['cursor']) if policy == 'final_only' else int(events[0].id)
+                    new_cursor = int(events[0].id)
                     task = kb.get_task(conn, sub["task_id"])
                     messages = [self._format_kanban_notification(slug, task, event) for event in events]
                     message = "\n".join(text for text in messages if text)
@@ -1442,7 +1449,10 @@ class AgentPool:
                         stopped = execution_stopped(conn, sub['task_id'])
                     except ImportError:
                         stopped = False  # compatible with a Core predating task-set stop
+                    studio_auto = (sub.get('delivery_metadata') or {}).get('studio_auto_continue') == 'v1'
                     notifications.append({
+                        **({'studio_auto_continue': 'v1',
+                            'wake_eligible': last_event.kind in _STUDIO_KANBAN_CANDIDATES} if studio_auto else {}),
                         "execution_stopped": stopped,
                         "notification_kind": "kanban",
                         "identity": identity,
@@ -1515,20 +1525,52 @@ class AgentPool:
             conn = self._open_kanban_claim_db({'db_path': identity[0],
                 'db_identity': db_identity or (stat.st_dev, stat.st_ino)})
             try:
-                sub = conn.execute('SELECT notifier_profile FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?',
+                conn.execute('BEGIN')
+                sub = conn.execute('SELECT notifier_profile, delivery_metadata FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?',
                                    (identity[1], identity[5], identity[6], identity[7])).fetchone()
-                event = conn.execute('SELECT task_id, run_id FROM task_events WHERE id=?', (identity[2],)).fetchone()
+                event = conn.execute('SELECT task_id, run_id, kind, payload FROM task_events WHERE id=?', (identity[2],)).fetchone()
                 task = kb.get_task(conn, identity[1])
                 if not sub or (sub['notifier_profile'] or profile) != profile or not event or not task:
                     return {'current': False}
                 if task.notification_policy == 'final_only':
-                    graph = conn.execute('WITH RECURSIVE graph(id) AS (SELECT ? UNION SELECT l.child_id FROM task_links l JOIN graph g ON l.parent_id=g.id) SELECT 1 FROM graph WHERE id=?',
-                                         (identity[1], event['task_id'])).fetchone()
-                    if not graph or identity[3] is not None:
+                    if identity[3] is not None:
                         return {'current': False}
                 elif event['task_id'] != identity[1] or event['run_id'] != identity[3]:
                     return {'current': False}
-                return {'current': True, 'execution_stopped': execution_fenced(conn, identity[1])}
+                result = {'current': True, 'execution_stopped': execution_fenced(conn, identity[1])}
+                metadata = json.loads(sub['delivery_metadata'] or '{}')
+                if metadata.get('studio_auto_continue') == 'v1':
+                    kind = event['kind']
+                    stale = False
+                    if task.notification_policy == 'final_only':
+                        from hermes_cli.kanban_db_notify import final_only_graph_state
+                        graph_state = final_only_graph_state(conn, identity[1], after_event_id=0)
+                        if graph_state.get('all_terminal'):
+                            kind = 'completed'
+                            stale = int(graph_state['cursor']) != int(identity[2])
+                        else:
+                            kind = 'blocked'
+                            stale = int(graph_state.get('blocking_event_id') or 0) != int(identity[2])
+                    else:
+                        if kind == 'completed':
+                            stale = task.status not in {'done', 'archived'}
+                        elif kind == 'review_requested':
+                            stale = task.status != 'review'
+                        if event['run_id'] is not None and task.current_run_id is not None:
+                            stale = stale or event['run_id'] != task.current_run_id
+                        for row in conn.execute('SELECT id, kind, payload FROM task_events WHERE task_id=? AND id>?', (identity[1], identity[2])):
+                            if row['kind'] in {'claimed', 'review_reopened', 'descendant_invalidated',
+                                               'changes_requested', 'review_requested', 'completed'}:
+                                stale = stale or kind in {'completed', 'review_requested'}
+                            elif row['kind'] == 'status':
+                                status = json.loads(row['payload'] or '{}').get('status')
+                                retained = {'done', 'archived'} if kind == 'completed' else {'review'}
+                                if status is not None and status not in retained:
+                                    stale = stale or kind in {'completed', 'review_requested'}
+                    result.update(studio_auto_continue='v1', wake_eligible=kind in _STUDIO_KANBAN_CANDIDATES,
+                        stale_result=stale, latest_task_status=task.status, latest_run_id=task.current_run_id,
+                        latest_event_id=conn.execute('SELECT MAX(id) FROM task_events WHERE task_id=?', (identity[1],)).fetchone()[0])
+                return result
             finally:
                 conn.close()
         with self._notification_lock:

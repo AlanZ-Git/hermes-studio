@@ -84,6 +84,59 @@ function makeContext(state: any, commandResult: Record<string, unknown> = {
   return { bridge, namespaceEmit, nsp, runQueuedItem, sessionMap, socket }
 }
 
+describe('correlated native loop control', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  async function invoke(row: any, owner: any = { id: 'synthetic-owner' }, failure = false) {
+    getSessionMock.mockReturnValue(row)
+    const state = { messages: [], isWorking: true, currentRunId: 'executing-caller', events: [], queue: [{ queue_id: 'existing' }] }
+    const fixture = makeContext(state, { handled: true, ok: true, message: 'synthetic loop status', request_id: 'bridge-must-not-override', profile: 'other' })
+    Object.assign(fixture.socket, { data: { user: owner } })
+    if (failure) fixture.bridge.command.mockRejectedValueOnce(new Error('synthetic bridge failure'))
+    const { handleSessionCommand, parseSessionCommand } = await import('../../packages/server/src/modules/studio/services/chat-run/session-command')
+    await handleSessionCommand('session-1', parseSessionCommand('/loop status')!, {
+      ...fixture, profile: 'synthetic-profile', requestId: 'synthetic-request',
+    } as any)
+    return { ...fixture, state }
+  }
+
+  const row = { id: 'session-1', user_id: 'synthetic-owner', profile: 'synthetic-profile', source: 'api_server', agent: 'hermes' }
+
+  it('returns exact requester correlation without ending, queueing or rescheduling the active turn', async () => {
+    const f = await invoke(row)
+    expect(f.bridge.command).toHaveBeenCalledWith('session-1', '/loop status', 'synthetic-profile')
+    expect(f.namespaceEmit).toHaveBeenCalledWith('session.command', expect.objectContaining({
+      session_id: 'session-1', profile: 'synthetic-profile', request_id: 'synthetic-request', action: 'loop', control: true, terminal: false, busy: true, ok: true,
+    }))
+    expect(f.state.isWorking).toBe(true)
+    expect(f.state.currentRunId).toBe('executing-caller')
+    expect(f.state.queue).toEqual([{ queue_id: 'existing' }])
+    expect(f.runQueuedItem).not.toHaveBeenCalled()
+    expect(f.namespaceEmit.mock.calls.every(([event]) => event === 'session.command')).toBe(true)
+  })
+
+  it.each([
+    ['wrong owner', { ...row, user_id: 'other' }, { id: 'synthetic-owner' }],
+    ['wrong profile', { ...row, profile: 'other' }, { id: 'synthetic-owner' }],
+    ['coding engine', { ...row, agent: 'codex' }, { id: 'synthetic-owner' }],
+    ['external session', { ...row, agent_session_id: 'external' }, { id: 'synthetic-owner' }],
+    ['missing owner', row, null],
+  ])('preserves %s denial and correlates the rejection', async (_label, sessionRow, owner) => {
+    const f = await invoke(sessionRow, owner)
+    expect(f.bridge.command).not.toHaveBeenCalled()
+    expect(f.socket.emit).toHaveBeenCalledWith('session.command', expect.objectContaining({ ok: false, terminal: false, control: true, action: 'loop', profile: 'synthetic-profile', request_id: 'synthetic-request' }))
+    expect(f.runQueuedItem).not.toHaveBeenCalled()
+  })
+
+  it('correlates bridge errors as nonterminal loop receipts', async () => {
+    const f = await invoke(row, { id: 'synthetic-owner' }, true)
+    const emissions = [...f.socket.emit.mock.calls, ...f.namespaceEmit.mock.calls]
+    expect(emissions).toContainEqual(['session.command', expect.objectContaining({ ok: false, action: 'loop', control: true, terminal: false, profile: 'synthetic-profile', request_id: 'synthetic-request', message: 'synthetic bridge failure' })])
+    expect(f.state.isWorking).toBe(true)
+    expect(f.runQueuedItem).not.toHaveBeenCalled()
+  })
+})
+
 describe('plan session command', () => {
   beforeEach(() => {
     vi.clearAllMocks()

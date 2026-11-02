@@ -57,13 +57,17 @@ class LoopStore:
         with self.transaction() as db:
             state,meta=self.read(db,sid);mgr=self.manager(sid,state)
             before=state.to_json() if state else None
+            prior_count=state.ticks_fired if state else None
             action=arg.strip().lower()
-            if action=='resume' and (recovery.unresolved(meta) or recovery.exhausted(state)):
-                return {'session_id':sid,'handled':True,'ok':False,'message':'/loop: unresolved recovery or exhausted count; resume denied',**self.result(state,meta)}
+            if action=='resume' and (recovery.unresolved(meta) or recovery.exhausted(state) or (meta.get('tick') or {}).get('phase')=='unknown'):
+                return {'session_id':sid,'handled':True,'ok':False,'message':'/loop: unresolved dispatch/recovery or exhausted count; resume denied',**self.result(state,meta)}
             result=dispatch_loop_command(mgr,arg,route={'platform':'agent_bridge','chat_id':sid,'profile':profile})
             # clear() hides the state but its cleared record must remain in native storage.
             state=mgr.state or (state if arg.lower() in {'stop','clear','cancel'} else None)
             if result['created'] or (state.to_json() if state else None)!=before or action in {'pause','stop','clear','cancel'}:
+                running=meta.get('tick')
+                if running and running['generation']==meta['generation']:
+                    running.setdefault('ticks_fired',prior_count)
                 meta['generation']+=1
                 if meta.get('recovery') and recovery.unresolved(meta):
                     meta['recovery'].update(status='held' if action=='pause' else 'superseded',result='new user control invalidated recovery',finished_at=time.time())
@@ -93,23 +97,32 @@ class LoopStore:
             with self.transaction() as db:
                 state,meta=self.read(db,sid)
                 snapshot=(state.to_json() if state else None,json.dumps(meta,sort_keys=True))
-                if not self.matches(meta,req):return self.result(state,meta,stale=True)
+                if not state or (state.route or {}).get('profile')!=req.get('profile') or not self.matches(meta,req):return self.result(state,meta,stale=True)
             if meta['generation']==req['generation']:
                 mgr=self.manager(sid,state);decision=mgr.complete_tick(req.get('response',''));candidate=mgr.state
         with self.transaction() as db:
             state,meta=self.read(db,sid);mgr=self.manager(sid,state)
+            if op in {'claim','reconcile_claim','inject','started','complete','unknown','abandon','interrupted','failed'}:
+                if not state or (state.route or {}).get('profile')!=req.get('profile'):
+                    return self.result(state,meta,stale=True,claimed=False,authorized=False)
+            if op=='reconcile_claim':
+                return self.reconcile_claim(db,sid,mgr,meta,req)
             if op=='recover':
-                recovery.boot(self,mgr,meta)
+                recovery.boot(self,mgr,meta,recovery_only=req.get('recovery_only') is True)
             elif op.startswith('recovery_'):
                 return recovery.operation(self,db,mgr,meta,req)
             elif op=='claim':
+                if (type(req.get('generation')) is not int or req['generation']!=meta['generation']
+                    or not isinstance(req.get('tick_id'),str) or not req['tick_id'] or len(req['tick_id'])>128
+                    or req['tick_id'] in meta.get('claim_fences',{})):
+                    return self.result(state,meta,claimed=False,stale=True)
                 if meta.get('tick') or recovery.unresolved(meta) or recovery.exhausted(state) or not mgr.is_due() or goal_blocks_loop_tick(sid):return self.result(state,meta,claimed=False)
                 prompt=mgr.fire_tick()
-                meta['tick']={'id':req['tick_id'],'generation':meta['generation'],'phase':'claimed'}
+                meta['tick']={'id':req['tick_id'],'generation':meta['generation'],'profile':req['profile'],'phase':'claimed'}
                 self.save(db,sid,mgr.state,meta)
                 return self.result(mgr.state,meta,claimed=True,prompt=prompt)
             elif op == 'inject':
-                authorized = self.matches(meta,req) and meta['generation']==req['generation'] and state and state.status=='active'
+                authorized = self.matches(meta,req) and meta['tick']['phase']=='claimed' and meta['generation']==req['generation'] and state and state.status=='active'
                 if authorized:
                     meta['tick']['phase']='injecting'
                     self.save(db,sid,state,meta)
@@ -120,13 +133,16 @@ class LoopStore:
                                       or meta['tick'].get('phase') not in {'claimed','injecting'}
                                       or meta['tick'].get('run_id')):
                     raise ValueError('abandon requires positive no-dispatch proof and no started run')
-                if op=='started':meta['tick']['phase']='started';meta['tick']['run_id']=req['run_id']
+                if op=='started':
+                    if meta['tick']['phase']!='injecting':return self.result(state,meta,stale=True)
+                    meta['tick']['phase']='started';meta['tick']['run_id']=req['run_id']
                 else:
                     if op=='complete' and meta['generation']==req['generation'] and snapshot!=(state.to_json() if state else None,json.dumps(meta,sort_keys=True)):
                         return self.result(state,meta,stale=True)
                     if meta['generation']==req['generation']:
                         if op=='complete':mgr=self.manager(sid,candidate)
-                        elif op=='abandon':mgr.abandon_tick();mgr.pause('injection-not-executed: manual resume required')
+                        elif op=='abandon':
+                            state.awaiting_response=False;mgr.pause('injection-not-executed: count retained; manual resume required')
                         elif op=='interrupted':mgr.pause('user-interrupted: count retained; manually resume when ready')
                         elif op=='failed':mgr.pause('execution-failed: count retained; inspect command/run error then manually resume')
                         else:mgr.pause('execution-unknown: count retained; inspect result then manually resume')
@@ -134,15 +150,65 @@ class LoopStore:
                     # old uncertain receipt for audit, never mutate the new loop.
                     elif op in {'unknown','interrupted','failed'}:
                         meta.setdefault('retired_ticks',[]).append({**meta['tick'],'outcome':op})
+                    self.fence(meta,meta['tick'],req['profile'],op)
                     meta['tick']=None
             else:raise ValueError('Unsupported loop operation')
             self.save(db,sid,mgr.state,meta)
             return self.result(mgr.state,meta,decision=decision if op=='complete' else None)
 
     @staticmethod
+    def fence(meta,tick,profile,outcome):
+        meta.setdefault('claim_fences',{})[tick['id']]={**tick,'profile':profile,'outcome':outcome}
+
+    def reconcile_claim(self,db,sid,mgr,meta,req):
+        state=mgr.state;tick=meta.get('tick');tid=req.get('tick_id');gen=req.get('generation')
+        if type(gen) is not int or not isinstance(tid,str) or not tid or len(tid)>128:
+            return self.result(state,meta,stale=True)
+        prior=meta.get('claim_fences',{}).get(tid)
+        if prior:
+            valid=prior['generation']==gen and prior['profile']==req['profile']
+            return self.result(state,meta,stale=not valid,claim_resolution=prior['outcome'] if valid else None)
+        if tick and tick['id']==tid:
+            if tick['generation']!=gen or tick.get('profile',req['profile'])!=req['profile']:
+                return self.result(state,meta,stale=True)
+            if tick['phase']!='claimed' or tick.get('run_id'):
+                # inject is durable BEFORE dispatch; missing run_id is not no-dispatch proof.
+                if tick['phase']!='unknown':
+                    tick['uncertain_phase']=tick['phase'];tick['phase']='unknown'
+                    tick['recovery_reason']='Dispatch may have occurred; retain count and block wakeups. Verify saved run/session evidence through bound recovery; never replay this tick.'
+                    if gen==meta['generation'] and state.status=='active':
+                        mgr.pause('dispatch-unknown: count retained; verify saved run evidence through bound recovery; never replay')
+                    self.save(db,sid,state,meta)
+                return self.result(state,meta,claim_resolution='unknown')
+            meta.setdefault('retired_ticks',[]).append({**tick,'outcome':'claim-only-retired'})
+            self.fence(meta,tick,req['profile'],'claim-only-retired')
+            meta['tick']=None
+            if gen==meta['generation']:
+                state.awaiting_response=False
+                if recovery.exhausted(state):
+                    mgr.pause('claim-only-retired: count retained; exhausted limit requires explicit new loop control')
+                elif state.status=='active':
+                    from hermes_cli.loops import self_paced_floor_seconds
+                    state.next_due_at=time.time()+max(1,state.current_delay or state.interval_seconds or self_paced_floor_seconds())
+            resolution='claim-only-retired'
+        elif gen==meta['generation'] and not tick:
+            # A delayed pre-commit claim must observe this tombstone under the same writer lock.
+            self.fence(meta,{'id':tid,'generation':gen},req['profile'],'not-committed-fenced')
+            if state.status=='active':
+                from hermes_cli.loops import self_paced_floor_seconds
+                state.next_due_at=time.time()+max(1,state.current_delay or state.interval_seconds or self_paced_floor_seconds())
+            resolution='not-committed-fenced'
+        elif gen<meta['generation']:
+            return self.result(state,meta,claim_resolution='generation-fenced')
+        else:return self.result(state,meta,stale=True)
+        self.save(db,sid,state,meta)
+        return self.result(state,meta,claim_resolution=resolution)
+
+    @staticmethod
     def matches(meta,req):
         tick=meta.get('tick')
-        return bool(tick and tick['id']==req.get('tick_id') and tick['generation']==req.get('generation')
+        return bool(tick and type(req.get('generation')) is int and tick['id']==req.get('tick_id') and tick['generation']==req.get('generation')
+                    and tick.get('profile',req.get('profile'))==req.get('profile')
                     and (not tick.get('run_id') or tick['run_id']==req.get('run_id')))
 
     @staticmethod

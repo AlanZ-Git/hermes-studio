@@ -52,6 +52,9 @@ export function resolveHermesInvocation(
   hermesBin = resolveHermesBin(),
   env: NodeJS.ProcessEnv = process.env,
 ): HermesInvocation {
+  if (env.HERMES_RUNTIME_SOURCE === 'explicit-binding' && env.HERMES_AGENT_CLI_PYTHON?.trim()) {
+    return { command: env.HERMES_AGENT_CLI_PYTHON.trim(), argsPrefix: ['-I', '-m', 'hermes_cli.main'] }
+  }
   if (process.platform === 'win32') {
     const python = bundledCliPythonForWindows(hermesBin, env)
     if (python) return { command: python, argsPrefix: ['-m', 'hermes_cli.main'] }

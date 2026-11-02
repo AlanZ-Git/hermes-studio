@@ -116,9 +116,9 @@ describe.skipIf(process.platform === 'win32')('Hermes Runtime selection', () => 
       HOME: userHome,
       HERMES_HOME: userCli.hermesHome,
       HERMES_BIN: managedCli,
-      HERMES_AGENT_BRIDGE_PYTHON: '/old/runtime/python',
-      HERMES_AGENT_CLI_PYTHON: '/old/runtime/python',
-      HERMES_AGENT_ROOT: '/old/runtime/root',
+      HERMES_AGENT_BRIDGE_PYTHON: undefined,
+      HERMES_AGENT_CLI_PYTHON: undefined,
+      HERMES_AGENT_ROOT: undefined,
       PATH: [join(managedCli, '..'), '/usr/bin', '/bin'].join(delimiter),
     }
 
@@ -138,6 +138,7 @@ describe.skipIf(process.platform === 'win32')('Hermes Runtime selection', () => 
     expect(env.HERMES_AGENT_ROOT).toBe(userCli.agentRoot)
     expect(env.VIRTUAL_ENV).toBe(join(userCli.agentRoot, 'venv'))
     expect(env.PATH?.split(delimiter)[0]).toBe(join(userHome, '.local', 'bin'))
+    expect(await configurePreferredHermesRuntime(env)).toEqual(selected)
   })
 
   it('uses the active managed Runtime when no user CLI exists', async () => {
@@ -177,8 +178,8 @@ describe.skipIf(process.platform === 'win32')('Hermes Runtime selection', () => 
       HOME: userHome,
       HERMES_HOME: join(userHome, '.hermes'),
       HERMES_BIN: managedCli,
-      HERMES_AGENT_BRIDGE_PYTHON: '/old/runtime/python',
-      HERMES_AGENT_CLI_PYTHON: '/old/runtime/python',
+      HERMES_AGENT_BRIDGE_PYTHON: undefined,
+      HERMES_AGENT_CLI_PYTHON: undefined,
       VIRTUAL_ENV: '/old/runtime',
       PATH: [join(managedCli, '..'), join(userCli, '..'), '/usr/bin', '/bin'].join(delimiter),
     }

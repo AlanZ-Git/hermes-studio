@@ -46,6 +46,8 @@ function readPackageVersion() {
 
 const VERSION = readPackageVersion()
 const MODEL_RUN_BINDING = parseModelRunBinding(process.env.HERMES_WEB_UI_MODEL_RUN_AUTH)
+const CURRENT_SESSION_LOOP = process.env.HERMES_WEB_UI_API_SCOPE === 'current-session-loop'
+const CURRENT_SESSION_LOOP_DESCRIPTION = 'Current-session loop control only. Read ekko_studio_api_openapi_get for the bound session/profile and POST /api/studio/chat-run/runs with input, session_id, profile, and a unique request_id. Only /loop commands are allowed; this does not start or finish a model turn.'
 if (!MODEL_RUN_BINDING && process.env.HERMES_WEB_UI_REQUIRE_MODEL_RUN_AUTH === '1') {
   throw new Error('Managed MCP requires model run binding')
 }
@@ -75,7 +77,8 @@ When run without options, this process waits for MCP JSON-RPC messages on stdin.
 
 const positionalArgs = process.argv.slice(2).filter(arg => !arg.startsWith('-'))
 const requestedToolset = String(positionalArgs[0] || process.env.HERMES_MCP_TOOLSET || 'api').trim().toLowerCase()
-const ACTIVE_TOOLSET = TOOLSETS.has(requestedToolset) ? requestedToolset : 'api'
+if (!TOOLSETS.has(requestedToolset)) throw new Error(`Unknown MCP toolset: ${requestedToolset}`)
+const ACTIVE_TOOLSET = requestedToolset
 const SHARED_TASK_PLAN_ENABLED = process.env.HERMES_MCP_NATIVE_TASK_PLAN !== '1'
 const USER_CLARIFICATION_ENABLED = SHARED_TASK_PLAN_ENABLED && process.env.HERMES_MCP_USER_CLARIFICATION === '1'
 
@@ -159,7 +162,7 @@ function defaultProfile() {
     process.env.HERMES_WEB_UI_PROFILE ||
     process.env.HERMES_PROFILE ||
     process.env.PROFILE ||
-    '',
+    (ACTIVE_TOOLSET === 'plan' ? 'default' : ''),
   ).trim()
 }
 
@@ -249,21 +252,52 @@ async function fetchMobileConsent(url, options) {
 }
 
 function enforceCurrentSessionLoop(path, options = {}, document = false) {
-  if (process.env.HERMES_WEB_UI_API_SCOPE !== 'current-session-loop') return
+  if (!CURRENT_SESSION_LOOP) return
   const session = process.env.HERMES_STUDIO_SESSION_ID
   const profile = options.profile === undefined ? defaultProfile() : options.profile
   const method = options.method || 'GET'
   const reject = () => { throw new Error('Current-session loop API scope rejected') }
   if (!MODEL_RUN_BINDING || !session || profile !== MODEL_RUN_BINDING.profile || defaultProfile() !== MODEL_RUN_BINDING.profile) reject()
   if (options.token !== undefined || options.query && Object.keys(options.query).length || options.headers && Object.keys(options.headers).length) reject()
+  readBoundModelRunToken(MODEL_RUN_BINDING, profile)
   if (path === '/api/openapi.json' && method === 'GET' && options.body === undefined && document) return
   if (path !== '/api/studio/chat-run/runs' || method !== 'POST' || !isRecord(options.body)) reject()
   const body = options.body
-  if (Object.keys(body).some(key => !['session_id', 'profile', 'input', 'timeout_ms', 'include_events'].includes(key))
+  if (Object.keys(body).some(key => !['session_id', 'profile', 'input', 'request_id', 'timeout_ms', 'include_events'].includes(key))
     || body.session_id !== session || body.profile !== MODEL_RUN_BINDING.profile
+    || typeof body.request_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body.request_id)
     || typeof body.input !== 'string' || !/^\/loop(?:\s|$)/.test(body.input) || body.input.includes('\0')
     || body.timeout_ms !== undefined && (!Number.isSafeInteger(body.timeout_ms) || body.timeout_ms < 1 || body.timeout_ms > 1800000)
     || body.include_events !== undefined && typeof body.include_events !== 'boolean') reject()
+}
+
+function preflightManagementCredential(path, options = {}) {
+  const target = new URL(path, baseUrl())
+  const method = options.method || 'GET'
+  if (method === 'GET' && path === '/api/openapi.json') return ''
+  const profile = options.profile || defaultProfile()
+  const contextId = path === '/api/studio/task-plans/update' ? String(options.body?.context_id || '') : undefined
+  const runCredential = readRunCredential(profile, contextId)
+  const token = runCredential?.token || readToken(options.token, options.allowTokenFile !== false, profile)
+  // Immutable bound/run credentials retain their server-side lifecycle checks.
+  // This diagnostic restores the legacy management-JWT early rejection only;
+  // it cannot verify signatures and never grants authority or changes source.
+  if (MODEL_RUN_BINDING || runCredential
+    || ['/api/studio/media/apikey-image-generate', '/api/studio/media/grok-image-to-video', '/api/studio/media/minimax-image-to-video'].includes(target.pathname)
+    || target.pathname.startsWith('/api/studio/voice/proxy/')) return token
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3 || parts.some(part => !/^[A-Za-z0-9_-]+$/.test(part))) throw new Error()
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'))
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
+    if (header.alg !== 'HS256' || !['access', 'app_access'].includes(claims.type)
+      || claims.aud !== 'hermes-studio' || !claims.sub || !claims.username || !claims.role
+      || !Number.isFinite(claims.exp) || claims.exp <= Date.now() / 1000
+      || claims.nbf !== undefined && (!Number.isFinite(claims.nbf) || claims.nbf > Date.now() / 1000)) throw new Error()
+  } catch {
+    throw new Error('Management JWT credential is missing, malformed or expired. Start a new authorized Studio run; no credential fallback was attempted.')
+  }
+  return token
 }
 
 async function requestEnvelope(path, options = {}) {
@@ -281,7 +315,7 @@ async function requestEnvelope(path, options = {}) {
   // rejected source never falls through to shared profile/static credentials.
   if (MODEL_RUN_BINDING && !publicDocument) readBoundModelRunToken(MODEL_RUN_BINDING, profile)
   const runCredential = publicDocument ? null : readRunCredential(profile, contextId)
-  const token = publicDocument ? '' : runCredential?.token || readToken(options.token, options.allowTokenFile !== false, profile)
+  const token = publicDocument ? '' : preflightManagementCredential(path, options)
   const method = options.method || 'GET'
   if (MODEL_RUN_BINDING?.run_marker.startsWith('recovery_v1_')) {
     const target = new URL(path, baseUrl())
@@ -347,7 +381,39 @@ function isRecord(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
+function currentSessionLoopDocument() {
+  return {
+    scope: 'current-session-loop',
+    description: CURRENT_SESSION_LOOP_DESCRIPTION,
+    session_id: process.env.HERMES_STUDIO_SESSION_ID,
+    profile: MODEL_RUN_BINDING.profile,
+    paths: {
+      '/api/studio/chat-run/runs': {
+        post: {
+          requestBody: { required: true, content: { 'application/json': { schema: {
+            type: 'object', additionalProperties: false,
+            required: ['input', 'session_id', 'profile', 'request_id'],
+            properties: {
+              input: { type: 'string', pattern: '^/loop(?:\\s|$)', examples: ['/loop status', '/loop 1h synthetic --times 12'] },
+              session_id: { const: process.env.HERMES_STUDIO_SESSION_ID },
+              profile: { const: MODEL_RUN_BINDING.profile },
+              request_id: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$', description: 'A unique identifier for this control request, echoed in its receipt.' },
+              timeout_ms: { type: 'integer', minimum: 1, maximum: 1800000 },
+              include_events: { type: 'boolean' },
+            },
+          } } } },
+          responses: { 200: { description: 'Matching nonterminal loop command receipt; not completion of the executing model turn.' } },
+        },
+      },
+    },
+  }
+}
+
 async function openApiDocument(options = {}) {
+  if (CURRENT_SESSION_LOOP) {
+    enforceCurrentSessionLoop('/api/openapi.json', options, true)
+    return currentSessionLoopDocument()
+  }
   if (cachedOpenApiDocument) return cachedOpenApiDocument
   cachedOpenApiDocument = await request('/api/openapi.json', options)
   return cachedOpenApiDocument
@@ -1210,7 +1276,7 @@ const tools = [
   {
     name: 'ekko_studio_api_openapi_get',
     toolset: 'api',
-    description: 'Return Ekko Studio API documentation as compact JSON. When the user asks to read/check the operation manual, API docs, endpoint docs, 接口文档, 接口手册, or 操作手册, call this tool without filters first to get the outline/module index. Without filters, returns only module purpose, keywords, and operation counts because the full API catalog is large. For endpoint details, call again with tag, path, or method filters, then use ekko_studio_api_request.',
+    description: CURRENT_SESSION_LOOP ? CURRENT_SESSION_LOOP_DESCRIPTION : 'Return Ekko Studio API documentation as compact JSON. When the user asks to read/check the operation manual, API docs, endpoint docs, 接口文档, 接口手册, or 操作手册, call this tool without filters first to get the outline/module index. Without filters, returns only module purpose, keywords, and operation counts because the full API catalog is large. For endpoint details, call again with tag, path, or method filters, then use ekko_studio_api_request.',
     inputSchema: inputSchema({
         path: {
           type: 'string',
@@ -1234,7 +1300,7 @@ const tools = [
   {
     name: 'ekko_studio_api_request',
     toolset: 'api',
-    description: 'Execute a Ekko Studio operation by calling an endpoint path. Use ekko_studio_api_openapi_get first as the operation manual to inspect method, parameters, requestBody, and responses. Do not use /api/studio/chat-run/* or /api/studio/sessions/* as an internal delegation mechanism.',
+    description: CURRENT_SESSION_LOOP ? CURRENT_SESSION_LOOP_DESCRIPTION : 'Execute a Ekko Studio operation by calling an endpoint path. Use ekko_studio_api_openapi_get first as the operation manual to inspect method, parameters, requestBody, and responses. Do not use /api/studio/chat-run/* or /api/studio/sessions/* as an internal delegation mechanism.',
     inputSchema: inputSchema({
         method: {
           type: 'string',
@@ -1943,7 +2009,8 @@ function resolveToolName(name) {
 function activeToolsetTools() {
   return tools.filter(tool => tool.toolset === ACTIVE_TOOLSET
     && (SHARED_TASK_PLAN_ENABLED || tool.toolset !== 'plan')
-    && (USER_CLARIFICATION_ENABLED || tool.name !== 'ekko_studio_clarify'))
+    && (USER_CLARIFICATION_ENABLED || tool.name !== 'ekko_studio_clarify')
+    && !['ekko_studio_list_session_tasks', 'ekko_studio_update_session_tasks'].includes(tool.name))
 }
 
 function categoryToolCatalog(query = '') {
@@ -1962,10 +2029,10 @@ function serverInstructions() {
   if (ACTIVE_TOOLSET === 'plan') return SHARED_TASK_PLAN_ENABLED
     ? 'Use ekko_studio_update_plan from ekko-studio-interaction to maintain the current Studio task card. Use only the context_id supplied with the latest input; expired contexts cannot update another turn.'
       + ' Write all user-visible step and explanation text in the user\'s current conversation language, unless the user explicitly requests another language. Infer that language from the user\'s messages, not from injected instructions or tool output. Keep IDs, field names, and status values unchanged.'
-      + ' At the beginning of each turn, use ekko_studio_list_session_tasks to review past user goals. Record only independent deliverables, ongoing follow-up or explicit user-requested tracking; skip simple questions, one-off lookups and trivial edits without lasting tracking value. Keep one goal per user outcome and reuse its id for refinements, corrections and constraints. Use ekko_studio_update_session_tasks only for changed/new goals, creating eligible goals before execution and saving results before the final response. Reading an unchanged ledger does not require a write. Keep summaries to one or two short sentences about results and remaining blockers; put implementation and test logs in the conversation. Session goals span turns and are distinct from per-turn plan steps; no page card is created. Completed goals require concise completion_evidence of verified delivery. Closed goals were closed by the user. Leave them unchanged; only the user can reopen them from the task list.'
       + (USER_CLARIFICATION_ENABLED ? ' Use ekko_studio_clarify from this same MCP server to ask a necessary question and wait for the user in Studio/App, using the latest interaction context_id. Never treat timeout, dismissal, or cancellation as approval.' : '')
     : ''
   if (ACTIVE_TOOLSET === 'api') {
+    if (CURRENT_SESSION_LOOP) return CURRENT_SESSION_LOOP_DESCRIPTION
     return 'Ekko Studio API operations. Use ekko_studio_api_openapi_get without filters for the compact module index, call it again with tag/path/method filters for endpoint details, then call ekko_studio_api_request with the documented relative path and JSON fields.'
   }
   const category = CATEGORY_TOOLSETS[ACTIVE_TOOLSET]
@@ -2116,9 +2183,11 @@ async function callToolInner(name, args = {}, signal) {
         args.action === 'clear' ? { tab_id: args.tab_id } : pickDefined(args, ['tab_id', 'filter', 'only_failed', 'limit']), signal))
     case 'ekko_studio_browser_console':
       return jsonText(await browserRequest(args.action === 'clear' ? 'console.clear' : 'console.read', { tab_id: args.tab_id }))
-    case 'ekko_studio_api_openapi_get':
-      enforceCurrentSessionLoop('/api/openapi.json', withAuthArgs(args), true)
-      return jsonText(compactOpenApiDocument(await openApiDocument(withAuthArgs(args)), args))
+    case 'ekko_studio_api_openapi_get': {
+      enforceCurrentSessionLoop('/api/openapi.json', { ...args, method: 'GET' }, true)
+      const document = await openApiDocument(withAuthArgs(args))
+      return jsonText(CURRENT_SESSION_LOOP ? document : compactOpenApiDocument(document, args))
+    }
     case 'ekko_studio_api_request': {
       const method = normalizeApiMethod(args.method)
       const path = normalizeApiPath(args.path)
@@ -2126,7 +2195,8 @@ async function callToolInner(name, args = {}, signal) {
       if (!path) return errorText('Invalid path. Use a relative /api/... or /health path from ekko_studio_api_openapi_get; full URLs are not allowed.')
       if (process.env.HERMES_WEB_UI_API_SCOPE === 'current-session-loop'
         && Object.keys(args).some(key => !['method', 'path', 'profile', 'body', 'query', 'headers'].includes(key))) throw new Error('Current-session loop API fields rejected')
-      enforceCurrentSessionLoop(path, { ...args, method }, true)
+      enforceCurrentSessionLoop(path, { ...args, method })
+      preflightManagementCredential(path, withAuthArgs(args, { method, body: args.body }))
       const validationError = await validateApiRequest(method, path, args)
       if (validationError) return errorText(`Invalid API request for ${method} ${pathWithoutQuery(path)}: ${validationError}. Use ekko_studio_api_openapi_get to inspect required parameters and requestBody.`)
       const options = withAuthArgs(args, {

@@ -1,4 +1,4 @@
-import { pendingKanbanNotifications, receiveKanbanNotification } from '../repositories/kanban-notification-store'
+import { diagnosePendingKanbanNotification, pendingKanbanNotifications, receiveKanbanNotification } from '../repositories/kanban-notification-store'
 import { personSessionIds } from '../repositories/person-session-store'
 import type { PersonResultDelivery } from '../public/person-runtime'
 import { personUser } from '../services/person/catalog'
@@ -74,7 +74,7 @@ import {
   respondToChatEkkoClarification as respondToEkkoClarification,
   respondToChatEkkoToolApproval as respondToEkkoToolApproval,
 } from '../public/chat-agent-runtime'
-import { handleBridgeRun, resumeBridgeRun } from '../services/chat-run/handle-bridge-run'
+import { handleBridgeRun, resumeBridgeRun, type BridgeRunPreparation } from '../services/chat-run/handle-bridge-run'
 import { readModelRunSource } from '../services/chat-run/model-run-source'
 import { handleCodingAgentRun } from '../services/chat-run/handle-coding-agent-run'
 import { handleEkkoAgentRun, type EkkoAgentRunSocketData } from '../services/chat-run/handle-ekko-agent-run'
@@ -456,7 +456,7 @@ export class ChatRunSocket {
   /** sessionId → session state (messages, working status, events, run tracking) */
   private sessionMap = new Map<string, SessionState>()
   private readonly runAdmissions = new Map<string, Promise<void>>()
-  private readonly ekkoExecutions = new Map<string, symbol>()
+  private readonly runExecutions = new Map<string, symbol>()
   private hermesQueueInsertionOperations = new Map<string, Promise<void>>()
   private readonly taskPlanRuns = new TaskPlanRuns(saveTaskPlan, (sessionId, snapshot) => {
     this.emitExternalEvent(sessionId, 'plan.updated', { event: 'plan.updated', ...snapshot })
@@ -1027,6 +1027,7 @@ export class ChatRunSocket {
       display_role?: 'user' | 'command'
       storage_message?: string
       session_id?: string
+      request_id?: string
       model?: string
       instructions?: string
       group_system_prompt?: string
@@ -1091,6 +1092,14 @@ export class ChatRunSocket {
             await recordSessionUploadAttachments(data.session_id, runProfile, data.input, { allowPendingSession: true })
           }
         } catch (err) {
+          if (typeof data.input === 'string' && /^\/loop(?:\s|$)/.test(data.input) && data.request_id) {
+            socket.emit('session.command', {
+              event: 'session.command', session_id: data.session_id, profile: data.profile,
+              request_id: data.request_id, command: 'loop', action: 'loop', control: true, terminal: false,
+              ok: false, message: err instanceof Error ? err.message : String(err),
+            })
+            return
+          }
           const payload = {
             event: 'run.failed',
             session_id: data.session_id,
@@ -1130,6 +1139,7 @@ export class ChatRunSocket {
                 model_groups: data.model_groups,
                 instructions: data.instructions,
                 queueId: data.queue_id,
+                requestId: data.request_id,
                 runQueuedItem: this.runQueuedItem.bind(this),
               })
               if (handled !== false) return
@@ -1376,8 +1386,9 @@ export class ChatRunSocket {
       }
     })
 
-    socket.on('approval.respond', async (data: { session_id?: string; approval_id?: string; choice?: string }) => {
+    socket.on('approval.respond', async (data: { session_id?: string; approval_id?: string; choice?: string; run_id?: string; request_id?: string; response_id?: string }) => {
       if (!data.session_id || !data.approval_id) return
+      const responseBinding = { run_id: data.run_id, request_id: data.request_id, response_id: data.response_id }
       try {
         if (data.session_id.startsWith('person-task-')) {
           requireSocketSessionReadAccess(data.session_id)
@@ -1389,6 +1400,7 @@ export class ChatRunSocket {
       } catch (err) {
         socket.emit('approval.resolved', {
           event: 'approval.resolved',
+          ...responseBinding,
           session_id: data.session_id,
           approval_id: data.approval_id,
           choice: data.choice || 'deny',
@@ -1402,7 +1414,7 @@ export class ChatRunSocket {
           await answerPersonChatInteraction(socketUser!.id, data.approval_id, data.choice || '', true, data.session_id!)
           this.syncPersonInteraction(socketUser!.id)
         } catch (error) {
-          socket.emit('approval.resolved', { event: 'approval.resolved', session_id: data.session_id, approval_id: data.approval_id, resolved: false, error: String(error) })
+          socket.emit('approval.resolved', { event: 'approval.resolved', ...responseBinding, session_id: data.session_id, approval_id: data.approval_id, resolved: false, error: String(error) })
         }
         return
       }
@@ -1415,6 +1427,7 @@ export class ChatRunSocket {
         if (!ekkoResult.resolved) {
           this.emitToSession(socket, data.session_id, 'approval.resolved', {
             event: 'approval.resolved',
+            ...responseBinding,
             approval_id: data.approval_id,
             choice: ekkoResult.choice,
             resolved: false,
@@ -1431,6 +1444,7 @@ export class ChatRunSocket {
       if (codingAgentResult.handled) {
         this.emitToSession(socket, data.session_id, 'approval.resolved', {
           event: 'approval.resolved',
+          ...responseBinding,
           approval_id: data.approval_id,
           choice: data.choice || 'deny',
           resolved: codingAgentResult.resolved,
@@ -1440,13 +1454,14 @@ export class ChatRunSocket {
       }
       try {
         if (shared && !buildResumeEvents(this.sessionMap.get(data.session_id)?.events || []).some(entry => entry.event === 'approval.requested' && entry.data?.approval_id === data.approval_id)) throw new Error('Approval does not belong to this session')
-        const result = await this.respondToBridgeApproval(data.session_id, currentProfile(), data.approval_id, data.choice || 'deny')
+        if (data.request_id && !this.sessionMap.get(data.session_id)?.events.some(entry => entry.event === 'approval.requested' && entry.data?.approval_id === data.approval_id && entry.data?.request_id === data.request_id && entry.data?.run_id === data.run_id)) throw new Error('Approval request binding is unavailable')
+        const result = await this.respondToBridgeApproval(data.session_id, currentProfile(), data.approval_id, data.choice || 'deny', data.run_id)
         const resolved = Boolean(result.resolved)
         if (!resolved) {
           // Failure belongs to this attempt, not to the lifetime of the request.
           // Only the authoritative bridge terminal may dismiss it for all clients.
           socket.emit('approval.resolved', {
-            event: 'approval.resolved', session_id: data.session_id,
+            event: 'approval.resolved', ...responseBinding, session_id: data.session_id,
             approval_id: data.approval_id, choice: data.choice || 'deny',
             resolved: false, terminal: false, outcome: result.outcome,
             error: 'Approval response could not be applied.',
@@ -1455,6 +1470,7 @@ export class ChatRunSocket {
         }
         this.emitToSession(socket, data.session_id, 'approval.resolved', {
           event: 'approval.resolved',
+          ...responseBinding,
           approval_id: data.approval_id,
           choice: data.choice || 'deny',
           resolved,
@@ -1462,6 +1478,7 @@ export class ChatRunSocket {
       } catch (err) {
         socket.emit('approval.resolved', {
           event: 'approval.resolved',
+          ...responseBinding,
           session_id: data.session_id,
           approval_id: data.approval_id,
           choice: data.choice || 'deny',
@@ -1745,19 +1762,29 @@ export class ChatRunSocket {
     const [socket, data, profile, , , pushTargetId] = args
     const sessionId = data.session_id
     if (!sessionId) return this.handleRun(...args)
-    if (!isPersonSession(sessionId) && !isEkkoAgentExecution(data)) {
-      this.ekkoExecutions.delete(sessionId)
-      return this.handleRun(...args)
-    }
     const state = getOrCreateSession(this.sessionMap, sessionId)
+    const ordinaryHermes = !isPersonSession(sessionId) && !isEkkoAgentExecution(data)
+    if (ordinaryHermes && isProviderAgentExecution(resolveRunSource(data.source, sessionId), data)) return this.handleRun(...args)
     const execution = Symbol()
-    this.ekkoExecutions.set(sessionId, execution)
+    this.runExecutions.set(sessionId, execution)
+    let ownedMarker = state.activeRunMarker
+    const preparation: BridgeRunPreparation = {
+      isCurrent: () => this.runExecutions.get(sessionId) === execution
+        && this.sessionMap.get(sessionId) === state && state.activeRunMarker === ownedMarker,
+      onMarker: marker => { ownedMarker = marker },
+    }
     try {
-      await this.handleRun(...args)
+      await this.handleRun(socket, data, profile, args[3], args[4], pushTargetId, ordinaryHermes ? preparation : undefined)
     } catch (err) {
       // Setup can fail before the runtime's own try/finally, even after it
       // installs a controller. Never release a replacement turn's reservation.
-      if (this.ekkoExecutions.get(sessionId) !== execution || this.sessionMap.get(sessionId) !== state) return
+      if (this.runExecutions.get(sessionId) !== execution || this.sessionMap.get(sessionId) !== state) return
+      if (ordinaryHermes && (!preparation.isCurrent() || state.runId)) return
+      if (data.background_notification_kind === 'kanban' && data.background_delegation_id) {
+        diagnosePendingKanbanNotification(data.background_delegation_id, sessionId, String(err))
+      }
+      state.runStartedAt = undefined
+      state.bridgeRunPollMarker = undefined
       state.abortController?.abort()
       state.abortController = undefined
       state.runId = undefined
@@ -1771,10 +1798,11 @@ export class ChatRunSocket {
       const payload = {
         event: 'run.failed', session_id: sessionId, queue_id: data.queue_id,
         error: err instanceof Error ? err.message : String(err), queue_remaining: state.queue.length,
+        ...(data.background_delegation_id ? { delegation_id: data.background_delegation_id, autonomous: data.autonomous === true } : {}),
       }
       observeChatRunWebhookEvent({
         pushTargetId, event: 'run.failed', sessionId, profile,
-        source: resolveRunSource(data.source, sessionId), agent: 'ekko', payload,
+        source: resolveRunSource(data.source, sessionId), agent: ordinaryHermes ? 'bridge' : 'ekko', payload,
         roomId: data.group_room_id, workflowId: data.workflow_id, workflowNodeId: data.workflow_node_id,
       })
       data.onEvent?.('run.failed', payload)
@@ -1787,7 +1815,7 @@ export class ChatRunSocket {
       if (!this.nsp.adapter.rooms.get(`session:${sessionId}`)?.has(socket.id)) socket.emit('run.failed', payload)
       this.dequeueNextQueuedRun(socket, sessionId, profile)
     } finally {
-      if (this.ekkoExecutions.get(sessionId) === execution) this.ekkoExecutions.delete(sessionId)
+      if (this.runExecutions.get(sessionId) === execution) this.runExecutions.delete(sessionId)
     }
   }
 
@@ -1847,6 +1875,7 @@ export class ChatRunSocket {
     skipUserMessage = false,
     backgroundContinuationContext?: BackgroundContinuationContext,
     pushTargetId?: string,
+    preparation?: BridgeRunPreparation,
   ) {
     if (isPersonSession(data.session_id)) {
       const userId = socket.data?.user?.id
@@ -2005,6 +2034,7 @@ export class ChatRunSocket {
           loadSessionStateFromDb,
           this.dequeueNextQueuedRun.bind(this),
           backgroundContinuationContext,
+          preparation,
         )
       } catch (err) {
         if (data.session_id) this.finishTaskPlanRun(data.session_id, 'run.failed', undefined, planContext)
@@ -2294,7 +2324,8 @@ export class ChatRunSocket {
     }
     if (notification.notification_kind === 'kanban') {
       try {
-        const wake = ['notify+wake', 'wake'].includes(notification.delivery_mode)
+        const wake = ['notify+wake', 'wake'].includes(notification.delivery_mode || '')
+          && (notification.studio_auto_continue !== 'v1' || notification.wake_eligible === true)
           && !notification.execution_stopped
         const { receipt, message } = receiveKanbanNotification(notification, wake)
         if (!state.messages.some(item => item.id === message.id)) state.messages.push(message)
@@ -3018,6 +3049,7 @@ export class ChatRunSocket {
     const runProfile = backgroundContinuationContext?.runtime === 'hermes'
       ? backgroundContinuationContext.profile
       : next.profile || fallbackProfile
+    const currentSession = next.backgroundNotificationKind === 'kanban' ? getSession(sessionId) : undefined
     let deliverySettled = false
     const execution = this.executeRun(socket, {
       onEvent: next.personStageDelivery ? (event:string,payload:any) => {
@@ -3036,8 +3068,8 @@ export class ChatRunSocket {
       display_role: next.displayRole,
       storage_message: next.storageMessage,
       session_id: sessionId,
-      model: next.model,
-      provider: next.provider,
+      model: currentSession ? currentSession.model || undefined : next.model,
+      provider: currentSession ? currentSession.provider || undefined : next.provider,
       model_groups: next.model_groups,
       instructions: next.instructions,
       group_system_prompt: next.groupSystemPrompt,

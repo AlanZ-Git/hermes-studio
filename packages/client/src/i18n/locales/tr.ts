@@ -597,6 +597,7 @@ export default {
   },
 
   chat: {
+    compressionFailed: 'Bağlam sıkıştırma başarısız oldu',
     selectMessages: "Mesajları seç",
     messagesSelected: "{count} seçildi",
     deleteSelectedMessages: "Seçilenleri sil",
@@ -611,6 +612,10 @@ export default {
     messagesDeleted: "{count} öğe silindi",
     approvalAgree: 'Onayla',
     reasoningEffort: {
+      inherited: 'Varsayılan ({effort})',
+      providerDefault: 'sağlayıcı varsayılanı',
+      unknown: 'bilinmiyor',
+      unsupported: 'bu model tarafından desteklenmiyor',
       tooltip: 'Akıl yürütme çabası',
       dragHint: 'Seçmek için sürükleyin · {count} düzey',
       defaultLabel: 'Varsayılan',

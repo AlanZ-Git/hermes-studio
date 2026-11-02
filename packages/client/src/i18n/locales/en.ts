@@ -1127,6 +1127,7 @@ export default {
 
   // Chat
   chat: {
+    compressionFailed: 'Context compression failed',
     selectMessages: "Select messages",
     messagesSelected: "{count} selected",
     deleteSelectedMessages: "Delete selected",
@@ -1289,6 +1290,10 @@ export default {
     },
     attachFiles: 'Attach files',
     reasoningEffort: {
+      inherited: 'Default ({effort})',
+      providerDefault: 'provider default',
+      unknown: 'unknown',
+      unsupported: 'unsupported by this model',
       tooltip: 'Reasoning effort',
       dragHint: 'Drag to choose · {count} levels',
       defaultLabel: 'Default',

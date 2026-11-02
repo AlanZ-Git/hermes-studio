@@ -435,6 +435,8 @@ export function formatMessageWithReference(reference: MessageReference, content:
 export interface PendingApproval {
   sessionId: string
   approvalId: string
+  runId?: string
+  requestId?: string
   command: string
   description: string
   choices: Array<'once' | 'session' | 'always' | 'deny'>
@@ -442,6 +444,10 @@ export interface PendingApproval {
   isMemoryWrite: boolean
   requestedAt: number
   countdownDeadline: number
+}
+
+export function pendingApprovalKey(pending: Pick<PendingApproval, 'sessionId' | 'approvalId' | 'runId' | 'requestId'>): string {
+  return JSON.stringify([pending.sessionId, pending.approvalId, pending.runId || '', pending.requestId || ''])
 }
 
 export interface PendingClarify {
@@ -1379,7 +1385,10 @@ function createChatState(scopedSessionId?: string) {
     streamStates.value.clear()
     serverWorking.value.clear()
     announcedPersonRuns.clear()
-    pendingApprovals.value = new Map([...pendingApprovals.value].filter(([id]) => !id.startsWith('person-main-')))
+    pendingApprovals.value = new Map([...pendingApprovals.value].filter(([, pending]) => !pending.sessionId.startsWith('person-main-')))
+    for (const key of pendingApprovalResponseIds.keys()) {
+      if (!pendingApprovals.value.has(key)) pendingApprovalResponseIds.delete(key)
+    }
     pendingClarifies.value = new Map([...pendingClarifies.value].filter(([id]) => !id.startsWith('person-main-')))
   })
 
@@ -1484,7 +1493,7 @@ function createChatState(scopedSessionId?: string) {
   const pendingApprovalResponseIds = new Map<string, string>()
   const activePendingApproval = computed(() => {
     const sid = activeSessionId.value
-    return sid ? pendingApprovals.value.get(sid) || null : null
+    return sid ? [...pendingApprovals.value.values()].find(pending => pending.sessionId === sid) || null : null
   })
 
   const pendingClarifies = ref<Map<string, PendingClarify>>(new Map())
@@ -1591,9 +1600,11 @@ function createChatState(scopedSessionId?: string) {
     queuedUserMessages.value = new Map()
     pendingUserMessageIds.clear()
     queueInsertionStates.value = new Map()
-    pendingApprovals.value = new Map([...pendingApprovals.value].filter(([id]) => id.startsWith('person-main-')))
+    pendingApprovals.value = new Map([...pendingApprovals.value].filter(([, pending]) => pending.sessionId.startsWith('person-main-')))
     pendingClarifies.value = new Map([...pendingClarifies.value].filter(([id]) => id.startsWith('person-main-')))
-    pendingApprovalResponseIds.clear()
+    for (const key of pendingApprovalResponseIds.keys()) {
+      if (!pendingApprovals.value.has(key)) pendingApprovalResponseIds.delete(key)
+    }
     pendingClarifyResponseIds.clear()
     streamStates.value = new Map()
     serverWorking.value = new Set()
@@ -1618,6 +1629,12 @@ function createChatState(scopedSessionId?: string) {
     if (state) next.set(sessionId, state)
     else next.delete(sessionId)
     compressionStates.value = next
+    if (state && !state.compressing && !state.error) {
+      const completed = compressionStates.value.get(sessionId)
+      setTimeout(() => {
+        if (compressionStates.value.get(sessionId) === completed) setCompressionState(sessionId, null)
+      }, 5000)
+    }
   }
 
   // Abort state is scoped per session because background sockets remain active
@@ -2219,7 +2236,7 @@ function createChatState(scopedSessionId?: string) {
           } else if (!data.isWorking) {
             setAbortState(sessionId, null)
           }
-          if (!data.isWorking) setCompressionState(sessionId, null)
+          if (!data.isWorking && !compressionStates.value.get(sessionId)?.error) setCompressionState(sessionId, null)
           applySessionTokenUsage(target, data)
           applyResumedSessionSettings(data)
           if (typeof data.workspace === 'string') {
@@ -3462,7 +3479,9 @@ function createChatState(scopedSessionId?: string) {
     const sid = evt.session_id
     const approvalId = (evt as any).approval_id as string | undefined
     if (!sid || !approvalId) return
-    if (pendingApprovalResponseIds.get(sid) !== approvalId) pendingApprovalResponseIds.delete(sid)
+    const binding = { sessionId: sid, approvalId, runId: evt.run_id as string | undefined, requestId: (evt as any).request_id as string | undefined }
+    const key = pendingApprovalKey(binding)
+    const existing = pendingApprovals.value.get(key)
     const description = String((evt as any).description || '')
     const normalizedDescription = description.trim().toLowerCase().replace(/\s+/g, ' ')
     const isMemoryWrite = !Boolean((evt as any).allow_permanent) && (
@@ -3474,52 +3493,40 @@ function createChatState(scopedSessionId?: string) {
     const choices = rawChoices
       .filter((choice: unknown): choice is PendingApproval['choices'][number] =>
         choice === 'once' || choice === 'session' || choice === 'always' || choice === 'deny')
-    pendingApprovals.value.set(sid, {
-      sessionId: sid,
-      approvalId,
+    const remaining = (evt as any).remaining_timeout_ms
+    const deadlineMs = (evt as any).deadline_ms
+    const countdownDeadline = (evt as any).durable === true ? Infinity : pendingInteractionDeadline(
+      typeof deadlineMs === 'number' ? Math.min(remaining ?? Infinity, Math.max(0, deadlineMs - Date.now())) : remaining,
+      (evt as any).timeout_ms,
+    )
+    pendingApprovals.value.set(key, {
+      ...binding,
       command: String((evt as any).command || ''),
       description,
       choices: isMemoryWrite ? ['once', 'deny'] : choices.length ? choices : ['once', 'session', 'deny'],
       allowPermanent: Boolean((evt as any).allow_permanent),
       isMemoryWrite,
-      requestedAt: Date.now(),
-      countdownDeadline: (evt as any).durable === true ? Infinity : pendingInteractionDeadline(
-        (evt as any).remaining_timeout_ms,
-        (evt as any).timeout_ms,
-      ),
+      requestedAt: existing?.requestedAt ?? Date.now(),
+      countdownDeadline: Math.min(existing?.countdownDeadline ?? Infinity, countdownDeadline),
     })
     pendingApprovals.value = new Map(pendingApprovals.value)
   }
 
   function clearPendingApproval(evt: RunEvent) {
     const sid = evt.session_id
-    if (!sid) return
-    const approvalId = String((evt as any).approval_id || '')
-    const attempted = Boolean(approvalId && pendingApprovalResponseIds.get(sid) === approvalId)
-    if (attempted) pendingApprovalResponseIds.delete(sid)
-    const current = pendingApprovals.value.get(sid)
-    if (!current) {
-      if (attempted && (evt as any).resolved === false && ((evt as any).stale === true || isPendingInteractionExpiredError((evt as any).error || (evt as any).reason))) {
-        notifyPendingInteractionExpired()
-      }
-      return
-    }
-    if (approvalId && current.approvalId !== approvalId) return
-    if ((evt as any).resolved === false) {
-      // A withdrawn/expired request is terminal without being an accepted decision.
-      // A rejected response attempt must not dismiss the still-live request.
-      if ((evt as any).terminal === true) {
-        dismissPendingApprovalFor(sid, current.approvalId)
-        return
-      }
-      if ((evt as any).terminal === false) return
-      if ((evt as any).stale === true || isPendingInteractionExpiredError((evt as any).error || (evt as any).reason)) {
-        dismissPendingApprovalFor(sid, current.approvalId)
-        if (attempted) notifyPendingInteractionExpired()
-      }
-      return
-    }
-    pendingApprovals.value.delete(sid)
+    const approvalId = (evt as any).approval_id
+    if (!sid || !approvalId) return
+    const key = pendingApprovalKey({ sessionId: sid, approvalId, runId: evt.run_id as string | undefined, requestId: (evt as any).request_id })
+    const current = pendingApprovals.value.get(key)
+    if (!current) return
+    const responseId = (evt as any).response_id
+    const terminal = (evt as any).resolved === true || (evt as any).terminal === true
+    if (!terminal && responseId && pendingApprovalResponseIds.get(key) !== responseId) return
+    const attempted = pendingApprovalResponseIds.has(key)
+    pendingApprovalResponseIds.delete(key)
+    if (!terminal) return
+    if (attempted && (evt as any).resolved === false && ((evt as any).outcome === 'timeout' || (evt as any).stale === true || isPendingInteractionExpiredError((evt as any).error))) notifyPendingInteractionExpired()
+    pendingApprovals.value.delete(key)
     pendingApprovals.value = new Map(pendingApprovals.value)
   }
 
@@ -3570,12 +3577,13 @@ function createChatState(scopedSessionId?: string) {
     pendingClarifies.value = new Map(pendingClarifies.value)
   }
 
-  function clearPendingInteractions(sessionId: string) {
-    pendingApprovalResponseIds.delete(sessionId)
+  function clearPendingInteractions(sessionId: string, runId?: string) {
     pendingClarifyResponseIds.delete(sessionId)
     let changed = false
-    if (pendingApprovals.value.has(sessionId)) {
-      pendingApprovals.value.delete(sessionId)
+    for (const [key, pending] of pendingApprovals.value) {
+      if (pending.sessionId !== sessionId || runId && pending.runId && pending.runId !== runId) continue
+      pendingApprovals.value.delete(key)
+      pendingApprovalResponseIds.delete(key)
       changed = true
     }
     if (pendingClarifies.value.has(sessionId)) {
@@ -3586,13 +3594,6 @@ function createChatState(scopedSessionId?: string) {
       pendingApprovals.value = new Map(pendingApprovals.value)
       pendingClarifies.value = new Map(pendingClarifies.value)
     }
-  }
-
-  function dismissPendingApprovalFor(sessionId: string, approvalId: string) {
-    const pending = pendingApprovals.value.get(sessionId)
-    if (!pending || pending.approvalId !== approvalId) return
-    pendingApprovals.value.delete(sessionId)
-    pendingApprovals.value = new Map(pendingApprovals.value)
   }
 
   function dismissPendingClarifyFor(sessionId: string, clarifyId: string) {
@@ -3619,20 +3620,29 @@ function createChatState(scopedSessionId?: string) {
   }
 
 
-  function respondApprovalFor(sessionId: string, approvalId: string, choice: PendingApproval['choices'][number]): PendingInteractionSubmitResult {
-    const pending = pendingApprovals.value.get(sessionId)
-    if (!pending || pending.approvalId !== approvalId) return 'missing'
-    respondToolApproval(sessionId, approvalId, choice, sessionId.startsWith('person-main-') ? 'chat-run' : runtimeTransport())
-    pendingApprovalResponseIds.set(sessionId, approvalId)
+  function respondApprovalFor(sessionId: string, approvalId: string, choice: PendingApproval['choices'][number], binding?: Pick<PendingApproval, 'runId' | 'requestId'>): PendingInteractionSubmitResult {
+    const matches = [...pendingApprovals.value.values()].filter(pending => pending.sessionId === sessionId && pending.approvalId === approvalId && (!binding || pending.runId === binding.runId && pending.requestId === binding.requestId))
+    if (matches.length !== 1) return 'missing'
+    const pending = matches[0]
+    const key = pendingApprovalKey(pending)
+    if (pendingApprovalResponseIds.has(key)) return 'submitted'
+    const responseId = crypto.randomUUID()
+    pendingApprovalResponseIds.set(key, responseId)
+    try {
+      respondToolApproval(sessionId, approvalId, choice, sessionId.startsWith('person-main-') ? 'chat-run' : runtimeTransport(), {
+        run_id: pending.runId, request_id: pending.requestId, response_id: responseId,
+      })
+    } catch (error) {
+      if (pendingApprovalResponseIds.get(key) === responseId) pendingApprovalResponseIds.delete(key)
+      throw error
+    }
     return 'submitted'
   }
 
   function respondApproval(choice: PendingApproval['choices'][number]): PendingInteractionSubmitResult {
     const pending = activePendingApproval.value
     if (!pending) return 'missing'
-    const result = respondApprovalFor(pending.sessionId, pending.approvalId, choice)
-    if (result === 'submitted') dismissPendingApprovalFor(pending.sessionId, pending.approvalId)
-    return result
+    return respondApprovalFor(pending.sessionId, pending.approvalId, choice, pending)
   }
 
   function updateSessionTitle(sessionId: string) {
@@ -4052,7 +4062,7 @@ function createChatState(scopedSessionId?: string) {
         } else if (!data.isWorking) {
           setAbortState(sid, null)
         }
-        if (!data.isWorking) setCompressionState(sid, null)
+        if (!data.isWorking && !compressionStates.value.get(sid)?.error) setCompressionState(sid, null)
 
         applySessionTokenUsage(target, data)
         applyResumedSessionSettings(data)
@@ -4190,7 +4200,7 @@ function createChatState(scopedSessionId?: string) {
               setRunStartedAt(sid, Date.now())
               clearAgentEventMessages(sid)
               setAbortState(sid, null)
-              setCompressionState(sid, null)
+              if (!compressionStates.value.get(sid)?.error) setCompressionState(sid, null)
               runProducedAssistantText = false
               runProducedAssistantContent = false
               runHadToolActivity = false
@@ -4264,13 +4274,6 @@ function createChatState(scopedSessionId?: string) {
                 const target = sessions.value.find(s => s.id === sid)
                 if (target) target.contextTokens = (evt as any).contextTokens
               }
-              // Auto-clear after 5s
-              setTimeout(() => {
-                const state = compressionStates.value.get(sid)
-                if (state && !state.compressing) {
-                  setCompressionState(sid, null)
-                }
-              }, 5000)
               break
             }
 
@@ -4287,7 +4290,7 @@ function createChatState(scopedSessionId?: string) {
             case 'abort.completed': {
               setAbortState(sid, { aborting: false, synced: (evt as any).synced ?? false })
               settleInterruptedSubagents(sid)
-              clearPendingInteractions(sid)
+              clearPendingInteractions(sid, evt.run_id)
               const abortedAssistant = getSessionMsgs(sid).find(message => message.id === activeAssistantMessageId)
                 || [...getSessionMsgs(sid)].reverse().find(message => message.role === 'assistant' && message.isStreaming)
               handleTerminalWorkspaceRunChange(sid, evt, abortedAssistant?.id)
@@ -4668,7 +4671,7 @@ function createChatState(scopedSessionId?: string) {
             case 'run.failed': {
               if (evt.queue_id) acknowledgeUserMessage(sid, evt.queue_id)
               clearRunStartedAt(sid)
-              clearPendingInteractions(sid)
+              clearPendingInteractions(sid, evt.run_id)
               const failedMessages = getSessionMsgs(sid)
               const failedAssistant = activeAssistantMessageId
                 ? failedMessages.find(message => message.id === activeAssistantMessageId)
@@ -4899,7 +4902,7 @@ function createChatState(scopedSessionId?: string) {
           ensureAbortHandle()
           clearAgentEventMessages(sid)
           setAbortState(sid, null)
-          setCompressionState(sid, null)
+          if (!compressionStates.value.get(sid)?.error) setCompressionState(sid, null)
           runProducedAssistantText = false
           runProducedAssistantContent = false
           runHadToolActivity = false
@@ -4937,12 +4940,6 @@ function createChatState(scopedSessionId?: string) {
             const target = sessions.value.find(s => s.id === sid)
             if (target) target.contextTokens = (evt as any).contextTokens
           }
-          setTimeout(() => {
-            const state = compressionStates.value.get(sid)
-            if (state && !state.compressing) {
-              setCompressionState(sid, null)
-            }
-          }, 5000)
           break
         }
 
@@ -4959,7 +4956,7 @@ function createChatState(scopedSessionId?: string) {
         case 'abort.completed': {
           setAbortState(sid, { aborting: false, synced: (evt as any).synced ?? false })
           settleInterruptedSubagents(sid)
-          clearPendingInteractions(sid)
+          clearPendingInteractions(sid, evt.run_id)
           const abortedAssistant = getSessionMsgs(sid).find(message => message.id === activeAssistantMessageId)
             || [...getSessionMsgs(sid)].reverse().find(message => message.role === 'assistant' && message.isStreaming)
           handleTerminalWorkspaceRunChange(sid, evt, abortedAssistant?.id)
@@ -5329,7 +5326,7 @@ function createChatState(scopedSessionId?: string) {
 
         case 'run.failed': {
           clearRunStartedAt(sid)
-          clearPendingInteractions(sid)
+          clearPendingInteractions(sid, evt.run_id)
           const failedMessages = getSessionMsgs(sid)
           const failedAssistant = activeAssistantMessageId
             ? failedMessages.find(message => message.id === activeAssistantMessageId)
@@ -5589,7 +5586,7 @@ function createChatState(scopedSessionId?: string) {
             } else if (!data.isWorking) {
               setAbortState(sid, null)
             }
-            if (!data.isWorking) setCompressionState(sid, null)
+            if (!data.isWorking && !compressionStates.value.get(sid)?.error) setCompressionState(sid, null)
             applyResumedSessionSettings(data)
             if (activeSession.value) applySessionTokenUsage(activeSession.value, data)
             if (Array.isArray(data.messages) && activeSession.value) {

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { enableAutoUnmount, mount } from '@vue/test-utils'
 import { defineComponent, nextTick, reactive } from 'vue'
 
 const chatState = reactive({
@@ -84,6 +84,8 @@ function notificationTitleText(entry: any): string {
   const title = typeof entry.options.title === 'function' ? entry.options.title() : entry.options.title
   return typeof title === 'string' ? title : String(title?.children || '')
 }
+
+enableAutoUnmount(afterEach)
 
 describe('GlobalPendingActions', () => {
   beforeEach(() => {
@@ -378,7 +380,7 @@ describe('GlobalPendingActions', () => {
     expect(systemNotificationMock.showSystemNotification).toHaveBeenCalledOnce()
     expect(systemNotificationMock.showSystemNotification).toHaveBeenCalledWith(expect.objectContaining({
       clickUrl: '/hermes/session/session-a?profile=default',
-      tag: expect.stringContaining('chat-approval:session-a:approval-a'),
+      tag: expect.stringContaining('chat-approval:["session-a","approval-a","",""]'),
     }))
     wrapper.unmount()
   })
@@ -465,6 +467,24 @@ describe('GlobalPendingActions', () => {
     expect(copyButton.text()).toBe('common.copy')
   })
 
+  it('keeps same-session approval generations separate in global actions and submissions', async () => {
+    const first = { sessionId: 'session-b', approvalId: 'same', runId: 'r1', requestId: 'q1', choices: ['once'], command: 'pwd' }
+    const second = { ...first, runId: 'r2', requestId: 'q2' }
+    chatState.pendingApprovals = new Map([['first', first], ['second', second]])
+    const wrapper = mount(GlobalPendingActions)
+    await nextTick()
+    expect(created).toHaveLength(2)
+    const action = await render(created[1].options.action)
+    await action.get('button').trigger('click')
+    expect(chatState.respondApprovalFor).toHaveBeenCalledWith('session-b', 'same', 'once', second)
+    chatState.pendingApprovals.delete('first')
+    await nextTick()
+    expect(created[0].destroy).toHaveBeenCalledOnce()
+    expect(created[1].destroy).not.toHaveBeenCalled()
+    action.unmount()
+    wrapper.unmount()
+  })
+
   it('shows and directly handles an approval from an inactive chat session', async () => {
     chatState.sessions = [{ id: 'session-a', title: 'A' }, { id: 'session-b', title: 'B' }]
     chatState.pendingApprovals = new Map([['session-b', {
@@ -483,7 +503,7 @@ describe('GlobalPendingActions', () => {
     expect(routerPush).toHaveBeenCalledWith({ name: 'hermes.session', params: { sessionId: 'session-b' } })
     const action = await render(approvalNotification.options.action)
     await action.get('button').trigger('click')
-    expect(chatState.respondApprovalFor).toHaveBeenCalledWith('session-b', 'approval-b', 'once')
+    expect(chatState.respondApprovalFor).toHaveBeenCalledWith('session-b', 'approval-b', 'once', expect.objectContaining({ sessionId: 'session-b', approvalId: 'approval-b' }))
   })
 
   it('opens a global-agent session from its notification title', async () => {

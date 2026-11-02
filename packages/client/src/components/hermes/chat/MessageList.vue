@@ -878,8 +878,9 @@ defineExpose({
       </template>
       <template #after>
         <Transition name="fade">
-        <div v-if="isRunIndicatorActive" class="streaming-indicator">
+        <div v-if="isRunIndicatorActive || chatStore.compressionState" class="streaming-indicator" :class="{ 'compression-failed': !!chatStore.compressionState?.error }">
           <LiveReasoningStatus
+            v-if="isRunIndicatorActive"
             :deployment-session-id="chatStore.activeSessionId || ''"
             :agent="assistantAgent"
             :hide-reasoning="hideReasoning"
@@ -932,7 +933,7 @@ defineExpose({
               ></span>
             </div>
             <!-- Compression indicator -->
-            <div v-if="chatStore.compressionState" class="tool-call-item compression-item">
+            <div v-if="chatStore.compressionState" class="tool-call-item compression-item" :role="chatStore.compressionState.error ? 'alert' : 'status'">
               <svg
                 v-if="chatStore.compressionState.compressing"
                 width="12"
@@ -959,7 +960,9 @@ defineExpose({
               </svg>
               <span class="tool-call-name">
                 {{
-                  chatStore.compressionState.compressing
+                  chatStore.compressionState.error
+                    ? `${t('chat.compressionFailed')}: ${chatStore.compressionState.error}`
+                    : chatStore.compressionState.compressing
                     ? `Compressing... (${chatStore.compressionState.messageCount} msgs, ~${formatTokens(chatStore.compressionState.beforeTokens)} tokens)`
                     : chatStore.compressionState.compressed
                       ? `Compressed ${chatStore.compressionState.messageCount} msgs: ~${formatTokens(chatStore.compressionState.beforeTokens)} → ~${formatTokens(chatStore.compressionState.afterTokens)} tokens`
@@ -1956,6 +1959,22 @@ defineExpose({
   }
 }
 
+.streaming-indicator.compression-failed {
+  height: auto;
+  max-height: none;
+
+  .tool-calls-panel {
+    flex-basis: auto;
+    height: auto;
+    max-height: none;
+
+    .compression-item[role='alert'] {
+      height: auto;
+      max-height: none;
+    }
+  }
+}
+
 .tool-call-item {
   display: flex;
   flex: 1 1 0;
@@ -1992,6 +2011,18 @@ defineExpose({
   &.compression-item {
     color: $text-muted;
     font-size: calc(var(--font-size-base, 14px) * 10 / 14);
+
+    &[role='alert'] {
+      color: $error;
+      font-size: calc(var(--font-size-base, 14px) * 12 / 14);
+      border: 1px solid currentColor;
+      align-items: flex-start;
+
+      .tool-call-name {
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+    }
 
     .tool-call-name {
       flex: 1 1 auto;

@@ -375,11 +375,13 @@ class BridgeBroker:
                     raise ValueError('Invalid loop profile')
                 home = base if profile == 'default' else base / 'profiles' / profile
                 store = LoopStore(home)
-                for row in store.operation({'op':'list','include_inflight':action == 'loop_recover'})['loops']:
+                for row in store.operation({'op':'list','include_inflight':action == 'loop_recover' or req.get('include_inflight') is True})['loops']:
                     if row['route'].get('profile') != profile:
                         continue
                     if action == 'loop_recover':
-                        store.operation({'op':'recover','session_id':row['session_id']})
+                        if req.get('recovery_only') is True and not row.get('recovery'):
+                            continue
+                        store.operation({'op':'recover','session_id':row['session_id'],'recovery_only':req.get('recovery_only') is True})
                     else:
                         loops.append(row)
             return {'loops':loops}

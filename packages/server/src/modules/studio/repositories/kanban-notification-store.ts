@@ -68,6 +68,16 @@ export function consumeStoppedKanbanNotification(deliveryId: string, sessionId: 
     .run(deliveryId, sessionId, sessionId).changes) === 1
 }
 
+export function diagnosePendingKanbanNotification(deliveryId: string, sessionId: string, error: string) {
+  db().prepare(`UPDATE kanban_notification_receipts SET error=?
+    WHERE delivery_id=? AND session_id=? AND consumer_state='pending'`).run(error, deliveryId, sessionId)
+}
+
+export function consumePendingKanbanNotification(deliveryId: string, sessionId: string, reason: string): boolean {
+  return Number(db().prepare(`UPDATE kanban_notification_receipts SET consumer_state='consumed', error=?
+    WHERE delivery_id=? AND session_id=? AND consumer_state='pending'`).run(reason, deliveryId, sessionId).changes) === 1
+}
+
 export function beginKanbanConsumption(deliveryId: string, sessionId: string, marker: string): boolean {
   return Number(db().prepare(`UPDATE kanban_notification_receipts SET consumer_state='running', run_marker=?, error=NULL
     WHERE delivery_id=? AND session_id=? AND consumer_state='pending'`).run(marker, deliveryId, sessionId).changes) === 1

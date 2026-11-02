@@ -118,6 +118,23 @@ describe('ChatRunSocket clarify responses', { timeout: 15_000 }, () => {
     bridgeMock.statusIfLoaded.mockResolvedValue({ ok: true, exists: false, running: false, loaded: false })
   })
 
+  it('binds approval socket responses and echoes attempt identity on both failure and success ACKs', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, socket, namespaceEmit } = createSocketHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).sessionMap.set('session-1', { events: [{ event: 'approval.requested', data: { approval_id: 'a', run_id: 'r', request_id: 'q' } }] })
+    const respond = vi.spyOn(server as any, 'respondToBridgeApproval')
+      .mockResolvedValueOnce({ resolved: false, outcome: 'binding_mismatch' })
+      .mockResolvedValueOnce({ resolved: true })
+    ;(server as any).onConnection(socket)
+    const data = { session_id: 'session-1', approval_id: 'a', run_id: 'r', request_id: 'q', response_id: 'attempt-1', choice: 'once' }
+    await handlers.get('approval.respond')!(data)
+    expect(respond).toHaveBeenCalledWith('session-1', 'default', 'a', 'once', 'r')
+    expect(socket.emit).toHaveBeenCalledWith('approval.resolved', expect.objectContaining({ ...data, resolved: false, terminal: false }))
+    await handlers.get('approval.respond')!({ ...data, response_id: 'attempt-2' })
+    expect(namespaceEmit).toHaveBeenCalledWith('approval.resolved', expect.objectContaining({ ...data, response_id: 'attempt-2', resolved: true }))
+  })
+
   it.each([{ busy: true, flow: false }, { busy: false, flow: false }, { busy: true, flow: true }, { busy: false, flow: true }])('returns a Person background result through one original chat run (busy=$busy, flow=$flow)', async ({ busy, flow }) => {
     const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { io, socket } = createSocketHarness()

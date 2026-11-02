@@ -10,6 +10,7 @@ import ChatInput from '@/components/hermes/chat/ChatInput.vue'
 
 enableAutoUnmount(afterEach)
 
+const fetchReasoningDefaultMock = vi.hoisted(() => vi.fn())
 const persistReasoningEffortMock = vi.hoisted(() => vi.fn())
 const fetchSkillsMock = vi.hoisted(() => vi.fn())
 const fetchSkillBundlesMock = vi.hoisted(() => vi.fn())
@@ -52,6 +53,7 @@ vi.mock('naive-ui', () => ({
 }))
 
 vi.mock('@/api/studio/sessions', () => ({
+  fetchReasoningDefault: fetchReasoningDefaultMock,
   fetchContextLength: vi.fn().mockResolvedValue(256000),
   setSessionReasoningEffort: persistReasoningEffortMock,
 }))
@@ -111,6 +113,7 @@ function mountForSession(
 describe('ChatInput draft persistence', () => {
   beforeEach(() => {
     localStorage.clear()
+    fetchReasoningDefaultMock.mockReset().mockImplementation((profile: string, model: string) => Promise.resolve({ profile, model, status: 'resolved', effectiveEffort: 'high' }))
     persistReasoningEffortMock.mockReset().mockResolvedValue(true)
     window.innerWidth = 1024
     fetchSkillsMock.mockReset()
@@ -130,6 +133,101 @@ describe('ChatInput draft persistence', () => {
       configurable: true,
       value: vi.fn(),
     })
+  })
+
+  it.each(['', 'high', 'medium', 'low', 'none'])('Hermes preserves inherited or explicit effort %s with zero automatic writes', async effort => {
+    const wrapper = mountForSession('inherited', { agent: 'hermes', profile: 'A', model: 'm', reasoningEffort: effort }, {}, { scopedReasoningEfforts: ['medium'] })
+    await flushPromises()
+    expect(persistReasoningEffortMock).not.toHaveBeenCalled()
+    expect(useChatStore().activeSession?.reasoningEffort).toBe(effort)
+    expect(wrapper.get('.reasoning-effort-button').text()).toContain(effort ? `chat.reasoningEffort.options.${effort}` : 'chat.reasoningEffort.inherited')
+    if (effort && effort !== 'medium') expect(wrapper.text()).toContain('chat.reasoningEffort.unsupported')
+    await wrapper.setProps({ scopedReasoningEfforts: ['low'] })
+    await flushPromises()
+    expect(persistReasoningEffortMock).not.toHaveBeenCalled()
+    wrapper.unmount()
+    mountForSession('inherited', { agent: 'hermes', profile: 'A', model: 'm', reasoningEffort: effort })
+    await flushPromises()
+    expect(persistReasoningEffortMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps real Profile/model resolver results display-only through the default request and send chain', async () => {
+    const { resolveReasoningConfig } = await import('../../packages/server/src/modules/studio/services/chat-run/reasoning-default')
+    const sessions = await vi.importActual<typeof import('@/api/studio/sessions')>('@/api/studio/sessions')
+    const client = await import('@/api/client')
+    const transport = await import('@/api/studio/chat')
+    const profiles: Record<string, unknown> = {
+      A: { agent: { reasoning_effort: 'high', reasoning_overrides: { m: 'medium' } } },
+      B: { agent: { reasoning_effort: 'low' } },
+    }
+    const requests: string[] = []
+    const request = vi.spyOn(client, 'request').mockImplementation(async (path: string) => {
+      requests.push(path)
+      const url = new URL(path, 'https://synthetic.invalid')
+      expect(url.pathname).toBe('/api/studio/sessions/reasoning-default')
+      const profile = url.searchParams.get('profile')!
+      const model = url.searchParams.get('model')!
+      const resolved = resolveReasoningConfig(profiles[profile], model)
+      return { profile, model, status: resolved ? 'resolved' : 'provider-default', effectiveEffort: resolved ? resolved.enabled ? resolved.effort : 'none' : null } as any
+    })
+    const start = vi.spyOn(transport, 'startRunViaSocket').mockReturnValue({ abort: vi.fn() } as any)
+    fetchReasoningDefaultMock.mockImplementation(sessions.fetchReasoningDefault)
+    const wrapper = mountForSession('old-profile-session', { agent: 'hermes', profile: 'A', model: 'm', reasoningEffort: '' }, {}, { scopedReasoningEfforts: ['low', 'high'] })
+    try {
+      await flushPromises()
+      expect(requests).toEqual(['/api/studio/sessions/reasoning-default?profile=A&model=m'])
+      expect(useChatStore().activeSession?.reasoningEffort).toBe('')
+      expect(persistReasoningEffortMock).not.toHaveBeenCalled()
+      await useChatStore().sendMessage('Synthetic inherited request')
+      expect(start.mock.calls.at(-1)?.[0].reasoning_effort).toBeUndefined()
+      for (const effort of ['low', 'high']) {
+        await wrapper.get('.n-slider-stub').setValue(effort === 'low' ? '1' : '2')
+        await flushPromises()
+        await useChatStore().sendMessage(`Synthetic explicit ${effort}`)
+        expect(start.mock.calls.at(-1)?.[0].reasoning_effort).toBe(effort)
+      }
+      await wrapper.get('.n-slider-stub').setValue('0')
+      await flushPromises()
+      expect(persistReasoningEffortMock).toHaveBeenLastCalledWith('old-profile-session', '')
+      await useChatStore().sendMessage('Synthetic reset request')
+      expect(start.mock.calls.at(-1)?.[0].reasoning_effort).toBeUndefined()
+      await wrapper.setProps({ draft: true, reasoningEffort: '', draftConfig: { agent: 'hermes', profile: 'B', model: 'n' } })
+      await flushPromises()
+      expect(requests.at(-1)).toBe('/api/studio/sessions/reasoning-default?profile=B&model=n')
+      expect(wrapper.emitted('update:reasoningEffort')).toBeUndefined()
+      const draft = useChatStore().newChat({ agent: 'hermes', profile: 'B', model: 'n' })
+      await useChatStore().sendMessage('Synthetic new session inherited request')
+      expect(start.mock.calls.at(-1)?.[0]).toMatchObject({ session_id: draft.id, model: 'n' })
+      expect(start.mock.calls.at(-1)?.[0].reasoning_effort).toBeUndefined()
+    } finally {
+      wrapper.unmount()
+      request.mockRestore()
+      start.mockRestore()
+    }
+  })
+
+  it('Hermes draft emits only explicit choices and reset, never the displayed default', async () => {
+    const wrapper = mountForSession('old', {}, {}, { draft: true, draftConfig: { agent: 'hermes', profile: 'A', model: 'm' }, scopedReasoningEfforts: ['low', 'high'] })
+    await flushPromises()
+    expect(wrapper.emitted('update:reasoningEffort')).toBeUndefined()
+    await wrapper.get('.n-slider-stub').setValue('2')
+    expect(wrapper.emitted('update:reasoningEffort')).toEqual([['high']])
+    await wrapper.setProps({ reasoningEffort: 'high' })
+    await wrapper.get('.n-slider-stub').setValue('0')
+    expect(wrapper.emitted('update:reasoningEffort')).toEqual([['high'], ['']])
+    expect(persistReasoningEffortMock).not.toHaveBeenCalled()
+  })
+
+  it('Hermes explicit reset posts empty and keeps inheritance after refresh', async () => {
+    const wrapper = mountForSession('reset', { agent: 'hermes', profile: 'A', model: 'm', reasoningEffort: 'high' }, {}, { scopedReasoningEfforts: ['low', 'high'] })
+    await flushPromises()
+    expect(persistReasoningEffortMock).not.toHaveBeenCalled()
+    await wrapper.get('.n-slider-stub').setValue('0')
+    await flushPromises()
+    expect(persistReasoningEffortMock).toHaveBeenCalledExactlyOnceWith('reset', '')
+    await wrapper.setProps({ scopedReasoningEfforts: ['medium'] })
+    await flushPromises()
+    expect(persistReasoningEffortMock).toHaveBeenCalledTimes(1)
   })
 
   it('isolates the new-chat composer from the active session draft and reference', async () => {
@@ -191,7 +289,7 @@ describe('ChatInput draft persistence', () => {
       model_meta: { 'draft-model': { reasoning_efforts: ['high', 'max'] }, 'simple-model': { reasoning: false } },
     }] }]
     await nextTick()
-    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('1')
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('2')
     expect(useChatStore().setSessionReasoningEffort).not.toHaveBeenCalled()
     expect(useChatStore().activeSession?.reasoningEffort).toBe('low')
     await wrapper.setProps({ reasoningEffort: 'max' })
@@ -695,7 +793,7 @@ describe('ChatInput draft persistence', () => {
 
   it('does not retry a rejected automatic effort write and still allows explicit changes', async () => {
     persistReasoningEffortMock.mockResolvedValue(false)
-    const wrapper = mountForSession('failed-default-effort')
+    const wrapper = mountForSession('failed-default-effort', { agent: 'ekko' })
     await flushPromises()
     expect(persistReasoningEffortMock).toHaveBeenCalledTimes(1)
     expect(persistReasoningEffortMock).toHaveBeenCalledWith('failed-default-effort', 'low')
@@ -728,7 +826,7 @@ describe('ChatInput draft persistence', () => {
   })
 
   it('stores maximum reasoning effort for the active session', async () => {
-    const wrapper = mountForSession('session-reasoning-max')
+    const wrapper = mountForSession('session-reasoning-max', { agent: 'ekko' })
     const store = useChatStore()
 
     await wrapper.get('.n-slider-stub').setValue('4')
@@ -740,7 +838,7 @@ describe('ChatInput draft persistence', () => {
   })
 
   it('uses the selected model effort ladder and resets an unsupported effort after switching models', async () => {
-    const wrapper = mountForSession('session-model-efforts', { provider: 'custom:work', model: 'glm', profile: 'research' })
+    const wrapper = mountForSession('session-model-efforts', { agent: 'ekko', provider: 'custom:work', model: 'glm', profile: 'research' })
     const appStore = useAppStore()
     appStore.profileModelGroups = [{ profile: 'research', default: 'glm', default_provider: 'custom:work', groups: [{
       provider: 'custom:work', label: 'Work', base_url: 'https://api.z.ai/v1', api_key: '', models: ['glm', 'fast'],
@@ -760,7 +858,7 @@ describe('ChatInput draft persistence', () => {
   })
 
   it('stores the selected reasoning effort for the active session', async () => {
-    const wrapper = mountForSession('session-reasoning')
+    const wrapper = mountForSession('session-reasoning', { agent: 'ekko' })
     const store = useChatStore()
 
     await wrapper.get('.n-slider-stub').setValue('2')

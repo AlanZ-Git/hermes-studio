@@ -784,12 +784,14 @@ export function respondToolApproval(
   approvalId: string,
   choice: 'once' | 'session' | 'always' | 'deny',
   transport: ChatRunTransport = 'chat-run',
+  binding?: { run_id?: string; request_id?: string; response_id?: string },
 ): void {
   const socket = connectChatRun(null, transport)
   socket.emit('approval.respond', {
     session_id: sessionId,
     approval_id: approvalId,
     choice,
+    ...binding,
   })
 }
 

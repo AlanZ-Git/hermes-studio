@@ -1,6 +1,7 @@
 import Router from '@koa/router'
 import * as shares from '../controllers/session-shares'
 import * as directories from '../controllers/workspace-directories'
+import { reasoningDefault } from '../controllers/reasoning-default'
 import * as ctrl from '../controllers/sessions'
 
 export const sessionRoutes = new Router()
@@ -25,6 +26,7 @@ sessionRoutes.get('/api/studio/sessions/usage', ctrl.usageBatch)
 sessionRoutes.get('/api/studio/usage/stats', ctrl.usageStats)
 sessionRoutes.get('/api/studio/usage/pricing', ctrl.usagePricing)
 sessionRoutes.put('/api/studio/usage/pricing', ctrl.updateUsagePricing)
+sessionRoutes.get('/api/studio/sessions/reasoning-default', reasoningDefault)
 sessionRoutes.get('/api/studio/sessions/context-length', ctrl.contextLength)
 sessionRoutes.get('/api/studio/sessions/:id/context', ctrl.getContext)
 sessionRoutes.get('/api/studio/sessions/:id/tasks', ctrl.getTasks)

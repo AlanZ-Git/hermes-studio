@@ -1120,6 +1120,7 @@ export default {
 
   // Chat
   chat: {
+    compressionFailed: 'فشل ضغط السياق',
     selectMessages: "تحديد الرسائل",
     messagesSelected: "تم تحديد {count}",
     deleteSelectedMessages: "حذف المحدد",
@@ -1282,6 +1283,10 @@ export default {
     },
     attachFiles: 'إرفاق ملفات',
     reasoningEffort: {
+      inherited: 'الافتراضي ({effort})',
+      providerDefault: 'افتراضي المزود',
+      unknown: 'غير معروف',
+      unsupported: 'غير مدعوم في هذا النموذج',
       tooltip: 'جهد التفكير',
       dragHint: 'اسحب للاختيار · {count} درجات',
       defaultLabel: 'افتراضي',

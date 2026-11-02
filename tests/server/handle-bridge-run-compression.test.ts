@@ -207,6 +207,17 @@ describe('handle-bridge-run compression', () => {
     expect((bridge.compressionRespond.mock.calls[0][1].messages ?? []).map(m => [m.role, m.content])).toEqual(PREVIOUS_TURN_HISTORY)
   })
 
+  it('retains the genuine last user, assistant and tool round for hidden input', async () => {
+    const bridge = makeBridge()
+    const { nsp, socket } = makeSockets()
+    const state: SessionState = { messages: [], isWorking: false, events: [], queue: [] }
+    await handleBridgeRun(nsp, socket, { session_id: 'session-1', input: 'verify latest result', display_input: null }, 'default',
+      new Map([['session-1', state]]), bridge as unknown as PrimaryAgentBridgeClient, false, vi.fn(), vi.fn())
+    expect(bridge.chat).toHaveBeenCalledTimes(1)
+    expect(bridge.chat.mock.calls[0][2].map(m => [m.role, m.content])).toEqual(PREVIOUS_TURN_HISTORY)
+    expect(mocks.rows.filter(m => m.role === 'user')).toHaveLength(1)
+  })
+
   it('uses persisted input IDs without colliding with retained messages after deletion', async () => {
     mocks.rows.forEach((row, index) => { row.id = index + 3 })
     const retainedIds = mocks.rows.map(row => row.id)

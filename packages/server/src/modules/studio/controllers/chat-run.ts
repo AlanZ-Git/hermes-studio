@@ -232,6 +232,13 @@ export async function runOnce(ctx: Context) {
     return
   }
 
+  const isLoopControl = typeof body.input === 'string' && /^\/loop(?:\s|$)/.test(body.input)
+  if (isLoopControl && (typeof body.request_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body.request_id)
+    || typeof body.session_id !== 'string' || !body.session_id.trim())) {
+    ctx.status = 400
+    ctx.body = { ok: false, error: 'Loop control requires session_id and a valid unique request_id' }
+    return
+  }
   const timeoutMs = requestTimeoutMs(body.timeout_ms)
   const includeEvents = body.include_events === true
   const token = bearerToken(ctx)
@@ -328,7 +335,21 @@ export async function runOnce(ctx: Context) {
 
     for (const eventName of CHAT_RUN_EVENTS) {
       socket.on(eventName, (event: ChatRunEvent = {}) => {
-        const tagged = { ...event, event: event.event || eventName }
+        const tagged: ChatRunEvent = { ...event, event: event.event || eventName }
+        if (isLoopControl) {
+          if (eventName !== 'session.command' || tagged.session_id !== payload.session_id
+            || tagged.request_id !== payload.request_id || tagged.profile !== profile
+            || tagged.command !== 'loop' || tagged.action !== 'loop' || tagged.control !== true || tagged.terminal !== false
+            || typeof tagged.ok !== 'boolean') return
+          record(tagged)
+          output = typeof tagged.message === 'string' ? tagged.message : ''
+          finish(tagged.ok ? 200 : 400, {
+            ok: tagged.ok, status: tagged.ok ? 'completed' : 'failed', event: eventName,
+            request_id: payload.request_id, profile, command: tagged,
+            ...(!tagged.ok ? { error: output || 'Loop command failed' } : {}),
+          })
+          return
+        }
         record(tagged)
         if (typeof tagged.run_id === 'string' && tagged.run_id) runId = tagged.run_id
         if (eventName === 'message.delta' && typeof tagged.delta === 'string') output += tagged.delta

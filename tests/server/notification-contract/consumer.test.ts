@@ -32,7 +32,7 @@ vi.mock('../../../packages/server/src/modules/studio/services/chat-run/usage', (
   updateMessageContextTokenUsage: () => 0,
 }))
 
-it.each(['success', 'model-failure', 'save-failure', 'source-ack-independent', 'stopped-before-consume', 'before-dispatch-failure'])('real consumer persistence and responsibility: %s', async failure => {
+it.each(['success', 'model-failure', 'save-failure', 'source-ack-independent', 'stopped-before-consume', 'before-dispatch-failure', 'stale-result', 'stop-during-preparation'])('real consumer persistence and responsibility: %s', async failure => {
   const database = await import('../../../packages/server/src/modules/studio/infrastructure/database/index')
   expect(database.getStoragePath()).toBe(process.env.TODO199_RUN + '/webstate/hermes-web-ui.db')
   const { initAllHermesTables } = await import('../../../packages/server/src/modules/studio/infrastructure/database/schemas')
@@ -44,6 +44,7 @@ it.each(['success', 'model-failure', 'save-failure', 'source-ack-independent', '
   const id = 'kanban:' + sid
   store.createSession({ id: sid, profile: 'default', source: 'cli' })
   const notification = { session_id: sid, profile: 'default', delegation_id: id, claim_id: 'claim',
+    studio_auto_continue: 'v1',
     message: 'predecessor completed: continue ordinary work', identity: ['board', 'task', sid, 'run', 'default', sid, ''] }
   inbox.receiveKanbanNotification(notification, true)
   const state: any = { messages: [], events: [], queue: [], isWorking: false }
@@ -64,7 +65,8 @@ it.each(['success', 'model-failure', 'save-failure', 'source-ack-independent', '
       }
     }),
     ackResult: vi.fn(async () => true), request: vi.fn(async (req: any) => req.action === 'background_notification_status'
-      ? { current: true, execution_stopped: failure === 'stopped-before-consume' } : {}),
+      ? { current: true, execution_stopped: failure === 'stopped-before-consume', studio_auto_continue: 'v1',
+          wake_eligible: true, stale_result: failure === 'stale-result' } : {}),
     completeBackgroundNotification: vi.fn(async () => {
       if (failure === 'source-ack-independent') throw new Error('Consumer must not re-ACK the source lease')
       return { completed: true }
@@ -73,6 +75,7 @@ it.each(['success', 'model-failure', 'save-failure', 'source-ack-independent', '
   }
   const data: any = { session_id: sid, input: notification.message, display_input: null,
     background_notification_kind: 'kanban', background_delegation_id: id, background_claim_id: 'claim', autonomous: true }
+  if (failure === 'stop-during-preparation') data.loopBeforeDispatch = async () => { state.backgroundWakeStopped = true }
   let beforeDispatchState: string | undefined
   if (failure === 'before-dispatch-failure') data.loopBeforeDispatch = async () => {
     beforeDispatchState = inbox.kanbanNotificationReceipt(id).consumer_state
@@ -85,11 +88,20 @@ it.each(['success', 'model-failure', 'save-failure', 'source-ack-independent', '
   } finally {
     database.getDb()!.exec('DROP TRIGGER IF EXISTS synthetic_consumer_save')
   }
+  if (failure === 'stop-during-preparation') {
+    expect(bridge.chat).not.toHaveBeenCalled()
+    expect(inbox.kanbanNotificationReceipt(id).consumer_state).toBe('pending')
+    expect(state.backgroundWakeStopped).toBe(true)
+    expect(state.isWorking).toBe(false)
+    database.closeDb()
+    return
+  }
   if (failure === 'before-dispatch-failure') {
     expect(beforeDispatchState).toBe('pending')
     expect(bridge.chat).not.toHaveBeenCalled()
     expect(bridge.completeBackgroundNotification).not.toHaveBeenCalled()
     expect(inbox.kanbanNotificationReceipt(id).consumer_state).toBe('pending')
+    expect(inbox.kanbanNotificationReceipt(id).error).toContain('known failure before dispatch')
     delete data.loopBeforeDispatch
     state.isWorking = false
     await handleBridgeRun(nsp, socket, data, 'default', states, bridge, false, vi.fn(), vi.fn())
@@ -98,10 +110,10 @@ it.each(['success', 'model-failure', 'save-failure', 'source-ack-independent', '
     database.closeDb()
     return
   }
-  expect(bridge.chat).toHaveBeenCalledTimes(failure === 'stopped-before-consume' ? 0 : 1)
+  expect(bridge.chat).toHaveBeenCalledTimes(['stopped-before-consume', 'stale-result'].includes(failure) ? 0 : 1)
   expect(bridge.completeBackgroundNotification).not.toHaveBeenCalled()
   const receipt = inbox.kanbanNotificationReceipt(id)
-  expect(receipt.consumer_state).toBe(['success', 'source-ack-independent', 'stopped-before-consume'].includes(failure) ? 'consumed' : 'uncertain')
+  expect(receipt.consumer_state).toBe(['success', 'source-ack-independent', 'stopped-before-consume', 'stale-result'].includes(failure) ? 'consumed' : 'uncertain')
   if (['success', 'source-ack-independent'].includes(failure)) {
     database.closeDb()
     expect(store.getSessionDetail(sid)!.messages.filter(m => m.content === 'SYNTHETIC consumed predecessor result')).toHaveLength(1)
@@ -112,6 +124,6 @@ it.each(['success', 'model-failure', 'save-failure', 'source-ack-independent', '
   // A replayed persisted/running event never starts a second model attempt.
   state.isWorking = false
   await handleBridgeRun(nsp, socket, data, 'default', states, bridge, false, vi.fn(), vi.fn())
-  expect(bridge.chat).toHaveBeenCalledTimes(failure === 'stopped-before-consume' ? 0 : 1)
+  expect(bridge.chat).toHaveBeenCalledTimes(['stopped-before-consume', 'stale-result'].includes(failure) ? 0 : 1)
   database.closeDb()
 })

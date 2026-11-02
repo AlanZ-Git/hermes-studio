@@ -1127,6 +1127,7 @@ export default {
 
   // 对话
   chat: {
+    compressionFailed: '上下文压缩失败',
     selectMessages: "多选消息",
     messagesSelected: "已选 {count} 条",
     deleteSelectedMessages: "删除所选",
@@ -1289,6 +1290,10 @@ export default {
     },
     attachFiles: '添加附件',
     reasoningEffort: {
+      inherited: '默认（{effort}）',
+      providerDefault: '提供商默认',
+      unknown: '未知',
+      unsupported: '此模型不支持',
       tooltip: '推理强度',
       dragHint: '拖动选择 · 共 {count} 档',
       defaultLabel: '默认',

@@ -13,7 +13,7 @@ def exhausted(state):
     return bool(state and ((state.times and state.ticks_fired>=state.times) or
                            (state.max_ticks and state.ticks_fired>=state.max_ticks)))
 
-def boot(store,mgr,meta):
+def boot(store,mgr,meta,recovery_only=False):
     state=mgr.state;tick=meta.get('tick');r=meta.get('recovery')
     if r and r['status'] in {'claimed','injecting','started'}:
         if r['status']=='claimed' and r['attempts']<2:
@@ -21,6 +21,7 @@ def boot(store,mgr,meta):
         else:
             r.update(status='failed',result='recovery interrupted; no automatic replay',finished_at=time.time())
         if state and state.status=='active':mgr.pause('recovery interrupted; inspect saved recovery record')
+    if recovery_only:return
     if not tick and not (state and state.status=='active' and state.awaiting_response):return
     # Archive before clearing the live association, including original generation,
     # next_due, phase, count and route. The save is atomic with native state.
@@ -32,12 +33,17 @@ def boot(store,mgr,meta):
     if not state or state.status!='active' or tick and tick['generation']!=meta['generation']:
         saved.update(status='superseded',result='newer user control or terminal state retained')
     elif tick and tick.get('phase')=='claimed':
-        mgr.abandon_tick()  # only durable pre-dispatch evidence justifies refund
-        saved.update(status='released',result='durable claimed phase proves no dispatch')
+        state.awaiting_response=False
+        if exhausted(state):mgr.pause('claim-only-retired: count retained; exhausted limit requires explicit new loop control')
+        else:
+            from hermes_cli.loops import self_paced_floor_seconds
+            state.next_due_at=time.time()+max(1,state.current_delay or state.interval_seconds or self_paced_floor_seconds())
+        saved.update(status='released',result='durable claimed phase proves no dispatch; count retained')
     else:
         mgr.pause('recovery-required: execution uncertain; original chat will inspect without replay')
     if r:meta.setdefault('recovery_history',[]).append(r)
     meta['recovery']=saved
+    if tick:store.fence(meta,tick,(state.route or {}).get('profile'),'restart-'+saved['status'])
     meta['tick']=None
 
 def operation(store,db,mgr,meta,req):

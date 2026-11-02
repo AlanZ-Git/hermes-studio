@@ -1033,6 +1033,7 @@ export default {
 
 
   chat: {
+    compressionFailed: 'Не удалось сжать контекст',
     selectMessages: "Выбрать сообщения",
     messagesSelected: "Выбрано: {count}",
     deleteSelectedMessages: "Удалить выбранное",
@@ -1182,6 +1183,10 @@ export default {
     },
     attachFiles: 'Прикрепить файлы',
     reasoningEffort: {
+      inherited: 'По умолчанию ({effort})',
+      providerDefault: 'настройка поставщика',
+      unknown: 'неизвестно',
+      unsupported: 'не поддерживается этой моделью',
       tooltip: 'Глубина рассуждений',
       dragHint: 'Перетащите, чтобы выбрать · {count} уровней',
       defaultLabel: 'По умолчанию',

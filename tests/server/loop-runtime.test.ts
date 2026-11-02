@@ -1,10 +1,18 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const rows = vi.hoisted(() => new Map<string, any>())
 const details = vi.hoisted(() => new Map<string, any>())
 vi.mock('../../packages/server/src/modules/studio/repositories/session-store', () => ({
   getSession: (id: string) => rows.get(id),
   getSessionDetail: (id: string) => details.get(id),
+  addMessage: (message: any) => {
+    const saved = details.get(message.session_id) || { messages: [] }
+    const id = saved.messages.length + 1
+    saved.messages.push({ ...message, id })
+    details.set(message.session_id, saved)
+    return id
+  },
+  addMessages: () => { throw new Error('unexpected atomic write') },
 }))
 vi.mock('../../packages/server/src/modules/studio/services/chat-run/compression', () => ({
   getOrCreateSession: (map: Map<string, any>, id: string) => {
@@ -13,6 +21,7 @@ vi.mock('../../packages/server/src/modules/studio/services/chat-run/compression'
   },
 }))
 import { LoopRuntime } from '../../packages/server/src/modules/studio/services/chat-run/loop-runtime'
+import { flushBridgePendingToDb } from '../../packages/server/src/modules/studio/services/chat-run/bridge-message'
 
 function fixture(recovery = false) {
   const owner = { id: 1, username: 'fixture', role: 'super_admin' }
@@ -29,7 +38,7 @@ function fixture(recovery = false) {
       await data.loopBeforeDispatch()
       data.loopDispatchConfirmed()
       data.onEvent('run.started', { run_id: 'run' })
-      data.loopProof({ done: true, run_id: 'run', status: 'complete', result: { completed: true } })
+      data.loopProof({ done: true, run_id: 'run', session_id: 'session', status: 'complete', result: { completed: true } })
       details.set('session', { messages: [{ id: 5, role: 'assistant', content: 'done' }] })
       data.onEvent('run.completed', { run_id: 'run', message_id: 5, output: 'done' })
     }),
@@ -45,11 +54,187 @@ async function settle(runtime: LoopRuntime) {
 
 describe('native loop runtime dispatch evidence', () => {
   beforeEach(() => { rows.clear(); details.clear() })
+  afterEach(() => { vi.restoreAllMocks() })
+  it('retries a transient read failure after backoff without a process-wide permanent fault', async () => {
+    const { host, runtime } = fixture()
+    let now = Date.now()
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const normal = host.request.getMockImplementation()!
+    host.request.mockImplementationOnce(normal).mockRejectedValueOnce(new Error('synthetic list failure'))
+    await runtime.poll()
+    expect(host.run).not.toHaveBeenCalled()
+    const calls = host.request.mock.calls.length
+    await runtime.poll()
+    expect(host.request).toHaveBeenCalledTimes(calls)
+    now += 2100
+    await settle(runtime)
+    expect(host.run).toHaveBeenCalledOnce()
+    expect(host.request.mock.calls.filter(([v]: any[]) => v.action === 'loop_recover').map(([v]: any[]) => v))
+      .toEqual([{ action: 'loop_recover', profiles: ['alpha'], recovery_only: true }])
+  })
+  it('retries recovery-only startup after a lost acknowledgement without blocking unrelated business sessions', async () => {
+    const { host, runtime, item } = fixture(true)
+    const other = { ...item, session_id: 'other', recovery: undefined }
+    rows.set('other', { ...rows.get('session'), id: 'other' })
+    let now = Date.now(), attempts = 0
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const normal = host.request.getMockImplementation()!
+    host.request.mockImplementation(async (data: any) => {
+      if (data.action === 'loop_recover') {
+        expect(data).toEqual({ action: 'loop_recover', profiles: ['alpha'], recovery_only: true })
+        if (++attempts === 1) throw new Error('synthetic startup recovery acknowledgement loss')
+        return { loops: [] }
+      }
+      if (data.action === 'loop_list') return { loops: [item, other] }
+      if (data.op === 'claim') return { claimed: true, generation: 2, prompt: '/status' }
+      return normal(data)
+    })
+    await settle(runtime)
+    expect(attempts).toBe(1)
+    expect(host.command).toHaveBeenCalledOnce()
+    expect(host.run).not.toHaveBeenCalled()
+    expect(host.request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'recovery_claim' }))
+    await settle(runtime)
+    expect(attempts).toBe(1)
+    now += 2100
+    await settle(runtime)
+    expect(attempts).toBe(2)
+    expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: 'recovery_commit' }))
+    await settle(runtime)
+    expect(attempts).toBe(2)
+    runtime.close()
+  })
+  it('rechecks owner before reconciliation and never substitutes a newer listed generation', async () => {
+    const { host, runtime, item } = fixture()
+    let now = Date.now()
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const normal = host.request.getMockImplementation()!
+    host.request.mockImplementation(async (data: any) => {
+      if (data.op === 'claim') throw new Error('synthetic uncertain claim')
+      if (data.op === 'reconcile_claim') return { claim_resolution: 'claim-only-retired' }
+      return normal(data)
+    })
+    await settle(runtime)
+    const claim = host.request.mock.calls.find(([v]: any[]) => v.op === 'claim')![0]
+    expect(claim.generation).toBe(2)
+    item.generation = 3
+    rows.get('session').user_id = 'other'
+    await runtime.poll()
+    expect(host.request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'reconcile_claim' }))
+    expect(host.run).not.toHaveBeenCalled()
+    rows.get('session').user_id = '1'
+    now += 2100
+    await runtime.poll()
+    expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: 'reconcile_claim', tick_id: claim.tick_id, generation: 2, profile: 'alpha' }))
+    expect(host.request.mock.calls.filter(([v]: any[]) => v.op === 'claim')).toHaveLength(1)
+    expect(host.run).not.toHaveBeenCalled()
+  })
+  it('keeps uncertain work blocked while allowing a different authorized session to proceed', async () => {
+    const { host, runtime, item } = fixture()
+    const other = { ...item, session_id: 'other' }
+    rows.set('other', { ...rows.get('session'), id: 'other' })
+    host.request.mockImplementation(async (data: any) => {
+      if (data.action === 'loop_list') return { loops: [item, other] }
+      if (data.session_id === 'session' && ['claim', 'reconcile_claim'].includes(data.op)) throw new Error('synthetic unavailable receipt')
+      return data.op === 'claim' ? { claimed: true, generation: 2, prompt: '/status' } : { authorized: true }
+    })
+    await settle(runtime)
+    expect(host.command).toHaveBeenCalledOnce()
+    expect(host.request.mock.calls.filter(([v]: any[]) => v.op === 'claim' && v.session_id === 'session')).toHaveLength(1)
+    await runtime.poll()
+    expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: 'reconcile_claim', session_id: 'session' }))
+    expect(host.emit).toHaveBeenCalledWith('session', 'loop.updated', expect.objectContaining({ claim_resolution: 'receipt-uncertain' }))
+    expect(host.run).not.toHaveBeenCalled()
+  })
+  it('logs bounded loop correlation without prompt response or error bodies', async () => {
+    const { AgentBridgeClient } = await import('../../packages/server/src/modules/hermes/services/bridge/client')
+    const client = new AgentBridgeClient()
+    const summary = (client as any).summarizePayload({ action: 'loop_operation', op: 'reconcile_claim',
+      session_id: 'session', profile: 'alpha', tick_id: 'x'.repeat(300), generation: 2, expected_generation: 3,
+      prompt: 'SECRET', response: 'SECRET', reason: 'SECRET', error: 'SECRET', command: 'SECRET', body: 'SECRET' })
+    expect(summary).toEqual({ action: 'loop_operation', op: 'reconcile_claim', session_id: 'session', profile: 'alpha',
+      tick_id: 'x'.repeat(128), generation: 2, expected_generation: 3 })
+    expect(JSON.stringify(summary)).not.toContain('SECRET')
+  })
+  it('accepts the string message ID emitted by real bridge persistence with native proof', async () => {
+    const { host, runtime } = fixture()
+    host.run.mockImplementationOnce(async (_: any, data: any) => {
+      await data.loopBeforeDispatch(); data.loopDispatchConfirmed()
+      data.onEvent('run.started', { run_id: 'run' })
+      data.loopProof({ done: true, run_id: 'run', session_id: 'session', status: 'complete', result: { completed: true } })
+      const state = host.sessionMap.get('session')
+      state.bridgePendingAssistantContent = 'verified final response'
+      const messageId = flushBridgePendingToDb(state, 'session', 'native-marker')
+      expect(typeof messageId).toBe('string')
+      expect(typeof details.get('session').messages[0].id).toBe('number')
+      data.onEvent('run.completed', { run_id: 'run', message_id: messageId, output: 'verified final response' })
+    })
+    await settle(runtime)
+    expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: 'complete', run_id: 'run' }))
+    expect(host.request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'unknown' }))
+  })
   it('completes only after matching terminal proof and persisted assistant readback', async () => {
     const { host, runtime } = fixture()
     await settle(runtime)
     expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: 'complete', run_id: 'run', generation: 2 }))
     expect(host.sessionMap.get('session').isWorking).toBe(false)
+  })
+  for (const messageId of ['01', '1 ', null, undefined]) {
+    it(`rejects non-exact persistence ID ${String(messageId)} without replay`, async () => {
+      const { host, runtime } = fixture()
+      host.run.mockImplementationOnce(async (_: any, data: any) => {
+        await data.loopBeforeDispatch(); data.loopDispatchConfirmed()
+        data.onEvent('run.started', { run_id: 'run' })
+        data.loopProof({ done: true, run_id: 'run', session_id: 'session', status: 'complete' })
+        details.set('session', { messages: [{ id: 1, role: 'assistant', content: 'done' }] })
+        data.onEvent('run.completed', { run_id: 'run', message_id: messageId })
+      })
+      await settle(runtime)
+      expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: 'unknown' }))
+      expect(host.run).toHaveBeenCalledOnce()
+    })
+  }
+  it('rejects native proof belonging to another session even when run IDs match', async () => {
+    const { host, runtime } = fixture()
+    host.run.mockImplementationOnce(async (_: any, data: any) => {
+      await data.loopBeforeDispatch(); data.loopDispatchConfirmed()
+      data.onEvent('run.started', { run_id: 'run' })
+      data.loopProof({ done: true, run_id: 'run', session_id: 'other-session', status: 'complete' })
+      details.set('session', { messages: [{ id: 1, role: 'assistant', content: 'done' }] })
+      data.onEvent('run.completed', { run_id: 'run', message_id: '1' })
+    })
+    await settle(runtime)
+    expect(host.request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'complete' }))
+    expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: 'unknown' }))
+  })
+  it.each([
+    ['partial', { result: { partial: true } }, 'run.completed', 'unknown'],
+    ['interrupted', { result: { interrupted: true } }, 'abort.completed', 'interrupted'],
+    ['failed', { error: 'synthetic failure', status: 'error' }, 'run.failed', 'failed'],
+    ['stale run', { run_id: 'old-run' }, 'run.completed', 'unknown'],
+  ])('retains count and does not replay %s terminal evidence', async (_label, change, event, outcome) => {
+    const { host, runtime } = fixture()
+    host.run.mockImplementationOnce(async (_: any, data: any) => {
+      await data.loopBeforeDispatch(); data.loopDispatchConfirmed()
+      data.onEvent('run.started', { run_id: 'run' })
+      data.loopProof({ done: true, run_id: 'run', session_id: 'session', status: 'complete', ...change })
+      data.onEvent(event, { run_id: 'run', message_id: '1' })
+    })
+    await settle(runtime)
+    expect(host.run).toHaveBeenCalledOnce()
+    expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: outcome, not_started: false }))
+    expect(host.request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'abandon' }))
+    // Fixture list remains due; real-store no-replay is exercised separately.
+  })
+  it('rejects cross-profile rebinding before native dispatch', async () => {
+    const { host, runtime } = fixture()
+    host.run.mockImplementationOnce(async (_: any, data: any) => {
+      rows.get('session').profile = 'beta'
+      await data.loopBeforeDispatch()
+    })
+    await settle(runtime)
+    expect(host.request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'inject' }))
+    expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: 'abandon' }))
   })
   it('does not count a successful-looking callback without native completion proof', async () => {
     const { host, runtime } = fixture()
@@ -65,7 +250,7 @@ describe('native loop runtime dispatch evidence', () => {
   it('routes scheduled commands through the command dispatcher, never through model fallback', async () => {
     const { host, runtime } = fixture()
     host.request.mockImplementation(async (data: any) => data.action === 'loop_list'
-      ? { loops: [{ session_id: 'session', route: { profile: 'alpha' }, next_due_at: 0 }] }
+      ? { loops: [{ session_id: 'session', route: { profile: 'alpha' }, generation: 2, next_due_at: 0 }] }
       : data.op === 'claim' ? { claimed: true, generation: 2, prompt: '/status' } : { authorized: true })
     await settle(runtime)
     expect(host.command).toHaveBeenCalledOnce()

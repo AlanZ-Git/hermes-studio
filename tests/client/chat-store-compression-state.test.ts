@@ -1,5 +1,13 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { shallowMount } from '@vue/test-utils'
+import MessageList from '@/components/hermes/chat/MessageList.vue'
+
+vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
+vi.mock('naive-ui', async importOriginal => ({
+  ...await importOriginal<typeof import('naive-ui')>(),
+  useMessage: () => ({ success: vi.fn(), error: vi.fn() }),
+}))
 import { createPinia, setActivePinia } from 'pinia'
 vi.mock('@/api/studio/background-status', () => ({ observeBackgroundStatus: vi.fn(() => vi.fn()) }))
 import { nextTick } from 'vue'
@@ -110,6 +118,109 @@ describe('chat store compression state', () => {
       handlers = registeredHandlers
       return vi.fn()
     })
+  })
+
+  afterEach(() => vi.useRealTimers())
+
+  it('renders an idle failure beyond five seconds and clears it only on compression retry or recovery', async () => {
+    vi.useFakeTimers()
+    const store = useChatStore()
+    store.sessions = [makeSession('session-2')]
+    chatApi.resumeSession.mockImplementationOnce((session_id, callback) => {
+      callback({ session_id, messages: [], isWorking: true, events: [] })
+      return {} as any
+    })
+    await store.switchSession('session-2')
+    let events = handlers
+    const wrapper = shallowMount(MessageList, {
+      global: { stubs: { VirtualMessageList: { template: '<div><slot name="after" /></div>', methods: { isNearBottom: () => true, shouldAutoFollowBottom: () => true, scrollToBottom: vi.fn(), captureScrollPosition: () => null, captureViewportPosition: () => null } } } },
+    })
+    events.onCompressionCompleted({ event: 'compression.completed', session_id: 'session-2', compressed: false, error: 'Synthetic provider timeout' })
+    events.onRunCompleted({ event: 'run.completed', parsed_content: 'Synthetic answer' })
+    await nextTick()
+    expect(store.isRunActive).toBe(false)
+    expect(wrapper.text()).toContain('Synthetic provider timeout')
+    expect(wrapper.text()).toContain('chat.compressionFailed')
+    expect(wrapper.text()).not.toContain('Compression skipped')
+    await vi.advanceTimersByTimeAsync(5001)
+    expect(wrapper.text()).toContain('Synthetic provider timeout')
+
+    await store.switchSession('session-2')
+    expect(store.compressionState?.error).toBe('Synthetic provider timeout')
+    store.newChat()
+    await nextTick()
+    expect(store.compressionState).toBeNull()
+    expect(wrapper.text()).not.toContain('Synthetic provider timeout')
+    chatApi.resumeSession.mockImplementationOnce((session_id, callback) => {
+      callback({ session_id, messages: [], isWorking: true, events: [] })
+      return {} as any
+    })
+    await store.switchSession('session-2')
+    events = handlers
+    expect(wrapper.text()).toContain('Synthetic provider timeout')
+
+    events.onCompressionStarted({ event: 'compression.started', session_id: 'session-2' })
+    await nextTick()
+    expect(store.compressionState?.compressing).toBe(true)
+    expect(wrapper.text()).not.toContain('Synthetic provider timeout')
+    events.onCompressionCompleted({ event: 'compression.completed', session_id: 'session-2', compressed: true })
+    await nextTick()
+    expect(store.compressionState?.compressed).toBe(true)
+    await vi.advanceTimersByTimeAsync(5001)
+    expect(store.compressionState).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('does not let an old completion timer hide a newer failure or completion', async () => {
+    vi.useFakeTimers()
+    const store = useChatStore()
+    store.sessions = [makeSession('session-2')]
+    chatApi.resumeSession.mockImplementationOnce((session_id, callback) => {
+      callback({ session_id, messages: [], isWorking: true, events: [] })
+      return {} as any
+    })
+    await store.switchSession('session-2')
+    handlers.onCompressionCompleted({ event: 'compression.completed', compressed: true })
+    await vi.advanceTimersByTimeAsync(4000)
+    handlers.onCompressionCompleted({ event: 'compression.completed', compressed: false, error: 'Later failure' })
+    await vi.advanceTimersByTimeAsync(1001)
+    expect(store.compressionState?.error).toBe('Later failure')
+    handlers.onCompressionStarted({ event: 'compression.started' })
+    handlers.onCompressionCompleted({ event: 'compression.completed', compressed: true, afterTokens: 42 })
+    await vi.advanceTimersByTimeAsync(4000)
+    handlers.onCompressionCompleted({ event: 'compression.completed', compressed: true, afterTokens: 21 })
+    await vi.advanceTimersByTimeAsync(1001)
+    expect(store.compressionState?.afterTokens).toBe(21)
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(store.compressionState).toBeNull()
+  })
+
+  it('keeps replayed idle errors and handles active-socket failure, retry, and recovery', async () => {
+    vi.useFakeTimers()
+    const store = useChatStore()
+    store.sessions = [makeSession('session-2')]
+    chatApi.resumeSession.mockImplementationOnce((session_id, callback) => {
+      callback({ session_id, messages: [], isWorking: false, events: [
+        { data: { event: 'compression.completed', compressed: false, error: 'Replayed failure' } },
+      ] })
+      return {} as any
+    })
+    await store.switchSession('session-2')
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(store.compressionState?.error).toBe('Replayed failure')
+    await store.sendMessage('Synthetic retry')
+    const onEvent = chatApi.startRunViaSocket.mock.calls.at(-1)?.[1]
+    onEvent({ event: 'run.started', session_id: 'session-2' })
+    expect(store.compressionState?.error).toBe('Replayed failure')
+    onEvent({ event: 'compression.started', session_id: 'session-2' })
+    expect(store.compressionState?.error).toBeUndefined()
+    onEvent({ event: 'compression.completed', session_id: 'session-2', compressed: false, error: 'Live failure' })
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(store.compressionState?.error).toBe('Live failure')
+    onEvent({ event: 'compression.completed', session_id: 'session-2', compressed: true })
+    expect(store.compressionState?.error).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(5001)
+    expect(store.compressionState).toBeNull()
   })
 
   it('does not show a background session compression indicator in the active session', async () => {

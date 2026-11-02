@@ -2,6 +2,17 @@ import { request, getApiKey, getBaseUrlValue } from '../client'
 import type { ProviderApiMode } from './provider-api-mode'
 import { fetchAuthenticatedBlob, saveBlob } from './binary-content'
 
+export interface ReasoningDefault {
+  profile: string
+  model: string
+  effectiveEffort: string | null
+  status: 'resolved' | 'provider-default' | 'unknown'
+}
+
+export function fetchReasoningDefault(profile: string, model: string) {
+  return request<ReasoningDefault>(`/api/studio/sessions/reasoning-default?${new URLSearchParams({ profile, model })}`)
+}
+
 export interface SessionSummary {
   id: string
   profile?: string | null

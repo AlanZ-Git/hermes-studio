@@ -55,7 +55,6 @@ async function gate(attempt: string): Promise<void> {
     await new Promise<void>((done, fail) => {
       const timer = setInterval(() => {
         try {
-          if (Date.now() - start > 300000) throw new Error('maintenance timeout')
           if (!existsSync(resolve(root, 'release.json'))) return
           const release = readPrivate(resolve(root, 'release.json'))
           const fence = readPrivate(resolve(root, 'business-fence.json'))

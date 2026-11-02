@@ -304,7 +304,18 @@ export function buildResumeEvents(events: RunEventRecord[], nowMs = Date.now()):
     if (entry.event === 'approval.requested' || entry.event === 'clarify.requested') {
       const timeoutMs = Number(data?.timeout_ms)
       const requestedAt = Number(data?.requested_at)
-      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      const deadlineMs = Number(data?.deadline_ms)
+      const remainingMs = Number(data?.remaining_timeout_ms)
+      if (entry.event === 'approval.requested' && (Number.isFinite(deadlineMs) || Number.isFinite(remainingMs))) {
+        const elapsedMs = Number.isFinite(requestedAt) && requestedAt > 0 ? Math.max(0, nowMs - requestedAt) : 0
+        data = {
+          ...data,
+          remaining_timeout_ms: Math.max(0, Math.trunc(Math.min(
+            Number.isFinite(deadlineMs) ? deadlineMs - nowMs : Infinity,
+            Number.isFinite(remainingMs) ? remainingMs - elapsedMs : Infinity,
+          ))),
+        }
+      } else if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
         const elapsedMs = Number.isFinite(requestedAt) && requestedAt > 0
           ? Math.max(0, nowMs - requestedAt)
           : 0

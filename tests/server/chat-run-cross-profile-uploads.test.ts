@@ -55,10 +55,12 @@ vi.mock('../../packages/server/src/modules/studio/services/chat-run/handle-codin
   handleCodingAgentRun: handleCodingAgentRunMock,
 }))
 
+const handleSessionCommandMock = vi.hoisted(() => vi.fn())
+const parseSessionCommandMock = vi.hoisted(() => vi.fn(() => null as any))
 vi.mock('../../packages/server/src/modules/studio/services/chat-run/session-command', () => ({
-  handleSessionCommand: vi.fn(),
+  handleSessionCommand: handleSessionCommandMock,
   isSessionCommand: vi.fn(() => false),
-  parseSessionCommand: vi.fn(() => null),
+  parseSessionCommand: parseSessionCommandMock,
 }))
 
 vi.mock('../../packages/server/src/modules/hermes/services/bridge/index', () => ({
@@ -182,6 +184,7 @@ async function harness(profile = 'research', shared = false) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  parseSessionCommandMock.mockReturnValue(null)
   uploads.clear()
   getSessionMock.mockImplementation((id?: string) => id && id !== 'pending'
     ? { id, profile: id === 'other-session' ? 'private' : 'default', source: 'cli', model: 'gpt-test', provider: 'openai' }
@@ -197,11 +200,29 @@ async function upload(profile = 'default', name = '0123456789abcdef.txt') {
   return path
 }
 
+it('passes loop request correlation through socket admission to the native handler', async () => {
+  parseSessionCommandMock.mockReturnValue({ name: 'loop', rawName: 'loop', args: 'status' })
+  const { run, agent, server } = await harness('default')
+  await run({ session_id: 'session-1', profile: 'default', input: '/loop status', request_id: 'synthetic-request' })
+  expect(handleSessionCommandMock).toHaveBeenCalledWith('session-1', expect.objectContaining({ name: 'loop' }), expect.objectContaining({ requestId: 'synthetic-request', profile: 'default' }))
+  expect(agent).not.toHaveBeenCalled()
+  await server.close()
+})
+
+it('returns profile admission errors as correlated nonterminal loop receipts', async () => {
+  const { run, agent, socket, server } = await harness('default')
+  await run({ session_id: 'other-session', profile: 'private', input: '/loop status', request_id: 'synthetic-request' })
+  expect(socket.emit).toHaveBeenCalledWith('session.command', expect.objectContaining({ session_id: 'other-session', profile: 'private', request_id: 'synthetic-request', ok: false, action: 'loop', control: true, terminal: false }))
+  expect(agent).not.toHaveBeenCalled()
+  await server.close()
+})
+
 it.each([{ input: 'hello' }, { input: [{ type: 'text', text: 'hello' }] }])('runs cross-profile text input $input', async ({ input }) => {
   const { run, agent, socket, server } = await harness()
   await run({ session_id: 'session-1', source: 'cli', input })
   expect(socket.emit).not.toHaveBeenCalledWith('run.failed', expect.anything())
-  expect(agent).toHaveBeenCalledWith(socket, expect.objectContaining({ input }), 'default', false, undefined, undefined)
+  expect(agent).toHaveBeenCalledWith(socket, expect.objectContaining({ input }), 'default', false, undefined, undefined,
+    { isCurrent: expect.any(Function), onMarker: expect.any(Function) })
   await server.close()
 })
 

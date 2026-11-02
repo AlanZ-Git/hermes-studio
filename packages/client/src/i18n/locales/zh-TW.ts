@@ -1120,6 +1120,7 @@ export default {
 
   // 對話
   chat: {
+    compressionFailed: '上下文壓縮失敗',
     selectMessages: "多選訊息",
     messagesSelected: "已選 {count} 則",
     deleteSelectedMessages: "刪除所選",
@@ -1280,6 +1281,10 @@ export default {
     },
     attachFiles: '新增附件',
     reasoningEffort: {
+      inherited: '預設（{effort}）',
+      providerDefault: '供應商預設',
+      unknown: '未知',
+      unsupported: '此模型不支援',
       tooltip: '推理強度',
       dragHint: '拖曳選擇 · 共 {count} 檔',
       defaultLabel: '預設',

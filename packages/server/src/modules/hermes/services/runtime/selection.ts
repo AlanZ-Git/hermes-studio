@@ -1,3 +1,4 @@
+import { hasExplicitHermesBinding, validateExplicitHermesBinding } from './explicit-binding'
 import { existsSync } from 'fs'
 import { homedir } from 'os'
 import { delimiter, dirname, join } from 'path'
@@ -16,12 +17,19 @@ import {
 } from './version-manager'
 
 export interface HermesRuntimeSelection {
-  source: 'user-cli' | 'managed-runtime' | 'none'
+  source: 'user-cli' | 'managed-runtime' | 'explicit-binding' | 'none'
   path: string
   version: string
   managedRuntimeVersion?: string
   pythonPath?: string
   agentRoot?: string
+}
+
+// Discovery writes caller-facing binding variables; only its unchanged output is not explicit input.
+const discoveredBindings = new WeakMap<NodeJS.ProcessEnv, string>()
+
+function bindingIdentity(env: NodeJS.ProcessEnv): string {
+  return JSON.stringify([env.HERMES_AGENT_ROOT, env.HERMES_AGENT_BRIDGE_PYTHON, env.HERMES_AGENT_CLI_PYTHON])
 }
 
 function desktopSelectionLocked(env: NodeJS.ProcessEnv): boolean {
@@ -226,18 +234,31 @@ function applyManagedRuntime(env: NodeJS.ProcessEnv, runtime: InstalledRuntimeVe
   }
 }
 
-/**
- * Select the Hermes executable for this server process.
- *
- * A usable user-owned CLI always wins. A visible CLI that cannot report its
- * version is not safe to run from this process environment, so fall back to
- * Studio Runtime instead.
- */
 export async function configurePreferredHermesRuntime(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<HermesRuntimeSelection> {
   const lockedDesktopSelection = readLockedDesktopHermesSelection(env)
   if (lockedDesktopSelection) return lockedDesktopSelection
+
+  if (env.HERMES_DESKTOP?.trim().toLowerCase() !== 'true'
+    && hasExplicitHermesBinding(env)
+    && discoveredBindings.get(env) !== bindingIdentity(env)) {
+    const probe = await validateExplicitHermesBinding(env)
+    discoveredBindings.delete(env)
+    const { python, root } = probe
+    env.HERMES_AGENT_ROOT = root
+    env.HERMES_AGENT_BRIDGE_PYTHON = python
+    env.HERMES_AGENT_CLI_PYTHON = python
+    env.HERMES_BIN = python
+    env.HERMES_RUNTIME_SOURCE = 'explicit-binding'
+    env.HERMES_RUNTIME_VERSION = probe.version
+    env.VIRTUAL_ENV = probe.prefix
+    env.UV_PROJECT_ENVIRONMENT = probe.prefix
+    env.UV_PYTHON = python
+    if (process.platform !== 'win32') env.UV_SYSTEM_PYTHON = '1'
+    prependPath(env, [dirname(python)])
+    return { source: 'explicit-binding', path: python, version: probe.version, pythonPath: python, agentRoot: root }
+  }
 
   addUserHermesBinDirectory(env)
   const active = readActiveVersionManifest()
@@ -250,7 +271,9 @@ export async function configurePreferredHermesRuntime(
   )
   if (userCli) {
     prepareRuntimeSelectionEnvironment(env, runtimeCandidates)
-    return applyUserCli(env, userCli)
+    const selected = applyUserCli(env, userCli)
+    discoveredBindings.set(env, bindingIdentity(env))
+    return selected
   }
 
   const currentPlatform = `${process.platform === 'win32' ? 'win' : process.platform === 'darwin' ? 'mac' : process.platform}-${process.arch}`
@@ -312,6 +335,7 @@ export async function configurePreferredHermesRuntime(
     selected.version = probe.version
     env.HERMES_RUNTIME_VERSION = probe.version
     recordRuntimeSelectionResult(managedFailures, runtime)
+    discoveredBindings.set(env, bindingIdentity(env))
     return selected
   }
 

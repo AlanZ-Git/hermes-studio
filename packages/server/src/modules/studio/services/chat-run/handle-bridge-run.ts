@@ -1,4 +1,4 @@
-import { beginKanbanConsumption, completeKanbanConsumption, consumeStoppedKanbanNotification, kanbanNotificationReceipt, settleKanbanConsumption } from '../../repositories/kanban-notification-store'
+import { beginKanbanConsumption, completeKanbanConsumption, consumePendingKanbanNotification, consumeStoppedKanbanNotification, diagnosePendingKanbanNotification, kanbanNotificationReceipt, settleKanbanConsumption } from '../../repositories/kanban-notification-store'
 import { studioSessionAccount } from '../../contracts/runs/usage'
 import { completeRunUsage } from '../../repositories/run-usage-store'
 import { hermesStudioMcpCapabilities } from './studio-mcp'
@@ -468,6 +468,11 @@ async function ensureBridgeFixedContext(args: {
   }
 }
 
+export interface BridgeRunPreparation {
+  isCurrent: () => boolean
+  onMarker: (marker: string) => void
+}
+
 export async function handleBridgeRun(
   nsp: ReturnType<Server['of']>,
   socket: Socket,
@@ -479,6 +484,7 @@ export async function handleBridgeRun(
   loadSessionStateFromDbFn: (sid: string, sessionMap: Map<string, SessionState>) => Promise<SessionState>,
   dequeueNextQueuedRun: (socket: Socket, sessionId: string, fallbackProfile?: string) => void,
   backgroundContinuationContext?: BackgroundContinuationContext,
+  preparation?: BridgeRunPreparation,
 ) {
   const { input, session_id, instructions } = data
   const runSource = normalizeBridgeRunSource(data.source, data.session_source)
@@ -586,6 +592,7 @@ export async function handleBridgeRun(
   state.profile = profile
   state.source = runSource
   state.activeRunMarker = runMarker
+  preparation?.onMarker(runMarker)
   state.runId = undefined
   state.abortController = undefined
   state.bridgeOutput = ''
@@ -735,6 +742,34 @@ export async function handleBridgeRun(
   const kanbanDelivery = data.background_notification_kind === 'kanban' ? data.background_delegation_id : undefined
   let kanbanDispatched = false
   let kanbanSettled = false
+  let verifiedStudioNotification = false
+  const verifyKanbanNotification = async () => {
+    if ((data.autonomous || data.background_delegation_id) && state.backgroundWakeStopped) return false
+    if (!kanbanDelivery) return true
+    const receipt = kanbanNotificationReceipt(kanbanDelivery)
+    if (!receipt || receipt.session_id !== session_id || receipt.profile !== profile) throw new Error('Kanban receipt target changed')
+    if (receipt.consumer_state !== 'pending') return false
+    const notification = JSON.parse(receipt.notification)
+    const current = await bridge.request({ action: 'background_notification_status', session_id,
+      profile, delegation_id: kanbanDelivery, notification_identity: notification.identity,
+      board_db_identity: notification.board_db_identity })
+    if (sessionMap.get(session_id) !== state || state.activeRunMarker !== runMarker || state.backgroundWakeStopped) return false
+    if (!current.current) throw new Error('Kanban notification source identity must be reconciled before consumption')
+    if (current.execution_stopped) {
+      kanbanSettled = consumeStoppedKanbanNotification(kanbanDelivery, session_id)
+      return false
+    }
+    if (notification.studio_auto_continue === 'v1') {
+      if (current.studio_auto_continue !== 'v1') throw new Error('Studio automatic subscription must be reconciled before consumption')
+      if (current.stale_result || current.wake_eligible !== true) {
+        kanbanSettled = consumePendingKanbanNotification(kanbanDelivery, session_id,
+          current.stale_result ? 'Obsolete source result: no model dispatch' : 'Passive event: no model dispatch')
+        return false
+      }
+      verifiedStudioNotification = true
+    }
+    return true
+  }
   const finishWithoutModel = () => {
     if (state.activeRunMarker !== runMarker) return
     state.isWorking = false
@@ -750,23 +785,12 @@ export async function handleBridgeRun(
   // Inside the run's failure cleanup: a pre-run error (e.g. context window too small) must settle this run.
   try {
     data.loopAuthorize?.()
-    if (kanbanDelivery) {
-      const receipt = kanbanNotificationReceipt(kanbanDelivery)
-      if (!receipt || receipt.session_id !== session_id || receipt.profile !== profile) throw new Error('Kanban receipt target changed')
-      const notification = JSON.parse(receipt.notification)
-      const current = await bridge.request({ action: 'background_notification_status', session_id,
-        profile, delegation_id: kanbanDelivery, notification_identity: notification.identity,
-        board_db_identity: notification.board_db_identity })
-      if (!current.current) throw new Error('Kanban notification source identity must be reconciled before consumption')
-      if (current.execution_stopped) {
-        kanbanSettled = consumeStoppedKanbanNotification(kanbanDelivery, session_id)
-        finishWithoutModel()
-        return
-      }
-    }
-    if (kanbanDelivery && kanbanNotificationReceipt(kanbanDelivery)?.consumer_state !== 'pending') {
+    if (!await verifyKanbanNotification()) {
       finishWithoutModel()
       return
+    }
+    if (verifiedStudioNotification) {
+      fullInstructions += '\nThis Kanban notification is a verification trigger, not authorization or proof of business completion. Read the latest task details, current run and relevant artifacts using the existing tools before deciding whether any continuation is needed. Act only within the original conversation authority; do not resume stopped task chains or loops. If no action is needed, explain that conclusion with evidence.'
     }
     modelRunAuth = await createModelRunSource(socketUser, profile, runMarker)
     state.modelRunAuth = modelRunAuth
@@ -814,6 +838,7 @@ export async function handleBridgeRun(
           return contextTokens
         },
         currentInputTokens,
+        shouldPersistUserMessage,
       )
     const bridgeHistory = history
     const originalBridgeInput = isContentBlockArray(input)
@@ -857,6 +882,10 @@ export async function handleBridgeRun(
     }, '[chat-run-socket] starting CLI bridge run')
     await data.loopBeforeDispatch?.()
     if (sessionMap.get(session_id) !== state || state.activeRunMarker !== runMarker) return
+    if (!await verifyKanbanNotification()) {
+      finishWithoutModel()
+      return
+    }
     data.loopAuthorize?.()
     data.loopDispatchConfirmed?.()
     // Stay recoverably pending throughout preparation. Once dispatch may have
@@ -1021,6 +1050,9 @@ export async function handleBridgeRun(
       )
     }
   } catch (err: any) {
+    if (kanbanDelivery && !kanbanDispatched) {
+      diagnosePendingKanbanNotification(kanbanDelivery, session_id, String(err))
+    }
     if (kanbanDelivery && kanbanDispatched && !kanbanSettled) {
       settleKanbanConsumption(kanbanDelivery, session_id, runMarker, 'uncertain', String(err))
     }
@@ -1178,7 +1210,8 @@ export async function resumeBridgeRun(
     const output = typeof snapshot.output === 'string' ? snapshot.output : deltas.join('')
     const persisted = state.bridgeOutput || ''
     const missingOutput = output && output.startsWith(persisted) ? output.slice(persisted.length) : ''
-    if (missingOutput) {
+    const approvalEvents = snapshotEvents.filter((event: { event?: string } | null) => event?.event === 'approval.requested' || event?.event === 'approval.resolved')
+    if (missingOutput || approvalEvents.length) {
       await applyBridgeChunkAsync(
         nsp,
         socket,
@@ -1194,7 +1227,7 @@ export async function resumeBridgeRun(
           cursor: deltas.length,
           output,
           done: false,
-          events: [],
+          events: approvalEvents,
           event_cursor: snapshotEvents.length,
           error: null,
         },
@@ -1617,31 +1650,35 @@ async function applyBridgeChunkAsync(
       emit('moa.aggregating', payload)
     } else if (evType === 'approval.requested') {
       const requestedAt = Date.now()
+      const remaining = ev.remaining_timeout_ms ?? ev.remaining_ms ?? (typeof ev.deadline_ms === 'number' ? Math.max(0, ev.deadline_ms - requestedAt) : ev.timeout_ms)
       const payload = {
         event: 'approval.requested',
-        run_id: chunk.run_id,
+        run_id: ev.run_id ?? chunk.run_id,
+        request_id: ev.request_id,
+        deadline_ms: ev.deadline_ms ?? (typeof remaining === 'number' ? requestedAt + remaining : undefined),
         approval_id: ev.approval_id,
         command: ev.command,
         description: ev.description,
         choices: ev.choices,
         allow_permanent: ev.allow_permanent,
         timeout_ms: ev.timeout_ms,
-        remaining_timeout_ms: ev.timeout_ms,
+        remaining_timeout_ms: remaining,
         requested_at: requestedAt,
       }
-      replaceState(sessionMap, sessionId, 'approval.requested', payload)
+      pushState(sessionMap, sessionId, 'approval.requested', payload)
       emit('approval.requested', payload)
     } else if (evType === 'approval.resolved') {
       const payload = {
         event: 'approval.resolved',
-        run_id: chunk.run_id,
+        run_id: ev.run_id ?? chunk.run_id,
+        request_id: ev.request_id,
         approval_id: ev.approval_id,
         choice: ev.choice,
         resolved: ev.resolved,
         terminal: ev.terminal,
         outcome: ev.outcome,
       }
-      replaceState(sessionMap, sessionId, 'approval.resolved', payload)
+      pushState(sessionMap, sessionId, 'approval.resolved', payload)
       emit('approval.resolved', payload)
     } else if (evType === 'clarify.requested') {
       const requestedAt = Date.now()

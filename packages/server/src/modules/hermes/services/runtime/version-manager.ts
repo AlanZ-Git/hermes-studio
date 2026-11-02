@@ -487,6 +487,7 @@ async function fetchRemoteVersions(): Promise<{ manifest: StudioVersionManifest 
 }
 
 async function probeHermesAgentVersion(): Promise<string> {
+  if (process.env.HERMES_RUNTIME_SOURCE === 'explicit-binding') return process.env.HERMES_RUNTIME_VERSION || ''
   try {
     return await getHermesAgentVersion()
   } catch {

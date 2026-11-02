@@ -520,10 +520,6 @@ export function pruneOldToolResults(messages: ChatMessage[], keepRecentCount: nu
   return [...pruned, ...tail]
 }
 
-function pruneFallbackToolResults(messages: ChatMessage[], keepRecentCount: number): ChatMessage[] {
-  return pruneOldToolResults(messages, keepRecentCount)
-}
-
 // ─── LLM Summarization ──────────────────────────────────
 
 export async function callSummarizer(
@@ -664,6 +660,9 @@ async function callEkkoSummarizer(
     throw new Error('Clean Ekko summarizer did not complete in one model step')
   }
   if (!output) throw new Error('Empty Ekko summarization response')
+  if (/^API call failed(?: after \d+ retries)?:/i.test(output)) {
+    throw new Error('Invalid Ekko summarization response: provider failure text')
+  }
   return output
 }
 
@@ -929,30 +928,8 @@ export class ChatContextCompressor {
       summary = await callSummarizer(upstream, apiKey, prompt, [], this.config.summarizationTimeoutMs, previousSummary, summaryOptions)
       logger.info('[context-compressor] incremental-llm done in %dms, %d chars', Date.now() - t0, summary.length)
     } catch (err: any) {
-      if (force || resummarize) throw err
-      logger.warn('[context-compressor] incremental-llm failed: %s — keeping new messages verbatim', err.message)
-      const fallback = [
-        ...head,
-        previousSummaryMessage,
-        ...newMessages,
-      ]
-      const prunedFallback = pruneFallbackToolResults(fallback, this.config.tailMessageCount)
-      const budgetedFallback = enforceCompressedBudget(prunedFallback, this.config.triggerTokens, head.length)
-      return {
-        messages: budgetedFallback,
-        meta: {
-          ...meta,
-          compressed: true,
-          llmCompressed: false,
-          summaryTokenEstimate: countTokens(SUMMARY_PREFIX + previousSummary),
-          verbatimCount: budgetedFallback.length === fallback.length ? head.length + newMessages.length : 0,
-          compressedStartIndex: lastMessageIndex,
-          ...(cursorSnapshot ? {
-            compressedThroughCursor: snapshot.compressedThroughMessageId!,
-            protectedHeadThroughCursor: snapshot.protectedHeadThroughMessageId ?? null,
-          } : {}),
-        },
-      }
+      logger.warn('[context-compressor] incremental-llm failed: %s', err.message)
+      throw err
     }
 
     let result: ChatMessage[] = [
@@ -1050,12 +1027,8 @@ export class ChatContextCompressor {
       summary = await callSummarizer(upstream, apiKey, prompt, [], this.config.summarizationTimeoutMs, undefined, summaryOptions)
       logger.info('[context-compressor] full-llm done in %dms, %d chars', Date.now() - t0, summary.length)
     } catch (err: any) {
-      if (typeof summarizer === 'object' && summarizer.force) throw err
       logger.warn('[context-compressor] full-llm failed: %s', err.message)
-    }
-
-    if (!summary) {
-      return { messages: pruneFallbackToolResults(messages, this.config.tailMessageCount), meta }
+      throw err
     }
 
     const result: ChatMessage[] = []

@@ -4,6 +4,7 @@ import { homedir } from 'os'
 import { isAbsolute, join, resolve } from 'path'
 import { promisify } from 'util'
 import { normalizeWindowsCommandPath } from '../../../studio/public/windows-command'
+import { probeExplicitHermesPython } from './explicit-binding'
 import { resolveHermesInstallationEnvironment } from './installation'
 import { isPathWithin } from './path'
 import { resolveHermesBin } from './process'
@@ -110,6 +111,15 @@ export async function probeHermesCliVersion(
   path: string,
   env: NodeJS.ProcessEnv,
 ): Promise<{ version: string; error: string }> {
+  if (env.HERMES_RUNTIME_SOURCE === 'explicit-binding' && env.HERMES_AGENT_CLI_PYTHON) {
+    try {
+      const probe = await probeExplicitHermesPython(env.HERMES_AGENT_CLI_PYTHON, env)
+      const version = typeof probe.version === 'string' ? probe.version.trim() : ''
+      return { version, error: version ? '' : 'Hermes CLI import probe returned an empty version' }
+    } catch (error) {
+      return { version: '', error: versionProbeError(error) }
+    }
+  }
   const installation = resolveHermesInstallationEnvironment(
     path,
     hermesHomeForEnvironment(env),
@@ -146,6 +156,12 @@ export async function discoverHermesCliInstallations(
   env: NodeJS.ProcessEnv = process.env,
   options: HermesCliDiscoveryOptions = {},
 ): Promise<HermesCliInstallation[]> {
+  if (env.HERMES_RUNTIME_SOURCE === 'explicit-binding') {
+    return options.source === 'managed-runtime' ? [] : [{
+      source: 'user-cli', path: env.HERMES_AGENT_CLI_PYTHON || '',
+      version: env.HERMES_RUNTIME_VERSION || '', selected: true,
+    }]
+  }
   const configuredBin = resolveHermesBin(env.HERMES_BIN)
   const commandPaths = await findHermesCommandPaths(env)
   const candidates = [

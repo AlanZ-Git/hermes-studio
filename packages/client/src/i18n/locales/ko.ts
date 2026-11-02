@@ -1106,6 +1106,7 @@ export default {
 
   // 채팅
   chat: {
+    compressionFailed: '컨텍스트 압축 실패',
     selectMessages: "메시지 선택",
     messagesSelected: "{count}개 선택됨",
     deleteSelectedMessages: "선택 항목 삭제",
@@ -1263,6 +1264,10 @@ export default {
     },
     attachFiles: '파일 첨부',
     reasoningEffort: {
+      inherited: '기본값 ({effort})',
+      providerDefault: '공급자 기본값',
+      unknown: '알 수 없음',
+      unsupported: '이 모델에서 지원하지 않음',
       tooltip: '추론 노력',
       dragHint: '드래그하여 선택 · {count}단계',
       defaultLabel: '기본값',

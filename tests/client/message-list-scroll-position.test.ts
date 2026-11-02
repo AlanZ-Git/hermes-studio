@@ -77,7 +77,7 @@ vi.mock('@/components/hermes/chat/MessageItem.vue', () => ({
 }))
 
 import MessageList from '@/components/hermes/chat/MessageList.vue'
-import { useChatStore, type Message, type Session } from '@/stores/hermes/chat'
+import { useChatStore, pendingApprovalKey, type Message, type Session } from '@/stores/hermes/chat'
 import { useProfilesStore } from '@/stores/hermes/profiles'
 
 function makeMessage(id: string): Message {
@@ -506,7 +506,7 @@ describe('MessageList session scroll position', () => {
     const session = makeSession('approval-layer-session')
     chatStore.activeSessionId = session.id
     chatStore.activeSession = session
-    chatStore.pendingApprovals.set(session.id, {
+    chatStore.pendingApprovals.set(pendingApprovalKey({ sessionId: session.id, approvalId: 'approval-layer-request' }), {
       sessionId: session.id,
       approvalId: 'approval-layer-request',
       command: 'npm run test',
@@ -548,7 +548,7 @@ describe('MessageList session scroll position', () => {
     const session = makeSession('stale-prompt-session')
     chatStore.activeSessionId = session.id
     chatStore.activeSession = session
-    chatStore.pendingApprovals.set(session.id, {
+    chatStore.pendingApprovals.set(pendingApprovalKey({ sessionId: session.id, approvalId: 'stale-approval' }), {
       sessionId: session.id,
       approvalId: 'stale-approval',
       command: 'npm run test',
@@ -579,8 +579,10 @@ describe('MessageList session scroll position', () => {
       .find(panel => panel.text().includes('chat.approvalTitle'))
     expect(approvalPanel).toBeTruthy()
     await approvalPanel!.get('.approval-float-actions button').trigger('click')
-    expect(chatStore.pendingApprovals.has(session.id)).toBe(false)
+    expect(chatStore.pendingApprovals.size).toBe(1)
+    expect(approvalPanel!.exists()).toBe(true)
     expect(chatStore.pendingClarifies.has(session.id)).toBe(true)
+    chatStore.pendingApprovals.delete(pendingApprovalKey({ sessionId: session.id, approvalId: 'stale-approval' }))
 
     await nextTick()
     const clarifyPanel = wrapper.findAll('.approval-float-panel')

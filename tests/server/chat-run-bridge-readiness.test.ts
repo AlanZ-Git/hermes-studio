@@ -835,6 +835,74 @@ describe('ChatRunSocket bridge readiness gating', () => {
     })
   })
 
+  it.each(['sync', 'async'])('releases ordinary Hermes %s prestart failure and starts the next other item', async kind => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io, socket, emitted } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    const state = { messages: [], isWorking: true, events: [], queue: [{ queue_id: 'other', input: 'next', source: 'cli' }], runStartedAt: 123 }
+    ;(server as any).sessionMap.set('session-1', state)
+    handleBridgeRunMock.mockImplementationOnce((() => {
+      if (kind === 'sync') throw new Error('preparation rejected')
+      return Promise.reject(new Error('preparation rejected'))
+    }) as any)
+    handleBridgeRunMock.mockImplementationOnce((async () => { state.isWorking = false }) as any)
+    ;(server as any).runQueuedItem(socket, 'session-1', { queue_id: 'failed', input: 'first', source: 'cli' })
+    await vi.waitFor(() => expect(handleBridgeRunMock).toHaveBeenCalledTimes(2))
+    expect(handleBridgeRunMock.mock.calls[1][2]).toMatchObject({ queue_id: 'other', input: 'next' })
+    expect(emitted).toContainEqual(expect.objectContaining({ event: 'run.failed', payload: expect.objectContaining({ queue_id: 'failed', error: 'preparation rejected' }) }))
+    expect(state.isWorking).toBe(false)
+    await server.close()
+  })
+
+  it('does not let an old rejected preparation release a new execution generation', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    const state = { messages: [], isWorking: true, events: [], queue: [], activeRunMarker: undefined as string | undefined }
+    ;(server as any).sessionMap.set('session-1', state)
+    let reject!: (error: Error) => void
+    handleBridgeRunMock.mockImplementationOnce((() => new Promise((_, fail) => { reject = fail })) as any)
+    const old = (server as any).executeRun(socket, { session_id: 'session-1', input: 'old', source: 'cli' }, 'default')
+    await vi.waitFor(() => expect(reject).toBeTypeOf('function'))
+    handleBridgeRunMock.mockImplementationOnce((async () => { state.activeRunMarker = 'replacement' }) as any)
+    await (server as any).executeRun(socket, { session_id: 'session-1', input: 'new', source: 'cli' }, 'default')
+    reject(new Error('old rejection'))
+    await old.catch(() => {})
+    expect(state).toMatchObject({ isWorking: true, activeRunMarker: 'replacement' })
+    expect(socket.emit).not.toHaveBeenCalledWith('run.failed', expect.anything())
+    await server.close()
+  })
+
+  it('does not release a replacement marker installed through another entry while preparation waits', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    const state = { messages: [], isWorking: true, events: [], queue: [], activeRunMarker: undefined as string | undefined }
+    ;(server as any).sessionMap.set('session-1', state)
+    handleBridgeRunMock.mockImplementationOnce((async () => {
+      await Promise.resolve()
+      state.activeRunMarker = 'other-entry-generation'
+      throw new Error('superseded preparation')
+    }) as any)
+    await (server as any).executeRun(socket, { session_id: 'session-1', input: 'old', source: 'cli' }, 'default')
+    expect(state).toMatchObject({ isWorking: true, activeRunMarker: 'other-entry-generation' })
+    expect(socket.emit).not.toHaveBeenCalledWith('run.failed', expect.anything())
+    await server.close()
+  })
+
+  it('refreshes a queued Kanban continuation from the original session current model and provider', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    getSessionMock.mockReturnValue({ id: 'session-1', profile: 'default', source: 'cli', model: 'current-model', provider: 'current-provider' })
+    ;(server as any).sessionMap.set('session-1', { messages: [], isWorking: true, events: [], queue: [] })
+    ;(server as any).runQueuedItem(socket, 'session-1', { input: 'verify', displayInput: null, model: 'stale-model', provider: 'stale-provider',
+      backgroundNotificationKind: 'kanban', backgroundDelegationId: 'kanban:test', autonomous: true, source: 'cli' })
+    await vi.waitFor(() => expect(handleBridgeRunMock).toHaveBeenCalledTimes(1))
+    expect(handleBridgeRunMock.mock.calls[0][2]).toMatchObject({ session_id: 'session-1', model: 'current-model', provider: 'current-provider' })
+    await server.close()
+  })
+
   it('recovers the terminal result of a cached run that lost its consumer', async () => {
     const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { handlers, io, socket } = makeServerHarness()
@@ -1455,7 +1523,8 @@ describe('session upload provenance at the socket boundary', () => {
     const input = [{ type, path: '/uploads/attachment.txt', name: 'attachment.txt', text: 'hello' }]
     await handlers.get('run')!({ session_id: 'new-local-session', profile: 'default', input })
     expect(socket.emit).not.toHaveBeenCalledWith('run.failed', expect.anything())
-    expect(run).toHaveBeenCalledWith(socket, expect.objectContaining({ session_id: 'new-local-session', input }), 'default', false, undefined, undefined)
+    expect(run).toHaveBeenCalledWith(socket, expect.objectContaining({ session_id: 'new-local-session', input }), 'default', false, undefined, undefined,
+      { isCurrent: expect.any(Function), onMarker: expect.any(Function) })
     expect(recordSessionUploadAttachmentsMock).toHaveBeenCalledWith('new-local-session', 'default', input, { allowPendingSession: true })
   })
 

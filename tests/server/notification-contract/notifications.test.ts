@@ -80,6 +80,33 @@ it('keeps internal consumption pending across a supervision pause and delivers s
   expect(store.getSessionDetail('session-one').messages.filter((m: any) => m.run_marker === item.delegation_id)).toHaveLength(1)
 })
 
+it('only queues eligible events for newly marked Studio automatic subscriptions', async () => {
+  const { obj, state } = handler()
+  for (const [kind, eligible] of [['completed', true], ['status', false], ['unknown', false]] as const) {
+    await obj.scheduleBackgroundNotification(notice(`marked-${kind}`, { delivery_mode: 'notify+wake',
+      studio_auto_continue: 'v1', wake_eligible: eligible, event: { kind } }))
+  }
+  expect(state.queue.map((item: any) => item.backgroundDelegationId)).toEqual(['kanban:marked-completed'])
+})
+
+it('claims only the exact delivery once, preserves uncertain state, and adds no reservation schema', async () => {
+  const inbox = await import('../../../packages/server/src/modules/studio/repositories/kanban-notification-store')
+  for (const id of ['result-one', 'result-two']) inbox.receiveKanbanNotification(notice(id), true)
+  expect(inbox.beginKanbanConsumption('kanban:result-one', 'wrong-session', 'wrong-marker')).toBe(false)
+  expect(inbox.beginKanbanConsumption('kanban:result-one', 'session-one', 'marker-one')).toBe(true)
+  expect(inbox.beginKanbanConsumption('kanban:result-one', 'session-one', 'marker-two')).toBe(false)
+  expect(inbox.beginKanbanConsumption('kanban:result-two', 'session-one', 'marker-two')).toBe(true)
+  inbox.settleKanbanConsumption('kanban:result-one', 'session-one', 'wrong-marker', 'consumed')
+  expect(inbox.kanbanNotificationReceipt('kanban:result-one').consumer_state).toBe('running')
+  inbox.settleKanbanConsumption('kanban:result-one', 'session-one', 'marker-one', 'uncertain', 'transport unknown')
+  database.closeDb()
+  expect(inbox.beginKanbanConsumption('kanban:result-one', 'session-one', 'retry')).toBe(false)
+  expect(inbox.kanbanNotificationReceipt('kanban:result-one')).toMatchObject({ consumer_state: 'uncertain', error: 'transport unknown' })
+  const columns = database.getDb().prepare('PRAGMA table_info(kanban_notification_receipts)').all().map((c: any) => c.name)
+  expect(columns).toEqual(['delivery_id', 'session_id', 'profile', 'identity', 'notification', 'message_id', 'consumer_state', 'run_marker', 'error'])
+  expect(database.getDb().prepare("SELECT name FROM sqlite_master WHERE name='kanban_notification_result'").all()).toEqual([])
+})
+
 it('does not hide notification recovery routes because the session is old', () => {
   store.createSession({ id: 'old-target', profile: 'default', source: 'cli', agent: 'hermes' })
   database.getDb().prepare('UPDATE sessions SET last_active=1 WHERE id=?').run('old-target')

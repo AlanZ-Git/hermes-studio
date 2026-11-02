@@ -1,10 +1,12 @@
 import { createServer } from 'http'
-import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, describe, expect, it } from 'vitest'
 import pkg from '../../package.json'
+
+const syntheticJwt = [Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url'), Buffer.from(JSON.stringify({ type: 'access', aud: 'hermes-studio', sub: '1', username: 'fixture', role: 'super_admin', exp: 4102444800 })).toString('base64url'), 'c3ludGhldGlj'].join('.')
 
 function writeRpc(child: ChildProcessWithoutNullStreams, id: number, method: string, params?: unknown) {
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
@@ -49,7 +51,7 @@ describe('hermes-web-ui MCP server', () => {
     const home = mkdtempSync(join(tmpdir(), 'hermes-web-ui-mcp-'))
     homes.push(home)
     mkdirSync(join(home, 'profiles', 'research'), { recursive: true })
-    writeFileSync(join(home, 'profiles', 'research', '.model-run-token'), 'profile-token\n')
+    writeFileSync(join(home, 'profiles', 'research', '.model-run-token'), `${syntheticJwt}\n`)
     let chatRunHits = 0
 
     const server = createServer((req, res) => {
@@ -143,7 +145,7 @@ describe('hermes-web-ui MCP server', () => {
       env: {
         ...process.env,
         HERMES_WEB_UI_URL: `http://127.0.0.1:${address.port}`,
-        HERMES_WEB_UI_HOME: home,
+        HERMES_WEB_UI_HOME: home, HERMES_WEB_UI_TOKEN: '',
         HERMES_WEB_UI_PROFILE: 'research',
         AUTH_TOKEN: '',
       },
@@ -218,7 +220,7 @@ describe('hermes-web-ui MCP server', () => {
       url: '/api/test-public-requester?q=hello',
       body: { ok: true },
       profile: 'research',
-      authorization: 'Bearer profile-token',
+      authorization: `Bearer ${syntheticJwt}`,
     })
     writeRpc(child, 11, 'tools/call', {
       name: 'hermes_studio_api_request',
@@ -363,7 +365,7 @@ describe('hermes-web-ui MCP server', () => {
   it('excludes shared planning from Ekko discovery and rejects direct, aliased and catalog calls', async () => {
     const responses = new Map<number, any>()
     child = spawn(process.execPath, ['bin/ekko-studio-mcp.mjs', 'use'], {
-      cwd: process.cwd(), env: { ...process.env, HERMES_MCP_NATIVE_TASK_PLAN: '1' },
+      cwd: process.cwd(), env: { ...process.env, HERMES_WEB_UI_TOKEN: syntheticJwt, HERMES_MCP_NATIVE_TASK_PLAN: '1' },
     })
     let buffer = ''
     child.stdout.on('data', chunk => {
@@ -421,7 +423,7 @@ describe('hermes-web-ui MCP server', () => {
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     const responses = new Map<number, any>()
     child = spawn(process.execPath, ['bin/ekko-studio-mcp.mjs', 'plan'], {
-      cwd: process.cwd(), env: { ...process.env, HERMES_WEB_UI_URL: `http://127.0.0.1:${(server.address() as any).port}`, HERMES_WEB_UI_PROFILE: 'research', HERMES_MCP_USER_CLARIFICATION: '1' },
+      cwd: process.cwd(), env: { ...process.env, HERMES_WEB_UI_TOKEN: syntheticJwt, HERMES_WEB_UI_URL: `http://127.0.0.1:${(server.address() as any).port}`, HERMES_WEB_UI_PROFILE: 'research', HERMES_MCP_USER_CLARIFICATION: '1' },
     })
     let buffer = ''
     child.stdout.on('data', chunk => {
@@ -435,7 +437,7 @@ describe('hermes-web-ui MCP server', () => {
     try {
       writeRpc(child, 1, 'tools/list')
       const tools = (await waitForRpc(responses, 1)).result.tools
-      expect(tools.map((tool: any) => tool.name)).toEqual(['ekko_studio_clarify', 'ekko_studio_update_plan', 'ekko_studio_list_session_tasks', 'ekko_studio_update_session_tasks'])
+      expect(tools.map((tool: any) => tool.name)).toEqual(['ekko_studio_clarify', 'ekko_studio_update_plan'])
       expectProviderSafeToolNames('ekko-studio-interaction', tools)
       expect(tools[0].inputSchema.required).toEqual(['context_id', 'question'])
       const input = { context_id: 'current-turn', question: 'Which folder?', choices: ['client', 'server'] }
@@ -476,7 +478,7 @@ describe('hermes-web-ui MCP server', () => {
     const port = (server.address() as any).port
     const responses = new Map<number, any>()
     child = spawn(process.execPath, ['bin/ekko-studio-mcp.mjs', 'plan'], {
-      cwd: process.cwd(), env: { ...process.env, HERMES_WEB_UI_URL: `http://127.0.0.1:${port}`, HERMES_MCP_NATIVE_TASK_PLAN: native ? '1' : '0', HERMES_MCP_USER_CLARIFICATION: agent === 'hermes' ? '0' : '1' },
+      cwd: process.cwd(), env: { ...process.env, HERMES_WEB_UI_TOKEN: syntheticJwt, HERMES_WEB_UI_URL: `http://127.0.0.1:${port}`, HERMES_MCP_NATIVE_TASK_PLAN: native ? '1' : '0', HERMES_MCP_USER_CLARIFICATION: agent === 'hermes' ? '0' : '1' },
     })
     let buffer = ''
     child.stdout.on('data', chunk => {
@@ -490,7 +492,7 @@ describe('hermes-web-ui MCP server', () => {
     try {
       writeRpc(child, 1, 'tools/list')
       const tools = (await waitForRpc(responses, 1)).result.tools
-      expect(tools.map((tool: any) => tool.name)).toEqual(native ? [] : clarify ? ['ekko_studio_clarify', 'ekko_studio_update_plan', 'ekko_studio_list_session_tasks', 'ekko_studio_update_session_tasks'] : ['ekko_studio_update_plan', 'ekko_studio_list_session_tasks', 'ekko_studio_update_session_tasks'])
+      expect(tools.map((tool: any) => tool.name)).toEqual(native ? [] : clarify ? ['ekko_studio_clarify', 'ekko_studio_update_plan'] : ['ekko_studio_update_plan'])
       writeRpc(child, 5, 'initialize', {})
       const instructions = (await waitForRpc(responses, 5)).result.instructions
       if (!native) {
@@ -549,7 +551,7 @@ describe('hermes-web-ui MCP server', () => {
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     const startClient = () => {
       const client = spawn(globalThis.process.execPath, ['bin/ekko-studio-mcp.mjs', 'plan'], {
-        cwd: globalThis.process.cwd(), env: { ...globalThis.process.env,
+        cwd: globalThis.process.cwd(), env: { ...globalThis.process.env, HERMES_WEB_UI_TOKEN: syntheticJwt,
           HERMES_WEB_UI_URL: `http://127.0.0.1:${(server.address() as any).port}`,
           HERMES_WEB_UI_PROFILE: 'research' },
       })
@@ -820,7 +822,7 @@ describe('hermes-web-ui MCP server', () => {
     child = spawn(process.execPath, ['bin/ekko-studio-mcp.mjs', 'use'], {
       cwd: process.cwd(),
       env: {
-        ...process.env,
+        ...process.env, HERMES_WEB_UI_TOKEN: syntheticJwt,
         HERMES_WEB_UI_URL: `http://127.0.0.1:${address.port}`,
         HERMES_STUDIO_SESSION_ID: 'studio-codex-session',
       },
@@ -1222,26 +1224,13 @@ describe('hermes-web-ui MCP server', () => {
     await new Promise<void>(resolve => server.close(() => resolve()))
   })
 
-  it('does not expose retired device operations even when an old launcher requests devices', async () => {
-    const responses = new Map<number, any>()
-    child = spawn(process.execPath, ['bin/ekko-studio-mcp.mjs', 'devices'], {
+  it('rejects retired devices toolset without falling back to generic API', () => {
+    const result = spawnSync(process.execPath, ['bin/ekko-studio-mcp.mjs', 'devices'], {
       cwd: process.cwd(), env: { ...process.env, HERMES_MCP_TOOLSET: '' },
+      encoding: 'utf8', timeout: 3000, input: '',
     })
-    child.stdout.on('data', chunk => {
-      for (const line of String(chunk).trim().split('\n')) {
-        if (!line) continue
-        const message = JSON.parse(line)
-        responses.set(message.id, message)
-      }
-    })
-    writeRpc(child, 1, 'initialize', {})
-    writeRpc(child, 2, 'tools/list')
-    writeRpc(child, 3, 'tools/call', { name: 'hermes_lan_devices_list', arguments: {} })
-    const list = await waitForRpc(responses, 2)
-    expect(list.result.tools.map((tool: any) => tool.name)).toEqual([
-      'ekko_studio_api_openapi_get', 'ekko_studio_api_request',
-    ])
-    const retired = await waitForRpc(responses, 3)
-    expect(retired.result.isError).toBe(true)
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toMatch(/Unknown MCP toolset/)
+    expect(result.stdout).not.toContain('ekko_studio_api_request')
   })
 })

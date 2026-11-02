@@ -71,6 +71,7 @@ import {
   restorePersistedPiProxyTargets,
 } from './coding-agents'
 import { isAuthorizedCodexProxyRequest } from '../modules/coding-agents/services/codex/proxy'
+import { ExplicitHermesBindingError } from '../modules/hermes/services/runtime/explicit-binding'
 import {
   configurePreferredHermesRuntime,
   readLockedDesktopHermesSelection,
@@ -338,13 +339,13 @@ function recordLockedHermesSelection(selection: HermesRuntimeSelection): void {
     kind: 'hermes',
     installed: true,
     version: selection.version,
-    source: selection.source,
+    source: selection.source === 'explicit-binding' ? 'user-cli' : selection.source,
     path: selection.path,
     error: '',
     installations: [{
       path: selection.path,
       version: selection.version,
-      source: selection.source,
+      source: selection.source === 'explicit-binding' ? 'user-cli' : selection.source,
       selected: true,
       ...(selection.managedRuntimeVersion
         ? { managedRuntimeVersion: selection.managedRuntimeVersion }
@@ -373,6 +374,7 @@ export async function bootstrap() {
     try {
       hermesSelection = await configurePreferredHermesRuntime()
     } catch (error) {
+      if (error instanceof ExplicitHermesBindingError) throw error
       logger.warn(error, '[bootstrap] failed to inspect Hermes Runtime; continuing without a selected runtime')
     }
   }

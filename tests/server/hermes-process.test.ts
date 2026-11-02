@@ -34,6 +34,19 @@ afterEach(() => {
 })
 
 describe('Hermes process invocation', () => {
+  it.each(['linux', 'darwin', 'win32'] as const)('uses the explicit pair for CLI calls on %s', async platform => {
+    setPlatform(platform)
+    const env = {
+      HERMES_RUNTIME_SOURCE: 'explicit-binding',
+      HERMES_AGENT_CLI_PYTHON: '/selected runtime/python',
+      HERMES_AGENT_BRIDGE_PYTHON: '/selected runtime/python',
+    }
+    const { execHermesWithBin, spawnHermesWithBin } = await import('../../packages/server/src/modules/hermes/services/runtime/process')
+    await execHermesWithBin('/old/hermes', ['profile', 'list'], { env })
+    spawnHermesWithBin('/old/hermes', ['gateway', 'run'], { env })
+    expect(execFileCalls[0]).toMatchObject({ command: env.HERMES_AGENT_CLI_PYTHON, args: ['-I', '-m', 'hermes_cli.main', 'profile', 'list'] })
+    expect(spawnCalls[0]).toMatchObject({ command: env.HERMES_AGENT_CLI_PYTHON, args: ['-I', '-m', 'hermes_cli.main', 'gateway', 'run'] })
+  })
   it('bypasses the uv hermes.exe trampoline on Windows packaged installs', async () => {
     setPlatform('win32')
     process.env.HERMES_BIN = 'C:\\Users\\me\\AppData\\Local\\Programs\\Ekko Studio\\resources\\python\\Scripts\\hermes.exe'

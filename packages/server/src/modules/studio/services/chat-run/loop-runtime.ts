@@ -34,41 +34,75 @@ interface LoopHost {
 /** Native LoopStore is authoritative; this driver only owns in-flight dispatches. */
 export class LoopRuntime {
   private polling = false
-  private recovered = false
   private stopped = false
-  private fault?: string
+  private retryAt = 0
+  private startupRecovered = false
+  private recoveryRetryAt = 0
+  private uncertain = new Map<string, { row: HermesSessionRow; binding: Result; retryAt: number }>()
   private runs = new Map<string, Promise<void>>()
   private capabilities = new Map<string, { row: HermesSessionRow; binding: Result; owner: AuthenticatedUser }>()
   constructor(private readonly host: LoopHost) {}
 
   async poll(): Promise<void> {
-    if (this.polling || this.stopped || this.fault || this.host.closing()) return
+    if (this.polling || this.stopped || Date.now() < this.retryAt || this.host.closing()) return
     this.polling = true
     try {
       const profiles = this.host.profiles()
-      if (!this.recovered) {
-        await this.host.request({ action: 'loop_recover', profiles })
-        this.recovered = true
+      if (!this.startupRecovered && Date.now() >= this.recoveryRetryAt) {
+        try {
+          await this.host.request({ action: 'loop_recover', profiles, recovery_only: true })
+          this.startupRecovered = true
+        } catch { this.recoveryRetryAt = Date.now() + 2000 }
       }
-      const listed = await this.host.request({ action: 'loop_list', profiles })
+      const listed = await this.host.request({ action: 'loop_list', profiles, include_inflight: true })
+      const blocked = new Set(this.uncertain.keys())
+      for (const [sessionId, pending] of this.uncertain) {
+        if (this.runs.has(sessionId) || pending.retryAt > Date.now()) continue
+        await this.reconcile(pending)
+      }
       for (const item of listed.loops || []) {
-        if (this.stopped || this.host.closing() || item.current_tick || this.runs.has(item.session_id)) continue
+        if (this.stopped || this.host.closing() || blocked.has(item.session_id) || this.runs.has(item.session_id)) continue
         const recovery = item.recovery?.status === 'pending'
-        if (!recovery && (['held', 'failed', 'claimed', 'injecting', 'started'].includes(item.recovery?.status) || item.next_due_at * 1000 > Date.now())) continue
+        if (recovery && !this.startupRecovered) continue
         const row = getSession(item.session_id)
         if (!isHermesLoopSession(row) || !row?.user_id || (row.profile || 'default') !== item.route?.profile) continue
-        this.host.owner(row)
+        try { this.authorize(row) } catch { continue }
         const state = getOrCreateSession(this.host.sessionMap, row.id)
         if (state.isWorking || state.queue.length) continue
+        if (item.current_tick) {
+          if (item.current_tick.phase !== 'unknown') {
+            const pending = { row: { ...row }, binding: { action: 'loop_operation', session_id: row.id,
+              profile: row.profile || 'default', tick_id: item.current_tick.id, generation: item.current_tick.generation }, retryAt: 0 }
+            this.uncertain.set(row.id, pending)
+            await this.reconcile(pending)
+          }
+          continue
+        }
+        if (!recovery && (['held', 'failed', 'claimed', 'injecting', 'started'].includes(item.recovery?.status) || item.next_due_at * 1000 > Date.now())) continue
         state.isWorking = true
         const work = this.execute({ ...row }, state, item, recovery)
         this.runs.set(row.id, work)
         void work.finally(() => this.runs.delete(row.id)).catch(() => {})
       }
-    } catch (error) {
-      // A transport-unknown write must not automatically replay a task.
-      this.fault = String(error)
+    } catch {
+      this.retryAt = Date.now() + 2000
     } finally { this.polling = false }
+  }
+
+  private async reconcile(pending: { row: HermesSessionRow; binding: Result; retryAt: number }): Promise<void> {
+    try {
+      this.authorize(pending.row)
+      const result = await this.host.request({ ...pending.binding, op: pending.binding.recovery_id ? 'recovery_failed' : 'reconcile_claim',
+        ...(pending.binding.recovery_id ? { not_started: false, reason: 'Recovery receipt uncertain; no automatic replay' } : {}) })
+      if (!result.claim_resolution && !pending.binding.recovery_id) throw new Error('Claim reconciliation binding unresolved')
+      this.uncertain.delete(pending.row.id)
+      this.host.emit(pending.row.id, 'loop.updated', { session_id: pending.row.id, ...result })
+    } catch {
+      pending.retryAt = Date.now() + 2000
+      this.host.emit(pending.row.id, 'loop.updated', { session_id: pending.row.id,
+        claim_resolution: 'receipt-uncertain', tick_id: pending.binding.tick_id, generation: pending.binding.generation,
+        reason: 'Bound reconciliation pending; no business replay; retry in 2s' })
+    }
   }
 
   private authorize(row: HermesSessionRow): AuthenticatedUser {
@@ -90,7 +124,7 @@ export class LoopRuntime {
 
   private async execute(row: HermesSessionRow, state: SessionState, item: Result, recovery: boolean): Promise<void> {
     const base: Result = { action: 'loop_operation', session_id: row.id, profile: row.profile || 'default',
-      ...(recovery ? { recovery_id: item.recovery.id, expected_generation: item.generation } : { tick_id: randomUUID() }) }
+      ...(recovery ? { recovery_id: item.recovery.id, expected_generation: item.generation } : { tick_id: randomUUID(), generation: item.generation }) }
     let claimed = false, dispatched = false, runId: string | undefined, marker: string | undefined
     let proof: PrimaryAgentBridgeOutput | undefined, terminal: Result | undefined
     let updates: Promise<unknown> = Promise.resolve()
@@ -100,7 +134,8 @@ export class LoopRuntime {
       const claim = await request(recovery ? 'recovery_claim' : 'claim')
       if (!(recovery ? claim.authorized : claim.claimed)) return
       claimed = true
-      base.generation = claim.generation
+      if (!recovery && claim.generation !== base.generation) throw new Error('Loop claim generation mismatch')
+      if (recovery) base.generation = claim.generation
       const input = recovery
         ? `Recovery verification only. Never replay the interrupted business task or perform external writes or dispatch. Inspect saved conversation and existing evidence. Missing evidence requires hold. Submit one bound resume/finish/hold proposal with evidence using POST /api/studio/chat-run/loop-recovery and header x-webui-recovery-run equal to the current run marker, with session_id, profile and recovery=${JSON.stringify({ recovery_id: item.recovery.id, expected_generation: item.generation })}. Resume only schedules future supervision. Interrupted record: ${JSON.stringify(item.recovery)}`
         : String(claim.prompt || '')
@@ -140,10 +175,13 @@ export class LoopRuntime {
       }
       await updates
       const normal = commandResult && !commandResult.model || runId && terminal?.name === 'run.completed' && terminal.run_id === runId
-        && proof?.run_id === runId && proof.status === 'complete' && !proof.error
+        && proof?.run_id === runId && proof.session_id === row.id && proof.status === 'complete' && !proof.error
         && !proof.result?.failed && !proof.result?.partial && !proof.result?.interrupted
       if (normal && (!commandResult || commandResult.model)) {
-        const saved = getSessionDetail(row.id)?.messages.find(message => message.id === terminal?.message_id && message.role === 'assistant')
+        // Bridge persistence emits a string ID; repository rows use numbers.
+        // Compare the exact representation, never coerce via Number/loose equality.
+        const messageId = terminal?.message_id
+        const saved = messageId == null ? undefined : getSessionDetail(row.id)?.messages.find(message => String(message.id) === String(messageId) && message.role === 'assistant')
         if (!saved?.content?.trim()) throw new Error('Loop assistant persistence readback failed')
       }
       this.authorize(row)
@@ -153,9 +191,11 @@ export class LoopRuntime {
       this.host.emit(row.id, 'loop.updated', { session_id: row.id, ...result })
     } catch (error) {
       if (claimed) {
-        try { await updates.catch(() => {}); await request(recovery ? 'recovery_failed' : dispatched ? 'unknown' : 'abandon', { not_started: !dispatched, reason: String(error) }) }
-        catch (writeError) { this.fault = String(writeError) }
-      } else this.fault = String(error)
+        try { await updates.catch(() => {}); await request(recovery ? 'recovery_failed' : dispatched ? 'unknown' : 'abandon', { not_started: !dispatched, reason: 'Loop execution receipt or proof unavailable' }) }
+        catch { this.uncertain.set(row.id, { row, binding: { ...base }, retryAt: 0 }) }
+      } else this.uncertain.set(row.id, { row, binding: { ...base }, retryAt: 0 })
+      this.host.emit(row.id, 'loop.updated', { session_id: row.id, tick_id: base.tick_id, generation: base.generation,
+        claim_resolution: this.uncertain.has(row.id) ? 'receipt-uncertain' : 'settled-without-replay' })
     } finally {
       if (marker) this.capabilities.delete(marker)
       if (!state.runId && !state.activeRunMarker && !state.abortController && !state.queue.length) state.isWorking = false

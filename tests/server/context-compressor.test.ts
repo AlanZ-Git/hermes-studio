@@ -142,6 +142,32 @@ describe('ChatContextCompressor', () => {
     expect(closeCompressionSourceMock).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    'API call failed after 3 retries: Request timed out.',
+    'API call failed: connection reset',
+    '   ',
+  ])('rejects invalid primary text without saving it in automatic compression: %j', async content => {
+    const { ChatContextCompressor } = await import('../../packages/server/src/modules/studio/services/context-compressor')
+    getCompressionSnapshotMock.mockReturnValue(null)
+    ekkoRuntimeRunMock.mockResolvedValue({ output: { role: 'assistant', content, finishReason: 'stop' } })
+    const compressor = new ChatContextCompressor({ config: { triggerTokens: 1, headMessageCount: 0, tailMessageCount: 0 } })
+    await expect(compressor.compress([{ role: 'user', content: 'synthetic context' }], '', undefined, 'primary-failure', {
+      model: 'summary-model', provider: 'openrouter', allowHermesFallback: false,
+    })).rejects.toThrow(/summari.*response/i)
+    expect(saveCompressionSnapshotMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    'The API call failed during the investigation; retry succeeded.',
+    'The log said "API call failed after 3 retries: Request timed out."; the user fixed the endpoint.',
+  ])('accepts summaries discussing errors: %s', async content => {
+    const { callSummarizer } = await import('../../packages/server/src/modules/studio/services/context-compressor')
+    ekkoRuntimeRunMock.mockResolvedValue({ output: { role: 'assistant', content, finishReason: 'stop' } })
+    await expect(callSummarizer('', undefined, 'Summarize.', [], 12_000, undefined, {
+      model: 'summary-model', provider: 'openrouter', allowHermesFallback: false,
+    })).resolves.toBe(content)
+  })
+
   it('uses a fresh prompt-isolated, tool-free, skill-free Ekko agent for summarization', async () => {
     const { callSummarizer } = await import('../../packages/server/src/modules/studio/services/context-compressor')
     ekkoRuntimeRunMock.mockResolvedValue({
@@ -276,7 +302,7 @@ describe('ChatContextCompressor', () => {
     expect(bridgeDestroyMock).not.toHaveBeenCalled()
   })
 
-  it('keeps full history when full summarization fails', async () => {
+  it('reports full summarization failure without changing persisted history', async () => {
     const { ChatContextCompressor } = await import('../../packages/server/src/modules/studio/services/context-compressor')
     const compressor = new ChatContextCompressor({ config: { tailMessageCount: 3 } })
     const messages = Array.from({ length: 8 }, (_, i) => ({
@@ -286,17 +312,12 @@ describe('ChatContextCompressor', () => {
 
     getCompressionSnapshotMock.mockReturnValue(null)
 
-    const result = await compressor.compress(messages, 'http://upstream', undefined, 's1')
-
-    expect(result.messages).toHaveLength(messages.length)
-    expect(result.messages.map(m => m.content)).toEqual(messages.map(m => m.content))
-    expect(result.meta.compressed).toBe(false)
-    expect(result.meta.llmCompressed).toBe(false)
+    await expect(compressor.compress(messages, 'http://upstream', undefined, 's1')).rejects.toThrow('summarizer failed')
     expect(saveCompressionSnapshotMock).not.toHaveBeenCalled()
   })
 
-  it('keeps all new messages when incremental summarization fails', async () => {
-    const { ChatContextCompressor, SUMMARY_PREFIX } = await import('../../packages/server/src/modules/studio/services/context-compressor')
+  it('reports incremental summarization failure without replacing the snapshot', async () => {
+    const { ChatContextCompressor } = await import('../../packages/server/src/modules/studio/services/context-compressor')
     const compressor = new ChatContextCompressor({ config: { tailMessageCount: 3 } })
     const messages = Array.from({ length: 8 }, (_, i) => ({
       role: i % 2 === 0 ? 'user' : 'assistant',
@@ -309,18 +330,7 @@ describe('ChatContextCompressor', () => {
       messageCountAtTime: 2,
     })
 
-    const result = await compressor.compress(messages, 'http://upstream', undefined, 's1')
-
-    expect(result.messages).toHaveLength(7)
-    expect(result.messages[0]).toEqual({
-      role: 'user',
-      content: `${SUMMARY_PREFIX}\n\nprevious summary`,
-    })
-    expect(result.messages.slice(1).map(m => m.content)).toEqual(messages.slice(2).map(m => m.content))
-    expect(result.meta.compressed).toBe(true)
-    expect(result.meta.llmCompressed).toBe(false)
-    expect(result.meta.compressedStartIndex).toBe(1)
-    expect(result.meta.verbatimCount).toBe(6)
+    await expect(compressor.compress(messages, 'http://upstream', undefined, 's1')).rejects.toThrow('summarizer failed')
     expect(saveCompressionSnapshotMock).not.toHaveBeenCalled()
   })
 

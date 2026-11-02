@@ -1106,6 +1106,7 @@ export default {
 
   // チャット
   chat: {
+    compressionFailed: 'コンテキストの圧縮に失敗しました',
     selectMessages: "メッセージを選択",
     messagesSelected: "{count} 件選択中",
     deleteSelectedMessages: "選択項目を削除",
@@ -1263,6 +1264,10 @@ export default {
     },
     attachFiles: 'ファイルを添付',
     reasoningEffort: {
+      inherited: 'デフォルト（{effort}）',
+      providerDefault: 'プロバイダーのデフォルト',
+      unknown: '不明',
+      unsupported: 'このモデルでは非対応',
       tooltip: '推論の労力',
       dragHint: 'ドラッグして選択 · 全 {count} 段階',
       defaultLabel: '既定',

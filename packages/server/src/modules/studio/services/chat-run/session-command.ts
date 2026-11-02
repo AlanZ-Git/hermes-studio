@@ -54,6 +54,7 @@ interface SessionCommandContext {
   model_groups?: Array<{ provider: string; models: string[] }>
   instructions?: string
   queueId?: string
+  requestId?: string
   loopCommandResult?: (result: Record<string, unknown>) => void
   runQueuedItem: (socket: Socket, sessionId: string, next: QueuedRun, fallbackProfile?: string) => void
 }
@@ -136,24 +137,29 @@ export async function handleSessionCommand(
   ctx: SessionCommandContext,
 ): Promise<boolean | void> {
   if (command.name === 'loop') {
+    const receipt = { event: 'session.command', session_id: sessionId, profile: ctx.profile, request_id: ctx.requestId, command: command.rawName, action: 'loop', control: true, terminal: false }
     const owner = ctx.socket.data?.user
     let row = getSession(sessionId)
     if (!owner || row && (String(row.user_id) !== String(owner.id) || (row.profile || 'default') !== ctx.profile || !isHermesLoopSession(row))) {
-      ctx.socket.emit('session.command', { event: 'session.command', session_id: sessionId, command: command.rawName, action: 'loop', control: true, terminal: false, ok: false, message: 'Loop requires an authenticated Hermes session owner' })
+      ctx.socket.emit('session.command', { ...receipt, ok: false, message: 'Loop requires an authenticated Hermes session owner' })
       return
     }
-    if (!row) {
-      createSession({ id: sessionId, profile: ctx.profile, source: 'cli', user_id: String(owner.id), model: ctx.model, title: '[loop]' })
-      row = getSession(sessionId)
-      if (!row || String(row.user_id) !== String(owner.id)) throw new Error('Loop session ownership persistence failed')
+    try {
+      if (!row) {
+        createSession({ id: sessionId, profile: ctx.profile, source: 'cli', user_id: String(owner.id), model: ctx.model, title: '[loop]' })
+        row = getSession(sessionId)
+        if (!row || String(row.user_id) !== String(owner.id)) throw new Error('Loop session ownership persistence failed')
+      }
+      const state = getOrCreateSession(ctx.sessionMap, sessionId)
+      await ctx.socket.join(`session:${sessionId}`)
+      const result = await ctx.bridge.command(sessionId, `/loop${command.args ? ` ${command.args}` : ''}`, ctx.profile)
+      const message = String(result.message || '')
+      persistCommandMessage(sessionId, state, `/${command.rawName}${command.args ? ` ${command.args}` : ''}`)
+      if (message) persistCommandMessage(sessionId, state, message)
+      emitToSession(ctx.nsp, ctx.socket, sessionId, 'session.command', { ...result, ...receipt, busy: state.isWorking, ok: result.handled === true && result.ok !== false })
+    } catch (error) {
+      ctx.socket.emit('session.command', { ...receipt, ok: false, message: error instanceof Error ? error.message : String(error) })
     }
-    const state = getOrCreateSession(ctx.sessionMap, sessionId)
-    ctx.socket.join(`session:${sessionId}`)
-    const result = await ctx.bridge.command(sessionId, `/loop${command.args ? ` ${command.args}` : ''}`, ctx.profile)
-    const message = String(result.message || '')
-    persistCommandMessage(sessionId, state, `/${command.rawName}${command.args ? ` ${command.args}` : ''}`)
-    if (message) persistCommandMessage(sessionId, state, message)
-    emitToSession(ctx.nsp, ctx.socket, sessionId, 'session.command', { ...result, event: 'session.command', session_id: sessionId, command: command.rawName, action: 'loop', control: true, terminal: false, busy: state.isWorking, ok: result.handled === true && result.ok !== false })
     return
   }
   const state = getOrCreateSession(ctx.sessionMap, sessionId)

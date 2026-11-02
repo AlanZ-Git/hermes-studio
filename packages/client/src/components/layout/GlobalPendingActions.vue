@@ -132,7 +132,7 @@ function handleVisibleWorkflowApproval(event: Event) {
 function pendingSoundActionKeys(): string[] {
   const keys: string[] = []
   for (const pending of chatStore.pendingApprovals.values()) {
-    keys.push(`chat-approval:${pending.sessionId}:${pending.approvalId}`)
+    keys.push(`chat-approval:${JSON.stringify([pending.sessionId, pending.approvalId, pending.runId || '', pending.requestId || ''])}`)
   }
   for (const pending of chatStore.pendingClarifies.values()) {
     keys.push(`chat-clarify:${pending.sessionId}:${pending.clarifyId}`)
@@ -161,7 +161,7 @@ function pendingActions(suppressVisibleSources = true): GlobalPendingAction[] {
   const visibleGroupRoomId = suppressVisibleSources && route.name === 'hermes.groupChatRoom' ? groupChatStore.currentRoomId : null
   for (const pending of chatStore.pendingApprovals.values()) {
     if (pending.sessionId === visibleChatSessionId) continue
-    actions.push({ key: `chat-approval:${pending.sessionId}:${pending.approvalId}`, profile, kind: 'chat-approval', title: sessionTitle(pending.sessionId), pending })
+    actions.push({ key: `chat-approval:${JSON.stringify([pending.sessionId, pending.approvalId, pending.runId || '', pending.requestId || ''])}`, profile, kind: 'chat-approval', title: sessionTitle(pending.sessionId), pending })
   }
   for (const pending of chatStore.pendingClarifies.values()) {
     if (pending.sessionId === visibleChatSessionId) continue
@@ -245,7 +245,7 @@ async function submitApproval(action: Extract<GlobalPendingAction, { kind: 'chat
   if (submitting[action.key]) return
   submitting[action.key] = true
   try {
-    if (action.kind === 'chat-approval') chatStore.respondApprovalFor(action.pending.sessionId, action.pending.approvalId, choice)
+    if (action.kind === 'chat-approval') chatStore.respondApprovalFor(action.pending.sessionId, action.pending.approvalId, choice, action.pending)
     else await groupChatStore.respondApprovalFor(action.pending.roomId, action.pending.approvalId, choice)
   } catch (error) {
     message.error(error instanceof Error ? error.message : String(error))
