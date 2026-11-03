@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+const log = vi.hoisted(() => ({ warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() }))
+vi.mock('../../packages/server/src/modules/studio/public/logging', () => ({ logger: log, bridgeLogger: log }))
 const rows = vi.hoisted(() => new Map<string, any>())
 const details = vi.hoisted(() => new Map<string, any>())
 vi.mock('../../packages/server/src/modules/studio/repositories/session-store', () => ({
@@ -53,8 +55,44 @@ async function settle(runtime: LoopRuntime) {
 }
 
 describe('native loop runtime dispatch evidence', () => {
-  beforeEach(() => { rows.clear(); details.clear() })
-  afterEach(() => { vi.restoreAllMocks() })
+  beforeEach(() => { rows.clear(); details.clear(); vi.clearAllMocks() })
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
+  it('owns one timer and stops polling on close', async () => {
+    vi.useFakeTimers()
+    const { host, runtime } = fixture()
+    host.request.mockImplementation(async (data: any) => data.action === 'loop_list' ? { loops: [] } : {})
+    runtime.start(); runtime.start()
+    await vi.advanceTimersByTimeAsync(1100)
+    expect(host.request.mock.calls.filter(([v]: any[]) => v.action === 'loop_list')).toHaveLength(3)
+    runtime.close()
+    const count = host.request.mock.calls.length
+    await vi.advanceTimersByTimeAsync(2000)
+    runtime.start()
+    expect(host.request).toHaveBeenCalledTimes(count)
+  })
+  it('backs off uncertain reconciliation and logs only safe correlation and error classification', async () => {
+    const { host, runtime } = fixture()
+    let now = Date.now()
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const normal = host.request.getMockImplementation()!
+    host.request.mockImplementation(async (data: any) => {
+      if (['claim', 'reconcile_claim'].includes(data.op)) throw new Error('timed out SECRET bearer token prompt')
+      return normal(data)
+    })
+    await settle(runtime)
+    await runtime.poll()
+    const first = host.request.mock.calls.length
+    now += 1999; await runtime.poll()
+    expect(host.request.mock.calls.slice(first).filter(([v]: any[]) => v.op === 'reconcile_claim')).toHaveLength(0)
+    now += 2; await runtime.poll()
+    const second = host.request.mock.calls.length
+    now += 2100; await runtime.poll()
+    expect(host.request.mock.calls.slice(second).filter(([v]: any[]) => v.op === 'reconcile_claim')).toHaveLength(0)
+    expect(host.request.mock.calls.filter(([v]: any[]) => v.op === 'claim')).toHaveLength(1)
+    expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'loop.claim', session_id: 'session', generation: 2, error_class: 'timeout' }), expect.any(String))
+    expect(JSON.stringify(log.warn.mock.calls)).not.toContain('SECRET')
+    runtime.close()
+  })
   it('retries a transient read failure after backoff without a process-wide permanent fault', async () => {
     const { host, runtime } = fixture()
     let now = Date.now()

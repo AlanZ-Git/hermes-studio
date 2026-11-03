@@ -164,4 +164,48 @@ for status,attempts,expected in [('claimed',1,'pending'),('claimed',2,'failed'),
  assert snapshot(s)==saved
 results.append('recovery-only startup settles interrupted recovery statuses idempotently without touching business tick or count')
 
+s,r=fixture(False)
+before=time.time();q=s.operation({**r,'op':'reconcile_claim'})
+assert q['claim_resolution']=='not-committed-fenced'
+assert before < q['loop_state']['next_due_at'] <= before+3, q
+assert q['loop_state']['ticks_fired']==0
+saved=snapshot(s)
+assert s.operation({**r,'op':'reconcile_claim'})['loop_state']==q['loop_state']
+assert snapshot(s)==saved
+results.append('uncommitted attempt retries shortly without consuming a round or extending duplicate backoff')
+
+s,r=fixture(False)
+for attempt in range(1,5):
+ req={**r,'tick_id':f'failure-{attempt}','op':'reconcile_claim'}
+ before=time.time();q=s.operation(req)
+ assert q['startup_failure']['attempts']==attempt
+ assert q['loop_state']['ticks_fired']==0
+ if attempt<4:
+  assert before+2**attempt <= q['loop_state']['next_due_at'] <= time.time()+2**attempt
+ else:
+  assert q['loop_state']['status']=='paused' and 'startup-failed' in q['loop_state']['paused_reason']
+ saved=snapshot(s);s.operation(req);assert snapshot(s)==saved
+reopened=bridge_loops.LoopStore(s.home)
+with reopened.transaction() as db:
+ state,meta=reopened.read(db,'fixture')
+ assert state.status=='paused' and meta['startup_failure']['attempts']==4
+assert not reopened.operation({'op':'list'})['loops']
+assert reopened.command('fixture','resume','default')['loop_state']['status']=='active'
+results.append('consecutive precommit failures persist bounded backoff then visible pause across reopen')
+
+for control in ['pause','stop','30s newer --times 2']:
+ s,r=fixture(False);s.command('fixture',control,'default');saved=snapshot(s)
+ q=s.operation({**r,'op':'reconcile_claim'})
+ assert q['claim_resolution']=='generation-fenced' and snapshot(s)==saved
+results.append('pause stop and new-set invalidate uncommitted retries without rewriting new state')
+
+s,r=fixture(False);s.operation({**r,'op':'reconcile_claim'})
+with s.transaction() as db:
+ state,meta=s.read(db,'fixture');state.next_due_at=0;s.save(db,'fixture',state,meta)
+with patch.object(loops,'goal_blocks_loop_tick',return_value=False):
+ r={**r,'tick_id':'retry'};assert s.operation({**r,'op':'claim'})['claimed']
+q=s.operation({**r,'op':'inject'});assert q['authorized'] and q['startup_failure'] is None
+assert q['loop_state']['ticks_fired']==1
+results.append('successful retry injection resets failure streak and consumes exactly one round')
+
 print(json.dumps({'checks':results,'count':len(results),'bridge_file':bridge_loops.__file__,'core_file':loops.__file__},indent=2))

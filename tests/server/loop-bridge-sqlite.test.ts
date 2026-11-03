@@ -141,7 +141,7 @@ describe('loop native proof -> real bridge handler -> SQLite assistant readback'
     const { createSession, getSessionDetail } = await import('../../packages/server/src/modules/studio/repositories/session-store')
     const { handleBridgeRun } = await import('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run')
     const { LoopRuntime } = await import('../../packages/server/src/modules/studio/services/chat-run/loop-runtime')
-    createSession({ id: 'session-1', profile: 'default', source: 'cli', user_id: '1', model: 'gpt-test', provider: 'openai', workspace: '/audit/isolation/tmp/project' })
+    createSession({ id: 'session-1', profile: 'default', source: 'cli', user_id: '1', model: 'gpt-test', provider: 'openai', workspace: mkdtempSync(join(tmpdir(), 'loop-workspace-')) })
     const owner = { id: 1, username: 'fixture', role: 'super_admin' }
     const emitter = { emit: vi.fn(), except: vi.fn(() => ({ emit: vi.fn() })) }
     const nsp: any = { adapter: { rooms: new Map() }, to: () => emitter }
@@ -237,7 +237,7 @@ describe('loop native proof -> real bridge handler -> SQLite assistant readback'
       await vi.waitFor(() => expect((runtime as any).runs.size).toBe(0), { timeout: 5000 })
       if (nativeHome) {
         const saved = native({ action: 'fixture_status' })
-        expect(saved.loop_state.status).toBe(tick === 0 ? 'active' : 'done')
+        expect(saved.loop_state.status, JSON.stringify({ saved, events: socket.emit.mock.calls, requests: host.request.mock.calls })).toBe(tick === 0 ? 'active' : 'done')
         expect(saved.loop_state.ticks_fired).toBe(tick + 1 + retained)
         if (tick === 0) {
           await runtime.poll()

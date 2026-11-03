@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { logger } from '../../public/logging'
 import type { Socket } from 'socket.io'
 import type { AuthenticatedUser } from '../../public/auth'
 import type { PrimaryAgentBridgeOutput } from '../../public/chat-agent-runtime'
@@ -38,10 +39,26 @@ export class LoopRuntime {
   private retryAt = 0
   private startupRecovered = false
   private recoveryRetryAt = 0
-  private uncertain = new Map<string, { row: HermesSessionRow; binding: Result; retryAt: number }>()
+  private uncertain = new Map<string, { row: HermesSessionRow; binding: Result; retryAt: number; attempts?: number }>()
   private runs = new Map<string, Promise<void>>()
   private capabilities = new Map<string, { row: HermesSessionRow; binding: Result; owner: AuthenticatedUser }>()
+  private timer?: ReturnType<typeof setInterval>
   constructor(private readonly host: LoopHost) {}
+
+  start(): void {
+    if (this.timer || this.stopped) return
+    this.timer = setInterval(() => { void this.poll() }, 500)
+    this.timer.unref?.()
+    void this.poll()
+  }
+
+  private log(binding: Result, resolution: string, error?: unknown, result?: Result): void {
+    logger.warn({ event: 'loop.claim', session_id: binding.session_id, profile: binding.profile,
+      generation: binding.generation, tick_id: binding.tick_id, resolution,
+      error_class: error instanceof Error && /timeout|timed out/i.test(error.message) ? 'timeout' : error ? 'request-or-proof-error' : undefined,
+      next_due_at: result?.loop_state?.next_due_at, ticks_fired: result?.loop_state?.ticks_fired,
+      status: result?.loop_state?.status }, 'Loop claim lifecycle')
+  }
 
   async poll(): Promise<void> {
     if (this.polling || this.stopped || Date.now() < this.retryAt || this.host.closing()) return
@@ -89,19 +106,23 @@ export class LoopRuntime {
     } finally { this.polling = false }
   }
 
-  private async reconcile(pending: { row: HermesSessionRow; binding: Result; retryAt: number }): Promise<void> {
+  private async reconcile(pending: { row: HermesSessionRow; binding: Result; retryAt: number; attempts?: number }): Promise<void> {
     try {
       this.authorize(pending.row)
       const result = await this.host.request({ ...pending.binding, op: pending.binding.recovery_id ? 'recovery_failed' : 'reconcile_claim',
         ...(pending.binding.recovery_id ? { not_started: false, reason: 'Recovery receipt uncertain; no automatic replay' } : {}) })
       if (!result.claim_resolution && !pending.binding.recovery_id) throw new Error('Claim reconciliation binding unresolved')
       this.uncertain.delete(pending.row.id)
+      this.log(pending.binding, result.claim_resolution || 'recovery-failed', undefined, result)
       this.host.emit(pending.row.id, 'loop.updated', { session_id: pending.row.id, ...result })
-    } catch {
-      pending.retryAt = Date.now() + 2000
+    } catch (error) {
+      pending.attempts = (pending.attempts || 0) + 1
+      const delay = Math.min(30_000, 1000 * 2 ** Math.min(pending.attempts, 5))
+      pending.retryAt = Date.now() + delay
+      this.log(pending.binding, 'receipt-uncertain', error)
       this.host.emit(pending.row.id, 'loop.updated', { session_id: pending.row.id,
         claim_resolution: 'receipt-uncertain', tick_id: pending.binding.tick_id, generation: pending.binding.generation,
-        reason: 'Bound reconciliation pending; no business replay; retry in 2s' })
+        reason: `Bound reconciliation pending; no business replay; retry in ${delay / 1000}s` })
     }
   }
 
@@ -190,6 +211,7 @@ export class LoopRuntime {
       const result = await request(outcome, { response: commandResult?.response ?? terminal?.output ?? '', not_started: !dispatched, reason: 'No proven normal completion' })
       this.host.emit(row.id, 'loop.updated', { session_id: row.id, ...result })
     } catch (error) {
+      this.log(base, claimed ? 'execution-receipt-error' : 'claim-error', error)
       if (claimed) {
         try { await updates.catch(() => {}); await request(recovery ? 'recovery_failed' : dispatched ? 'unknown' : 'abandon', { not_started: !dispatched, reason: 'Loop execution receipt or proof unavailable' }) }
         catch { this.uncertain.set(row.id, { row, binding: { ...base }, retryAt: 0 }) }
@@ -202,5 +224,10 @@ export class LoopRuntime {
     }
   }
 
-  close(): void { this.stopped = true; this.capabilities.clear() }
+  close(): void {
+    this.stopped = true
+    if (this.timer) clearInterval(this.timer)
+    this.timer = undefined
+    this.capabilities.clear()
+  }
 }

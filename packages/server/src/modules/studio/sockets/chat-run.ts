@@ -811,7 +811,8 @@ export class ChatRunSocket {
     this.closing = false
     this.nsp.use(this.authMiddleware.bind(this))
     this.nsp.on('connection', this.onConnection.bind(this))
-    this.backgroundPollTimer = setInterval(() => { void this.pollBackgroundWork(); void this.loopRuntime.poll() }, 500)
+    this.backgroundPollTimer = setInterval(() => { void this.pollBackgroundWork() }, 500)
+    this.loopRuntime.start()
     this.backgroundPollTimer.unref?.()
     void this.pollBackgroundWork()
     logger.info('[chat-run-socket] Socket.IO ready at /chat-run')

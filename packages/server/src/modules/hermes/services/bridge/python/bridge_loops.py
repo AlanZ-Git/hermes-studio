@@ -2,12 +2,14 @@
 No model/session worker is loaded by list/recovery. SQLite is the shared writer gate.
 """
 from __future__ import annotations
-import json,sqlite3,time,uuid
+import json,logging,sqlite3,time,uuid
 from pathlib import Path
 from contextlib import contextmanager
 import bridge_recovery as recovery
 
 META='webui-loop:'
+STARTUP_FAILURE_LIMIT=4
+logger=logging.getLogger(__name__)
 
 class LoopStore:
     def __init__(self, home):
@@ -69,6 +71,7 @@ class LoopStore:
                 if running and running['generation']==meta['generation']:
                     running.setdefault('ticks_fired',prior_count)
                 meta['generation']+=1
+                meta.pop('startup_failure',None)
                 if meta.get('recovery') and recovery.unresolved(meta):
                     meta['recovery'].update(status='held' if action=='pause' else 'superseded',result='new user control invalidated recovery',finished_at=time.time())
             self.save(db,sid,state,meta)
@@ -125,6 +128,7 @@ class LoopStore:
                 authorized = self.matches(meta,req) and meta['tick']['phase']=='claimed' and meta['generation']==req['generation'] and state and state.status=='active'
                 if authorized:
                     meta['tick']['phase']='injecting'
+                    meta.pop('startup_failure',None)
                     self.save(db,sid,state,meta)
                 return self.result(state,meta,authorized=bool(authorized))
             elif op in {'complete','unknown','abandon','started','interrupted','failed'}:
@@ -162,6 +166,7 @@ class LoopStore:
 
     def reconcile_claim(self,db,sid,mgr,meta,req):
         state=mgr.state;tick=meta.get('tick');tid=req.get('tick_id');gen=req.get('generation')
+        old_due=state.next_due_at
         if type(gen) is not int or not isinstance(tid,str) or not tid or len(tid)>128:
             return self.result(state,meta,stale=True)
         prior=meta.get('claim_fences',{}).get(tid)
@@ -190,19 +195,36 @@ class LoopStore:
                 elif state.status=='active':
                     from hermes_cli.loops import self_paced_floor_seconds
                     state.next_due_at=time.time()+max(1,state.current_delay or state.interval_seconds or self_paced_floor_seconds())
+                    self.startup_failure(mgr,meta,'claim-only-retired',retry=False)
             resolution='claim-only-retired'
         elif gen==meta['generation'] and not tick:
             # A delayed pre-commit claim must observe this tombstone under the same writer lock.
             self.fence(meta,{'id':tid,'generation':gen},req['profile'],'not-committed-fenced')
             if state.status=='active':
-                from hermes_cli.loops import self_paced_floor_seconds
-                state.next_due_at=time.time()+max(1,state.current_delay or state.interval_seconds or self_paced_floor_seconds())
+                self.startup_failure(mgr,meta,'not-committed-fenced',retry=True)
             resolution='not-committed-fenced'
         elif gen<meta['generation']:
             return self.result(state,meta,claim_resolution='generation-fenced')
         else:return self.result(state,meta,stale=True)
         self.save(db,sid,state,meta)
+        logger.warning('loop_claim_reconciled %s',json.dumps({'session_id':sid,'profile':req['profile'],
+            'generation':gen,'tick_id':tid,'resolution':resolution,'old_due_at':old_due,
+            'next_due_at':state.next_due_at,'ticks_fired':state.ticks_fired,'status':state.status,
+            'startup_failure':meta.get('startup_failure')}))
         return self.result(state,meta,claim_resolution=resolution)
+
+    @staticmethod
+    def startup_failure(mgr,meta,resolution,retry):
+        previous=meta.get('startup_failure') or {}
+        attempts=previous.get('attempts',0)+1 if previous.get('generation')==meta['generation'] else 1
+        failure={'generation':meta['generation'],'attempts':attempts,'resolution':resolution,
+                 'failed_at':time.time(),'retry_at':None}
+        meta['startup_failure']=failure
+        if attempts>=STARTUP_FAILURE_LIMIT:
+            mgr.pause('startup-failed: repeated claim failures; inspect transport then explicitly resume')
+        elif retry:
+            mgr.state.next_due_at=time.time()+2**attempts
+            failure['retry_at']=mgr.state.next_due_at
 
     @staticmethod
     def matches(meta,req):
@@ -213,4 +235,4 @@ class LoopStore:
 
     @staticmethod
     def result(state,meta,**extra):
-        return {'loop_state':json.loads(state.to_json()) if state else None,'generation':meta['generation'],'current_tick':meta.get('tick'),'recovery':meta.get('recovery'),**extra}
+        return {'loop_state':json.loads(state.to_json()) if state else None,'generation':meta['generation'],'current_tick':meta.get('tick'),'recovery':meta.get('recovery'),'startup_failure':meta.get('startup_failure'),**extra}
