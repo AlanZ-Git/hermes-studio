@@ -82,6 +82,7 @@ export function createShutdownHandler(
     const stopAgentBridge = Boolean(agentBridgeManager && shouldStopAgentBridgeOnShutdown(signal))
     const stopManagedGateways = shouldStopManagedGatewaysOnShutdown()
     const shutdownStartedAt = Date.now()
+    const shutdownDeadline = shutdownStartedAt + getShutdownForceExitMs()
 
     shutdownPromise = (async () => {
       // Give resource cleanup a short bounded window, then prefer a clean
@@ -143,7 +144,7 @@ export function createShutdownHandler(
         // Stop accepting/routing chat work before stopping the bridge. This
         // lets ChatRunSocket release claimed background completions while the
         // broker is still reachable.
-        if (chatRunServer) await runShutdownStep('ChatRunSocket', () => chatRunServer.close())
+        if (chatRunServer) await runShutdownStep('ChatRunSocket', () => chatRunServer.close(shutdownDeadline - 100))
         await runShutdownStep('Chat webhook dispatcher', () => stopChatWebhookDispatcher())
 
         // These runtimes own the most likely long-lived descendants (PTYs,

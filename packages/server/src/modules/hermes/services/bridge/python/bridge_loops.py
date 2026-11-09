@@ -6,6 +6,7 @@ import json,logging,sqlite3,time,uuid
 from pathlib import Path
 from contextlib import contextmanager
 import bridge_recovery as recovery
+from bridge_recovery_resources import public as public_recovery
 
 META='webui-loop:'
 STARTUP_FAILURE_LIMIT=4
@@ -78,7 +79,7 @@ class LoopStore:
             output=result['output']
             running=meta.get('tick')
             if running:output+='\nCurrent wakeup still running; pause/stop only prevent subsequent wakeups. Use the existing abort action to interrupt.'
-            if meta.get('recovery'):output+='\nRecovery: '+json.dumps(meta['recovery'],ensure_ascii=False)
+            if meta.get('recovery'):output+='\nRecovery: '+json.dumps(public_recovery(meta['recovery']),ensure_ascii=False)
             return {'session_id':sid,'handled':True,'ok':not output.startswith('/loop:'),'command':'loop','action':'loop','type':'loop','message':output,'created':result['created'],**self.result(state,meta),'scheduler_enabled':True}
 
     def operation(self,req):
@@ -91,7 +92,7 @@ class LoopStore:
                 out=[]
                 for key,_ in rows:
                     s,m=self.read(db,key[len(META):])
-                    if s and (s.status=='active' or recovery.unresolved(m) or req.get('include_inflight') and m.get('tick')):out.append({'session_id':key[len(META):],'route':s.route,'next_due_at':s.next_due_at,'awaiting_response':s.awaiting_response,'current_tick':m.get('tick'),'generation':m['generation'],'recovery':m.get('recovery')})
+                    if s and (s.status=='active' or recovery.unresolved(m) or req.get('include_inflight') and m.get('tick')):out.append({'session_id':key[len(META):],'route':s.route,'next_due_at':s.next_due_at,'awaiting_response':s.awaiting_response,'current_tick':m.get('tick'),'generation':m['generation'],'recovery':public_recovery(m.get('recovery'))})
                 return {'loops':out}
         # Native --until may call a judge: evaluate outside the writer transaction,
         # then exact-snapshot CAS below. Controls never wait for the model/judge.
@@ -235,4 +236,4 @@ class LoopStore:
 
     @staticmethod
     def result(state,meta,**extra):
-        return {'loop_state':json.loads(state.to_json()) if state else None,'generation':meta['generation'],'current_tick':meta.get('tick'),'recovery':meta.get('recovery'),'startup_failure':meta.get('startup_failure'),**extra}
+        return {'loop_state':json.loads(state.to_json()) if state else None,'generation':meta['generation'],'current_tick':meta.get('tick'),'recovery':public_recovery(meta.get('recovery')),'startup_failure':meta.get('startup_failure'),**extra}

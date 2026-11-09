@@ -38,6 +38,8 @@ class WorkerProcess:
         self._endpoint_identity: tuple[int, int] | None = None
         self._lock = threading.RLock()
         self.model_run_auth: ModelRunAuth | None = None
+        from bridge_studio_notifications import StudioNotificationStore
+        self._studio_notifications = StudioNotificationStore()
 
     def bind_model_run_auth(self, binding: ModelRunAuth) -> None:
         bound = ModelRunAuth.parse(binding, self.profile)
@@ -54,6 +56,10 @@ class WorkerProcess:
         env = dict(parent_env)
         # Never inherit another worker's descriptor from the broker environment.
         env.pop("HERMES_WEB_UI_MODEL_RUN_AUTH", None)
+        if self._studio_notifications.path is not None:
+            env['HERMES_STUDIO_NOTIFICATION_DB'] = str(self._studio_notifications.path)
+        else:
+            env.pop('HERMES_STUDIO_NOTIFICATION_DB', None)
         if self.model_run_auth is not None:
             env["HERMES_WEB_UI_MODEL_RUN_AUTH"] = self.model_run_auth.serialized()
         return env
@@ -240,6 +246,10 @@ class WorkerProcess:
             if req.get("action") not in MAINTENANCE_ACTIONS:
                 self.last_used_at = time.monotonic()
             request_timeout = timeout if timeout is not None and timeout > 0 else self.REQUEST_TIMEOUT_SECONDS
+            if self._studio_notifications.path is not None:
+                hello = _send_bridge_request(self.endpoint, {'action': 'ping'}, request_timeout)
+                if hello.get('notification_receiver') != self._studio_notifications.configuration():
+                    raise RuntimeError('Studio worker notification receiver configuration mismatch')
             return _send_bridge_request(self.endpoint, req, request_timeout)
 
 
@@ -248,7 +258,7 @@ MAINTENANCE_ACTIONS = frozenset({
     "ping", "list", "status", "get_history", "get_session_title", "get_result", "get_output",
     "background_poll", "background_notification_complete", "background_notification_release", "background_notification_status",
     "result_ack", "background_events_ack", "prepare_retire", "lifecycle_snapshot",
-    "notification_retention_scan", "notification_retention_reconcile",
+    "notification_retention_scan", "notification_retention_reconcile", "observe_recovery_exit",
 })
 
 

@@ -201,6 +201,9 @@ class AgentSession:
     boundary_reached_run_id: str | None = None
     boundary_supported: bool = False
     boundary_error: str | None = None
+    owner_lease: Any = field(default=None, repr=False)
+    live_session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    owner_profile_home: Path | None = None
 
 
 class AgentPool:
@@ -210,6 +213,7 @@ class AgentPool:
     def __init__(self) -> None:
         self._sessions: dict[str, AgentSession] = {}
         self._runs: dict[str, RunRecord] = {}
+        self._recovery_runs = {}
         self._lock = threading.RLock()
         self._db = SessionDbHolder()
         self._approval_requests: dict[str, queue.Queue[str]] = {}
@@ -238,12 +242,68 @@ class AgentPool:
         self._model_run_chat_started = False
         self._retired = False
         self._run_threads: set[threading.Thread] = set()
+        self._session_admissions = {}
+        from bridge_studio_notifications import StudioNotificationStore
+        self._studio_notifications = StudioNotificationStore()
+
+    def _admit_session(self, session_id, profile):
+        from hermes_cli.active_sessions import try_acquire_active_session
+        profile = profile or 'default'
+        home = _profile_home(profile).resolve(strict=True)
+        if profile != 'default' and home != (_base_hermes_home() / 'profiles' / profile).resolve():
+            raise RuntimeError('Owning profile unavailable')
+        existing = self._session_admissions.get(session_id)
+        if existing:
+            if existing.owner_profile_home != home:
+                raise RuntimeError('Session owning profile changed')
+            return existing
+        admission = self._sessions.get(session_id) or AgentSession(session_id=session_id, agent=None)
+        lease, refusal = try_acquire_active_session(session_id=session_id, surface='studio', config=_load_cfg(),
+            metadata={'live_session_id': admission.live_session_id}, registry_home=home)
+        if lease is None:
+            raise RuntimeError(str(refusal))
+        admission.owner_lease = lease
+        admission.owner_profile_home = home
+        self._session_admissions[session_id] = admission
+        return admission
+
+    def _release_session_admission(self, session_id):
+        from hermes_cli.active_sessions import release_active_session
+        admission = self._session_admissions.pop(session_id, None)
+        if admission:
+            release_active_session(admission.owner_lease)
+
+    def _release_idle_admission(self, session_id):
+        session = self._sessions.get(session_id)
+        if session and session.running or self.has_active_background_for_session(session_id):
+            return
+        records = [r for r in self._runs.values() if r.session_id == session_id]
+        for record in records:
+            if record.worker_thread is not None and record.worker_thread.is_alive():
+                return
+            tracker = getattr(record, 'recovery_lifecycle', None)
+            if tracker is not None and tracker.observe()['outcome'] != 'exited_proven':
+                return
+        self._release_session_admission(session_id)
+
+    def _release_after_run_exit(self, session_id, thread):
+        thread.join()
+        with self._lock:
+            self._release_idle_admission(session_id)
+
+    def _notification_fence(self, session_id, admission):
+        from hermes_cli.active_sessions import notification_owner_fence
+        return notification_owner_fence(lease=admission.owner_lease, logical_session_id=session_id,
+            live_session_id=admission.live_session_id, profile_home=admission.owner_profile_home,
+            resolve_target=lambda: self._studio_notifications.path)
 
     def _close_model_run_auth(self, expected: ModelRunAuth | None) -> None:
         with self._lock:
             if expected is None or self._model_run_auth != expected or self._model_run_auth_closed:
                 return
             self._model_run_auth_closed = True
+            for sid in list(self._session_admissions):
+                self._release_idle_admission(sid)
         # Registry globals are safe here only because the broker gives every
         # complete descriptor its own process. Never reset them in a shared worker.
         try:
@@ -442,7 +502,20 @@ class AgentPool:
             except Exception:
                 pass
 
-    def get_or_create(
+    def get_or_create(self, session_id, profile=None, model=None, provider=None,
+                      background_delegation_enabled=None, model_run_auth=None):
+        ModelRunAuth.parse(model_run_auth, profile or 'default')
+        with self._lock:
+            self._admit_session(session_id, profile)
+            try:
+                return self._get_or_create(session_id, profile, model, provider,
+                                           background_delegation_enabled, model_run_auth)
+            except BaseException:
+                if session_id not in self._sessions:
+                    self._release_session_admission(session_id)
+                raise
+
+    def _get_or_create(
         self,
         session_id: str,
         profile: str | None = None,
@@ -538,6 +611,7 @@ class AgentPool:
                     existing.last_used_at = time.time()
                     return existing
 
+            self._admit_session(session_id, profile)
             _ensure_agent_imports()
             _suppress_bridge_platform_hint()
             from run_agent import AIAgent
@@ -633,6 +707,11 @@ class AgentPool:
                         "background_delegation_enabled": background_delegation_enabled is not False,
                     },
                 )
+                admitted = self._session_admissions[session_id]
+                session.owner_lease = admitted.owner_lease
+                session.live_session_id = admitted.live_session_id
+                session.owner_profile_home = admitted.owner_profile_home
+                self._session_admissions[session_id] = session
                 self._install_boundary_interrupt(session)
                 session.config["boundary_interrupt_supported"] = session.boundary_supported
                 if session.boundary_error:
@@ -1118,9 +1197,11 @@ class AgentPool:
         session = self._sessions.pop(session_id, None)
         if session is None:
             return
+        self._release_idle_admission(session_id)
         with self._lock:
             for rid in list(self._runs):
-                if self._runs[rid].session_id == session_id:
+                record = self._runs[rid]
+                if record.session_id == session_id and not (record.worker_thread and record.worker_thread.is_alive()):
                     del self._runs[rid]
 
     def _append_event(self, session_id: str, event: dict[str, Any]) -> None:
@@ -1323,9 +1404,23 @@ class AgentPool:
         with self._notification_lock:
             if self._notifications_closed:
                 return []
-            return self._claim_kanban_notifications_locked(loaded_session_ids)
+            results = []
+            for session_id in sorted(loaded_session_ids):
+                temporary = session_id not in self._sessions
+                try:
+                    with self._lock:
+                        admission = self._admit_session(session_id, os.environ.get('HERMES_AGENT_BRIDGE_WORKER_PROFILE', 'default'))
+                        with self._notification_fence(session_id, admission) as fence:
+                            results.extend(self._claim_kanban_notifications_locked({session_id}, fence))
+                except Exception as exc:
+                    print(f'[hermes_bridge] fenced notification refused: {exc}', file=sys.stderr, flush=True)
+                finally:
+                    if temporary:
+                        with self._lock:
+                            self._release_session_admission(session_id)
+            return results
 
-    def _claim_kanban_notifications_locked(self, loaded_session_ids: set[str]) -> list[dict[str, Any]]:
+    def _claim_kanban_notifications_locked(self, loaded_session_ids: set[str], fence) -> list[dict[str, Any]]:
         """Claim TUI-style Kanban subscriptions owned by loaded Web UI sessions."""
         try:
             from hermes_cli import kanban_db as kb
@@ -1352,22 +1447,18 @@ class AgentPool:
             try:
                 resolved = str(Path(db_path).expanduser().resolve()) if db_path else str(kb.kanban_db_path(slug).resolve())
             except Exception:
-                resolved = f"slug:{slug}"
+                continue
             if resolved in seen_db_paths:
                 continue
             seen_db_paths.add(resolved)
 
-            if not any(
-                notify.count_notify_subs(db_path=Path(resolved), platform="tui", chat_id=session_id)
-                for session_id in loaded_session_ids
-            ):
-                continue
             try:
-                conn = kbc.connect(db_path=Path(resolved))
+                stat = Path(resolved).stat()
+                conn = self._open_kanban_claim_db({'db_path': resolved, 'db_identity': (stat.st_dev, stat.st_ino)})
             except Exception:
                 continue
             try:
-                conn.execute('BEGIN')
+                conn.execute('PRAGMA busy_timeout=200')
                 for sub in notify.list_notify_subs(conn):
                     session_id = str(sub.get("chat_id") or "")
                     if (sub.get("platform") or "").lower() != "tui" or session_id not in loaded_session_ids:
@@ -1386,6 +1477,13 @@ class AgentPool:
                     profile = str(sub.get('notifier_profile') or worker_profile)
                     if profile != worker_profile:
                         continue
+                    from hermes_cli.kanban_db_notification_delivery import _binding
+                    from bridge_studio_notifications import source_transaction
+                    with source_transaction(conn):
+                        fence.check()
+                        if not _binding(conn, notify._sub_key(sub['task_id'], sub['platform'], session_id, sub.get('thread_id')),
+                                        self._studio_notifications.binding(session_id), bind=True):
+                            continue
                     task = kb.get_task(conn, sub["task_id"])
                     policy = getattr(task, 'notification_policy', 'direct') if task else 'direct'
                     if policy == 'silent':
@@ -1426,12 +1524,16 @@ class AgentPool:
                     delivery_id = 'kanban:' + hashlib.sha256(
                         json.dumps(identity, ensure_ascii=False, separators=(',', ':')).encode()
                     ).hexdigest()
+                    source_event = conn.execute('SELECT * FROM task_events WHERE id=?', (new_cursor,)).fetchone()
+                    if source_event is None:
+                        continue
                     claim_id = uuid.uuid4().hex
                     claim = {
+                        "source_event": dict(source_event),
                         "notification_kind": "kanban",
                         "board": slug,
                         "db_path": resolved,
-                        "db_identity": (Path(resolved).stat().st_dev, Path(resolved).stat().st_ino),
+                        "db_identity": (stat.st_dev, stat.st_ino),
                         "subscription_key": ident,
                         "claimed_at": time.monotonic(),
                         "task_id": sub["task_id"],
@@ -1450,7 +1552,7 @@ class AgentPool:
                     except ImportError:
                         stopped = False  # compatible with a Core predating task-set stop
                     studio_auto = (sub.get('delivery_metadata') or {}).get('studio_auto_continue') == 'v1'
-                    notifications.append({
+                    notification = {
                         **({'studio_auto_continue': 'v1',
                             'wake_eligible': last_event.kind in _STUDIO_KANBAN_CANDIDATES} if studio_auto else {}),
                         "execution_stopped": stopped,
@@ -1478,10 +1580,49 @@ class AgentPool:
                         "board": slug,
                         "task_id": sub["task_id"],
                         "event_id": getattr(last_event, "id", new_cursor),
-                    })
+                    }
+                    try:
+                        self._studio_notifications.accept(notification, claim, fence)
+                        self._ack_studio_notification(claim, notification, fence)
+                        notifications.append(notification)
+                    finally:
+                        with self._lock:
+                            self._background_notification_claims.pop((delivery_id, claim_id), None)
             finally:
                 conn.close()
         return notifications
+
+    def _ack_studio_notification(self, claim, notification, fence):
+        from hermes_cli import kanban_db as kb, kanban_db_notify as notify
+        from hermes_cli.kanban_db_notification_delivery import _binding
+        from bridge_studio_notifications import canonical, source_transaction
+        fence.check()
+        receipt = self._studio_notifications.verify(notification['delegation_id'], notification['identity'], fence)
+        if (receipt['source_event'] != canonical(claim['source_event'])
+                or receipt['source_file'] != canonical(claim['db_identity'])
+                or receipt['old_cursor'] != claim['old_cursor'] or receipt['new_cursor'] != claim['new_cursor']):
+            raise RuntimeError('Studio notification source provenance changed')
+        conn = self._open_kanban_claim_db(claim)
+        try:
+            conn.execute('PRAGMA busy_timeout=200')
+            with source_transaction(conn):
+                fence.check()
+                self._studio_notifications.check()
+                stat = Path(claim['db_path']).stat()
+                if (stat.st_dev, stat.st_ino) != tuple(claim['db_identity']):
+                    raise RuntimeError('Kanban source replaced inside ACK')
+                event = conn.execute('SELECT * FROM task_events WHERE id=?', (claim['new_cursor'],)).fetchone()
+                if event is None or dict(event) != claim['source_event']:
+                    raise RuntimeError('Kanban source event changed inside ACK')
+                key = notify._sub_key(claim['task_id'], claim['platform'], claim['chat_id'], claim['thread_id'])
+                if not _binding(conn, key, self._studio_notifications.binding(claim['chat_id'])):
+                    raise RuntimeError('Kanban receiver binding changed')
+                cursor = notify._notify_cursor(conn, *key)
+                if cursor != claim['old_cursor']:
+                    raise RuntimeError('Kanban cursor diverged')
+                notify._cas_cursor(conn, key, claim['new_cursor'], claim['old_cursor'])
+        finally:
+            conn.close()
 
     @staticmethod
     def _format_kanban_notification(board: str, task: Any, event: Any) -> str:
@@ -1505,6 +1646,22 @@ class AgentPool:
 
     def background_notification_status(self, delegation_id: str, claim_id: str, *,
                                        identity=None, db_identity=None, session_id=None) -> dict[str, Any]:
+        if identity is None:
+            return {'current': False}
+        with self._notification_lock, self._lock:
+            temporary = session_id not in self._sessions
+            try:
+                admission = self._admit_session(session_id, os.environ.get('HERMES_AGENT_BRIDGE_WORKER_PROFILE', 'default'))
+                with self._notification_fence(session_id, admission) as fence:
+                    receipt = self._studio_notifications.verify(delegation_id, identity, fence)
+                    return self._background_notification_status(delegation_id, claim_id, identity=identity,
+                        db_identity=db_identity, session_id=session_id, receipt=receipt)
+            finally:
+                if temporary:
+                    self._release_session_admission(session_id)
+
+    def _background_notification_status(self, delegation_id: str, claim_id: str, *,
+                                       identity=None, db_identity=None, session_id=None, receipt=None) -> dict[str, Any]:
         if identity is not None:
             # A durable receiver may have ACKed the source before its consumer
             # resumes. Validate the exact original event/target, not a dead lease.
@@ -1521,14 +1678,20 @@ class AgentPool:
             paths = {str(Path(b.get('db_path') or kb.kanban_db_path(b.get('slug') or kb.DEFAULT_BOARD)).resolve()) for b in boards}
             if identity[0] not in paths:
                 return {'current': False}
-            stat = Path(identity[0]).stat()
-            conn = self._open_kanban_claim_db({'db_path': identity[0],
-                'db_identity': db_identity or (stat.st_dev, stat.st_ino)})
+            source_file = json.loads(receipt['source_file'])
+            if db_identity is not None and tuple(db_identity) != tuple(source_file):
+                return {'current': False}
+            conn = self._open_kanban_claim_db({'db_path': identity[0], 'db_identity': source_file})
             try:
                 conn.execute('BEGIN')
                 sub = conn.execute('SELECT notifier_profile, delivery_metadata FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?',
                                    (identity[1], identity[5], identity[6], identity[7])).fetchone()
-                event = conn.execute('SELECT task_id, run_id, kind, payload FROM task_events WHERE id=?', (identity[2],)).fetchone()
+                event = conn.execute('SELECT * FROM task_events WHERE id=?', (identity[2],)).fetchone()
+                from bridge_studio_notifications import canonical
+                from hermes_cli.kanban_db_notification_delivery import _binding
+                if (not event or canonical(dict(event)) != receipt['source_event']
+                        or not _binding(conn, (identity[1], identity[5], identity[6], identity[7]), receipt['target_binding'])):
+                    return {'current': False}
                 task = kb.get_task(conn, identity[1])
                 if not sub or (sub['notifier_profile'] or profile) != profile or not event or not task:
                     return {'current': False}
@@ -1692,28 +1855,6 @@ class AgentPool:
     def _complete_background_notification(self, delegation_id: str, claim_id: str, *, allow_obsolete=True) -> dict[str, Any]:
         with self._lock:
             claim = self._background_notification_claims.get((delegation_id, claim_id))
-        if claim and claim.get("notification_kind") == "kanban":
-            completed = False
-            try:
-                from hermes_cli import kanban_db as kb
-                conn = self._open_kanban_claim_db(claim)
-                try:
-                    with kb.write_txn(conn):
-                        conn.execute(
-                            'UPDATE kanban_notify_subs SET last_event_id = MAX(last_event_id, ?) '
-                            'WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?',
-                            (claim['new_cursor'], claim['task_id'], claim['platform'],
-                             claim['chat_id'], claim['thread_id']))
-                    completed = True
-                finally:
-                    conn.close()
-            except Exception:
-                completed = False
-            if completed:
-                with self._lock:
-                    self._background_notification_claims.pop((delegation_id, claim_id), None)
-            return {"delegation_id": delegation_id, "completed": completed}
-
         if delegation_id.startswith('kanban:'):
             return {"delegation_id": delegation_id, "completed": False}
 
@@ -2446,6 +2587,12 @@ class AgentPool:
             name=f"hermes-bridge-run-{run_id[:8]}",
         )
         thread._bridge_session_id = session.session_id
+        binding = getattr(session.agent, '_hermes_bridge_model_run_auth', None)
+        if binding is not None and binding.run_marker.startswith('recovery_v1_'):
+            from agent.recovery_lifecycle import RecoveryLifecycle
+            record.recovery_lifecycle = RecoveryLifecycle(thread)
+            with self._lock:
+                self._recovery_runs[record.run_id] = (session.session_id, binding, record.recovery_lifecycle)
         with self._lock:
             self._run_threads.add(thread)
         with session.lock:
@@ -2455,9 +2602,61 @@ class AgentPool:
             except BaseException as exc:
                 self._fail_unexpected_run(session, record, exc)
                 raise
+        threading.Thread(target=self._release_after_run_exit, args=(session_id, thread),
+                         daemon=True, name=f'session-exit-{run_id[:8]}').start()
+        if getattr(record, 'recovery_lifecycle', None) is not None:
+            threading.Thread(target=self._persist_recovery_exit,
+                             args=(session.session_id, record.run_id, binding, record.recovery_lifecycle),
+                             daemon=True, name=f'recovery-exit-{run_id[:8]}').start()
         return record
 
-    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, workspace: str | None = None, source: str | None = None, reasoning_effort: str | None = None) -> None:
+    def _persist_recovery_exit(self, session_id, run_id, binding, tracker):
+        from bridge_loops import LoopStore
+        from bridge_recovery_resources import persist_owner_exit
+        store = LoopStore(os.environ['HERMES_HOME'])
+        while True:
+            observation = tracker.observe()
+            if observation['outcome'] == 'unknown':
+                return
+            if observation['outcome'] == 'exited_proven':
+                try:
+                    if persist_owner_exit(store, session_id, binding, run_id, observation):
+                        tracker.exit_persisted = True
+                        with self._lock:
+                            self._release_idle_admission(session_id)
+                        return
+                except Exception:
+                    pass
+            time.sleep(0.2)
+
+    def _run_chat(self, session, record, *args, **kwargs):
+        tracker = getattr(record, 'recovery_lifecycle', None)
+        if tracker is None:
+            return self._run_chat_owned(session, record, *args, **kwargs)
+        cleanup_ok = False
+        try:
+            with tracker.scope():
+                self._run_chat_owned(session, record, *args, **kwargs)
+                cleanup_ok = not bool((record.result or {}).get('cleanup_error'))
+        finally:
+            tracker.finish_owner(cleanup_ok)
+
+    def observe_recovery_exit(self, session_id, run_id, model_run_auth):
+        binding = ModelRunAuth.parse(model_run_auth)
+        with self._lock:
+            if not run_id:
+                matches = [(rid, owned) for rid, owned in self._recovery_runs.items() if owned[:2] == (session_id, binding)]
+                if len(matches) == 1:
+                    run_id, owned = matches[0]
+                else:
+                    owned = None
+            else:
+                owned = self._recovery_runs.get(run_id)
+        if not owned or owned[:2] != (session_id, binding):
+            return {'outcome': 'unknown', 'reason': 'original_run_not_registered'}
+        return {**owned[2].observe(), 'run_id': run_id}
+
+    def _run_chat_owned(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, workspace: str | None = None, source: str | None = None, reasoning_effort: str | None = None) -> None:
         # One publication boundary, including profile/context/auth cleanup. The
         # body may stage terminal fields, but readers and ACK share this seal.
         with self._lock:
@@ -2485,6 +2684,8 @@ class AgentPool:
                 if record.status == "running":
                     self._fail_unexpected_run(session, record, RuntimeError("Hermes run worker exited without a terminal result"))
                 record.finalizing = False
+                if session.session_id not in self._sessions and not self.has_active_background_for_session(session.session_id):
+                    self._release_idle_admission(session.session_id)
 
     def _fail_unexpected_run(self, session: AgentSession | None, record: RunRecord, exc: BaseException) -> None:
         with session.lock if session else self._lock:
@@ -3593,6 +3794,9 @@ class AgentPool:
         callbacks here. Diagnostic reads must leave the retirement inputs intact.
         """
         counts = {
+            "recovery_resource": sum(tracker.observe()['outcome'] != 'exited_proven'
+                or not getattr(tracker, 'exit_persisted', False)
+                for _, _, tracker in getattr(self, '_recovery_runs', {}).values()),
             "run_or_finalizing": sum(t.is_alive() for t in self._run_threads)
                 + sum(s.running for s in self._sessions.values()),
             "unconsumed_result": sum(
@@ -3794,6 +3998,8 @@ class AgentPool:
                 session.agent.interrupt("Session destroyed")
             except Exception:
                 pass
+        if not session.running:
+            self._release_idle_admission(session_id)
         self._close_model_run_auth(getattr(session.agent, "_hermes_bridge_model_run_auth", None))
         return {
             "session_id": session_id,

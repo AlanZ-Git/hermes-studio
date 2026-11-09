@@ -534,6 +534,9 @@ export function clearSessionMessages(id: string): number {
   db.exec('BEGIN')
   try {
     const result = db.prepare(`DELETE FROM ${MESSAGES_TABLE} WHERE session_id = ?`).run(id)
+    if ((db.prepare('PRAGMA table_info(kanban_notification_receipts)').all() as any[]).some(column => column.name === 'reference_state')) {
+      db.prepare("UPDATE kanban_notification_receipts SET reference_state='deleted', reference_error='Session history explicitly cleared' WHERE session_id=?").run(id)
+    }
     db.prepare(`DELETE FROM ${TASK_PLANS_TABLE} WHERE session_id = ?`).run(id)
     db.prepare(`DELETE FROM ${SESSION_TASKS_TABLE} WHERE session_id = ?`).run(id)
     db.prepare(`DELETE FROM ${COMPRESSION_SNAPSHOT_TABLE} WHERE session_id = ?`).run(id)

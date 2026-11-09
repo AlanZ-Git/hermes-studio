@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from 'child_process'
-import { existsSync } from 'fs'
+import { existsSync, realpathSync, statSync } from 'fs'
 import { createConnection, createServer } from 'net'
 import { isAbsolute, join, resolve } from 'path'
 import { logger } from '../../../studio/public/logging'
@@ -8,6 +8,21 @@ import { OPENROUTER_APP_HEADERS } from '../../../studio/public/openrouter-attrib
 import { resolveHermesInstallationEnvironment } from '../runtime/installation'
 import { detectHermesHome, getHermesBin } from '../runtime/path'
 import { AgentBridgeClient, DEFAULT_AGENT_BRIDGE_ENDPOINT } from './client'
+import { getStoragePath } from '../../../studio/infrastructure/database'
+import { initKanbanNotificationStore } from '../../../studio/repositories/kanban-notification-store'
+
+function notificationReceiver() {
+  initKanbanNotificationStore()
+  const path = realpathSync(getStoragePath())
+  const stat = statSync(path)
+  return [path, stat.dev, stat.ino]
+}
+
+function verifyNotificationReceiver(response: any) {
+  if (JSON.stringify(response.notification_receiver) !== JSON.stringify(notificationReceiver())) {
+    throw new Error('Studio notification receiver configuration mismatch')
+  }
+}
 
 const DEFAULT_AGENT_BRIDGE_STARTUP_TIMEOUT_MS = 120000
 const DEFAULT_AGENT_BRIDGE_RESTART_DELAY_MS = 1000
@@ -98,6 +113,7 @@ export function buildAgentBridgeProcessEnv(endpoint: string, hermesHome: string 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HERMES_AGENT_BRIDGE_ENDPOINT: endpoint,
+    HERMES_STUDIO_NOTIFICATION_DB: String(notificationReceiver()[0]),
     HERMES_HOME: hermesHome,
     // Shared Hermes YAML may have been rewritten by another Studio instance.
     // Carry the owner separately so each worker can scope managed MCP launches.
@@ -732,7 +748,7 @@ export class AgentBridgeManager {
         timeoutMs: options.timeoutMs ?? 1000,
         connectRetryMs: options.connectRetryMs ?? 0,
       })
-      await client.ping()
+      verifyNotificationReceiver(await client.ping())
       return {
         ...readiness,
         status: 'ready',
@@ -741,6 +757,7 @@ export class AgentBridgeManager {
         running: true,
       }
     } catch (err) {
+      if (err instanceof Error && err.message === 'Studio notification receiver configuration mismatch') throw err
       return {
         ...readiness,
         ready: false,
@@ -1081,7 +1098,7 @@ export class AgentBridgeManager {
         })
         while (!startupSettled && !child.killed) {
           try {
-            await client.ping()
+            verifyNotificationReceiver(await client.ping())
             markReady()
             return
           } catch {
@@ -1105,7 +1122,7 @@ export class AgentBridgeManager {
         timeoutMs: envPositiveInt('HERMES_AGENT_BRIDGE_ATTACH_TIMEOUT_MS') ?? 5000,
         connectRetryMs: envPositiveInt('HERMES_AGENT_BRIDGE_ATTACH_RETRY_MS') ?? 5000,
       })
-      await client.ping()
+      verifyNotificationReceiver(await client.ping())
       this.child = null
       this.attached = true
       this.ready = true
@@ -1113,6 +1130,7 @@ export class AgentBridgeManager {
       logger.info('[agent-bridge] attached to existing bridge at %s', this.endpoint)
       return true
     } catch (err) {
+      if (err instanceof Error && err.message === 'Studio notification receiver configuration mismatch') throw err
       logger.debug(err, '[agent-bridge] no reusable bridge at %s', this.endpoint)
       this.attached = false
       this.ready = false

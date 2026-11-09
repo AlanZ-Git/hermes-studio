@@ -1,4 +1,5 @@
-import { diagnosePendingKanbanNotification, pendingKanbanNotifications, receiveKanbanNotification } from '../repositories/kanban-notification-store'
+import { compatibilityRollbackProtected } from '../services/compatibility-rollback'
+import { diagnosePendingKanbanNotification, kanbanReferenceIssues, pendingKanbanNotifications, receiveKanbanNotification } from '../repositories/kanban-notification-store'
 import { personSessionIds } from '../repositories/person-session-store'
 import type { PersonResultDelivery } from '../public/person-runtime'
 import { personUser } from '../services/person/catalog'
@@ -2239,6 +2240,8 @@ export class ChatRunSocket {
   private readonly loopRuntime = new LoopRuntime({
     sessionMap: this.sessionMap,
     request: payload => this.backgroundBridge.request(payload),
+    abortRecovery: (binding, reason) => this.backgroundBridge.request({ ...binding, action: 'abort_recovery', reason }),
+    observeRecoveryExit: binding => this.backgroundBridge.request({ ...binding, action: 'observe_recovery_exit' }),
     profiles: () => ['default', ...listProfileNamesFromDisk()],
     owner: row => this.socketForBackgroundRun(row.id).data.user,
     socket: sessionId => this.socketForBackgroundRun(sessionId),
@@ -2286,6 +2289,7 @@ export class ChatRunSocket {
   }
 
   private async scheduleBackgroundNotification(notification: AgentBridgeBackgroundNotification, recovered = false) {
+    if (compatibilityRollbackProtected()) return
     const sessionId = String(notification.session_id || '').trim()
     const delegationId = String(notification.delegation_id || '').trim()
     const claimId = String(notification.claim_id || '').trim()
@@ -2329,6 +2333,14 @@ export class ChatRunSocket {
           && (notification.studio_auto_continue !== 'v1' || notification.wake_eligible === true)
           && !notification.execution_stopped
         const { receipt, message } = receiveKanbanNotification(notification, wake)
+        if (!message) {
+          state.queue = state.queue.filter(item => item.backgroundDelegationId !== delegationId)
+          this.emitExternalEvent(sessionId, 'delegation.updated', { event: 'delegation.updated',
+            delegation_id: delegationId, delivery_status: receipt.consumer_state,
+            reference_state: receipt.reference_state, error: receipt.reference_error })
+          await releaseClaim()
+          return
+        }
         if (!state.messages.some(item => item.id === message.id)) state.messages.push(message)
         this.emitExternalEvent(sessionId, 'delegation.updated', { event: 'delegation.updated',
           profile: notification.profile, delegation_id: delegationId, status: notification.status,
@@ -2337,11 +2349,7 @@ export class ChatRunSocket {
         // Durable visible acceptance is independent of every consumer state.
         // Pending responsibility is recovered below through the existing poll,
         // so a supervision pause cannot pin the source cursor and hide E2.
-        if (!recovered) {
-          const ack = await this.backgroundBridge.completeBackgroundNotification(sessionId, notification.profile, delegationId, claimId)
-          claimAccepted = Boolean(ack?.completed)
-          if (!claimAccepted) await releaseClaim()
-        }
+        claimAccepted = true
         if (receipt.consumer_state !== 'pending') {
           state.queue = state.queue.filter(item => item.backgroundDelegationId !== delegationId)
           return
@@ -2445,7 +2453,7 @@ export class ChatRunSocket {
   }
 
   private async pollBackgroundWork() {
-    if (this.closing || this.backgroundPollInFlight || Date.now() < this.backgroundPollRetryAt || !this.needsBackgroundPoll()) return
+    if (compatibilityRollbackProtected() || this.closing || this.backgroundPollInFlight || Date.now() < this.backgroundPollRetryAt || !this.needsBackgroundPoll()) return
     this.backgroundPollInFlight = true
     try {
       // Kanban work can complete after all foreground workers have retired.
@@ -2490,6 +2498,9 @@ export class ChatRunSocket {
       for (const notification of pendingKanbanNotifications()) {
         await this.scheduleBackgroundNotification(notification, true)
       }
+      for (const issue of kanbanReferenceIssues()) {
+        this.emitExternalEvent(issue.session_id, 'delegation.updated', issue)
+      }
     } catch (err) {
       this.backgroundPollRetryAt = Date.now() + 5000
       logger.debug(err, '[chat-run-socket] background bridge poll unavailable')
@@ -2525,7 +2536,20 @@ export class ChatRunSocket {
       this.personQuestions.set(sid, question)
       if (question && !resumeEvents.some(entry => entry.data?.approval_id === question.data.approval_id && entry.data?.clarify_id === question.data.clarify_id)) resumeEvents.push(question)
     }
+    for (const issue of kanbanReferenceIssues(sid)) {
+      resumeEvents.push({ event: 'delegation.updated', data: issue })
+    }
     const sessionDetail = getSessionMetadata(sid)
+    if (sessionDetail && isHermesWorkerBackedSession(sessionDetail)) {
+      try {
+        for (const issue of await this.loopRuntime.recoveryIssues(sid, sessionDetail?.profile || 'default')) {
+          resumeEvents.push({ event: 'agent.event', data: issue })
+        }
+      } catch {
+        resumeEvents.push({ event: 'agent.event', data: { event: 'agent.event', session_id: sid,
+          kind: 'recovery.resource', text: 'Recovery resource verification is unavailable; unsettled capacity remains reserved.' } })
+      }
+    }
     const messagePage = buildResumeMessagePage(state.messages, {
       limit: state.messagePageLimit,
       messageTotal: state.messageTotal,
@@ -3880,10 +3904,13 @@ export class ChatRunSocket {
   }
 
   /** Close all active upstream response streams */
-  async close() {
+  async close(deadline = Date.now() + 5000) {
     if (this.closing) return
     this.closing = true
-    this.loopRuntime.close()
+    const recoveryDrain = await this.loopRuntime.close(deadline)
+    if (recoveryDrain.status === 'unresolved') {
+      logger.warn({ unresolved: recoveryDrain.unresolved }, '[chat-run-socket] recovery exit remains unverified; persistent reservations retained')
+    }
     this.stopUsageUpdates()
     this.stopPersonUpdates()
     this.sessionStateSync.close()

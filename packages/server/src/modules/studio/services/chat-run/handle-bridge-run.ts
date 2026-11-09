@@ -794,7 +794,7 @@ export async function handleBridgeRun(
     }
     modelRunAuth = await createModelRunSource(socketUser, profile, runMarker)
     state.modelRunAuth = modelRunAuth
-    data.recoveryRegister?.(modelRunAuth)
+    await data.recoveryRegister?.(modelRunAuth)
     await ensureBridgeFixedContext({
       modelRunAuth, sessionId: session_id, profile, model: resolvedModel,
       provider: resolvedProvider, workspace, instructions: fullInstructions,
@@ -802,7 +802,9 @@ export async function handleBridgeRun(
     })
     const history = callbackContext
       ? structuredClone(callbackContext.messages)
-      : await buildCompressedHistory(
+      : data.recoveryRegister
+        ? await buildDbSnapshotAwareHistory(session_id, profile, { excludeLastUser: shouldPersistUserMessage }, { model: resolvedModel, provider: resolvedProvider })
+        : await buildCompressedHistory(
         session_id, profile,
         '',
         undefined,
@@ -1740,6 +1742,7 @@ async function applyBridgeChunkAsync(
       emit('compression.started', payload)
       if (ev.request_id && Array.isArray(ev.messages)) {
         try {
+          if (runMarker.startsWith('recovery_v1_')) throw new Error('Recovery context exceeds saved history budget; untracked summarization is not allowed')
           const compressed = await forceCompressBridgeHistory(
             sessionId,
             profile,

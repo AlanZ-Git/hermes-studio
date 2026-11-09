@@ -2818,6 +2818,22 @@ function createChatState(scopedSessionId?: string) {
 
     if (eventName === 'delegation.updated') {
       const delegationId = String(evt.delegation_id || '').trim()
+      if (delegationId.startsWith('kanban:')) {
+        const issueId = `notification-issue:${delegationId}`
+        const issue = getSessionMsgs(sessionId).find(message => message.id === issueId)
+        const unresolved = ['orphaned', 'deleted'].includes(String((evt as any).reference_state || ''))
+          || (evt as any).delivery_status === 'uncertain'
+        if (unresolved) {
+          const content = String((evt as any).error || 'Received; notification outcome cannot be confirmed. Automatic replay is paused')
+          if (issue) updateMessage(sessionId, issueId, { content, commandData: { ...evt } })
+          else addMessage(sessionId, { id: issueId, role: 'system', content, timestamp: Date.now(),
+            systemType: 'error', commandAction: 'notification.issue', commandData: { ...evt } })
+        } else if (issue) {
+          const session = sessions.value.find(session => session.id === sessionId)
+          if (session) session.messages = session.messages.filter(message => message.id !== issueId)
+        }
+        return
+      }
       const status = subagentStatus((evt as any).status)
       if (status === 'running') return
       const sessionStreams = [...subagentStreams.value.values()].filter(stream =>

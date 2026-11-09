@@ -111,6 +111,51 @@ describe('chat store error handling - #1644', () => {
     })
   })
 
+  it('displays persisted Kanban orphan and uncertain diagnoses without starting or replaying work', async () => {
+    const store = useChatStore()
+    store.sessions = [makeSession('notification-session')]
+    store.activeSessionId = 'notification-session'
+    store.activeSession = store.sessions[0]
+    await store.sendMessage('ordinary human input')
+    const onEvent = chatApi.startRunViaSocket.mock.calls[0][1] as (event: any) => void
+    const orphan = { event: 'delegation.updated', session_id: 'notification-session',
+      delegation_id: 'kanban:orphan', reference_state: 'orphaned', delivery_status: 'pending',
+      error: 'Received; original message location cannot be confirmed' }
+    onEvent(orphan)
+    onEvent(orphan)
+    onEvent({ ...orphan, delegation_id: 'kanban:uncertain', reference_state: 'visible', delivery_status: 'uncertain',
+      error: 'Received; dispatch outcome cannot be confirmed. Automatic replay is paused' })
+    const issues = () => store.sessions[0].messages.filter(message => message.commandAction === 'notification.issue')
+    expect(issues()).toHaveLength(2)
+    expect(issues()[0].content).toBe(orphan.error)
+    expect(issues()[1].content).toContain('Automatic replay is paused')
+    onEvent({ event: 'run.completed', session_id: 'notification-session', output: 'human response' })
+    expect(issues()).toHaveLength(2)
+    expect(chatApi.startRunViaSocket).toHaveBeenCalledTimes(1)
+    onEvent({ ...orphan, reference_state: 'visible', delivery_status: 'consumed', error: undefined })
+    expect(issues()).toHaveLength(1)
+    expect(issues()[0].id).toContain('kanban:uncertain')
+  })
+
+  it('restores Kanban diagnoses from resume events without replaying a model turn', async () => {
+    const store = useChatStore()
+    store.sessions = [makeSession('resume-notification')]
+    chatApi.resumeSession.mockImplementation((sessionId: string, onResumed: (data: any) => void) => {
+      onResumed({ session_id: sessionId, messages: [], isWorking: false, events: [{
+        event: 'delegation.updated', data: { event: 'delegation.updated', session_id: sessionId,
+          delegation_id: 'kanban:restart', delivery_status: 'uncertain', reference_state: 'visible',
+          error: 'Received; dispatch outcome cannot be confirmed. Automatic replay is paused' },
+      }] })
+      return {} as any
+    })
+    await store.switchSession('resume-notification')
+    const issues = store.sessions.find(session => session.id === 'resume-notification')!.messages
+      .filter(message => message.commandAction === 'notification.issue')
+    expect(issues).toHaveLength(1)
+    expect(issues[0].content).toContain('Automatic replay is paused')
+    expect(chatApi.startRunViaSocket).not.toHaveBeenCalled()
+  })
+
   it('reuses completion notifications for Person terminal events outside the active conversation once',()=>{
     const store=useChatStore(),settings=useSettingsStore()
     settings.display.notify_on_complete=true

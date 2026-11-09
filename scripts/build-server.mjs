@@ -37,6 +37,7 @@ for (const fileName of readdirSync(bridgeSrcDir)) {
   }
 }
 chmodSync(resolve(bridgeOutDir, 'hermes_bridge.py'), 0o755)
+cpSync(resolve(rootDir, 'scripts/notification_retention.py'), resolve(bridgeOutDir, 'notification_retention.py'))
 
 const serverAssetsSrcDir = resolve(rootDir, 'packages/server/src/assets')
 if (existsSync(serverAssetsSrcDir)) {

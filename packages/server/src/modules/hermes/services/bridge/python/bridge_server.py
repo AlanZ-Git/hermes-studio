@@ -48,6 +48,8 @@ class BridgeServer:
             return self._handle(req)
 
     def _handle(self, req: dict[str, Any]) -> dict[str, Any]:
+        from bridge_compatibility import guard
+        guard(req)
         action = str(req.get("action") or "").strip()
         if not action:
             raise ValueError("action is required")
@@ -63,6 +65,7 @@ class BridgeServer:
             running_sessions = sum(1 for session in sessions if session.running)
             return {
                 "pong": True,
+                "notification_receiver": self.pool._studio_notifications.configuration(),
                 "time": time.time(),
                 "pid": os.getpid(),
                 "agent_root": str(_agent_root()),
@@ -223,6 +226,10 @@ class BridgeServer:
 
         if action == "interrupt":
             return self.pool.interrupt(str(req.get("session_id") or ""), req.get("message"))
+
+        if action == 'observe_recovery_exit':
+            return self.pool.observe_recovery_exit(str(req.get('session_id') or ''),
+                                                   str(req.get('expected_run_id') or ''), req.get('model_run_auth'))
 
         if action == "request_boundary_interrupt":
             return self.pool.request_boundary_interrupt(

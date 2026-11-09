@@ -34,6 +34,8 @@ class BridgeBroker:
         self.endpoint = endpoint
         self.agent_root = agent_root
         self.hermes_home = hermes_home
+        from bridge_studio_notifications import StudioNotificationStore
+        self._studio_notifications = StudioNotificationStore()
         self._workers: dict[str, WorkerProcess] = {}
         self._run_profile: dict[str, str] = {}
         self._run_worker_key: dict[str, str] = {}
@@ -61,6 +63,8 @@ class BridgeBroker:
         self._draining: set[str] = set()
         self._gc_thread: threading.Thread | None = None
         self._lifecycle_events: deque[dict[str, Any]] = deque(maxlen=128)
+        from bridge_recovery_coordinator import RecoveryCoordinator
+        self._recovery = RecoveryCoordinator(self)
 
     def _normalize_profile(self, value: Any) -> str:
         profile = str(value or "").strip()
@@ -176,6 +180,7 @@ class BridgeBroker:
             self._background_claim_bindings.clear()
         for worker in workers:
             worker.stop()
+        self._recovery.close()
 
     def _forward(self, profile: str, req: dict[str, Any], worker_key: str | None = None, *, record_routes: bool = True) -> dict[str, Any]:
         profile = self._normalize_profile(profile)
@@ -255,6 +260,8 @@ class BridgeBroker:
         return resp
 
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
+        from bridge_compatibility import guard
+        guard(req)
         action = str(req.get("action") or "").strip()
         if not action:
             raise ValueError("action is required")
@@ -282,6 +289,7 @@ class BridgeBroker:
                 running_sessions = len(self._running_run_profile)
             return {
                 "pong": True,
+                "notification_receiver": self._studio_notifications.configuration(),
                 "time": time.time(),
                 "mode": "broker",
                 "broker": {
@@ -357,7 +365,18 @@ class BridgeBroker:
             resp["worker_key"] = worker_key
             return resp
 
+        if action == 'recovery_quiesce':
+            with self._recovery.gate:
+                self._recovery.admission_closed = True
+                return {'resources': self._recovery.all()}
+        if action == 'recovery_resources':
+            with self._recovery.gate:
+                return {'resources': self._recovery.all()}
+        if action in {'abort_recovery', 'observe_recovery_exit'}:
+            return self._recovery.control(req, cancel=action == 'abort_recovery')
+
         if action == "chat":
+            self._recovery.check_dispatch(req)
             profile = self._normalize_profile(req.get("profile"))
             binding = ModelRunAuth.parse(req.get("model_run_auth"), profile)
             key = binding.worker_key()
@@ -390,6 +409,8 @@ class BridgeBroker:
             if req.get('model_run_auth') is not None or req.get('worker_key') is not None:
                 raise ValueError('loop operation route override forbidden')
             profile = self._normalize_profile(req.get('profile'))
+            if str(req.get('op', '')).startswith('recovery_'):
+                return self._recovery.operate({**req, 'profile': profile})
             return self._forward(profile, req, profile)
 
         if action == "context_estimate":

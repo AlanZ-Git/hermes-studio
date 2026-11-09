@@ -33,10 +33,15 @@ function fixture(recovery = false) {
   const host: any = {
     sessionMap: new Map(), profiles: () => ['alpha'], owner: vi.fn(() => owner),
     socket: () => ({ data: { user: owner } }), closing: () => false, emit: vi.fn(),
-    request: vi.fn(async (data: any) => data.action === 'loop_list' ? { loops: [item] }
+    abortRecovery: vi.fn(async () => ({ outcome: 'unknown', reason: 'synthetic unproven' })),
+    observeRecoveryExit: vi.fn(async () => ({ outcome: 'unknown', reason: 'synthetic unproven' })),
+    request: vi.fn(async (data: any) => data.action === 'recovery_resources' ? { resources: [] }
+      : data.action === 'loop_list' ? { loops: [item] }
+      : data.op === 'recovery_claim' ? { authorized: true, generation: 2, reservation_id: 'reservation' }
       : data.op === 'claim' ? { claimed: true, generation: 2, prompt: 'inspect' }
         : { authorized: true }),
     run: vi.fn(async (_socket: any, data: any) => {
+      await data.recoveryRegister?.({ version: 1, owner_id: '1', profile: 'alpha', run_marker: 'recovery_v1_fixture', token_path: '/synthetic/token-reference' })
       await data.loopBeforeDispatch()
       data.loopDispatchConfirmed()
       data.onEvent('run.started', { run_id: 'run' })
@@ -57,6 +62,25 @@ async function settle(runtime: LoopRuntime) {
 describe('native loop runtime dispatch evidence', () => {
   beforeEach(() => { rows.clear(); details.clear(); vi.clearAllMocks() })
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
+  it('restores only the bound session/profile recovery diagnosis without exposing cleanup credentials', async () => {
+    const { host, runtime } = fixture()
+    const resources = [{ session_id: 'session', profile: 'alpha', recovery_id: 'old-recovery',
+      expected_generation: 1, cancel_requested: true, outcome: 'unknown', last_observed_at: 100,
+      evidence: { reason: 'original_worker_unavailable' }, model_run_auth: { token_path: 'PRIVATE' } },
+    { session_id: 'other', profile: 'alpha', cancel_requested: true },
+    { session_id: 'session', profile: 'beta', cancel_requested: true }]
+    host.request.mockResolvedValue({ resources })
+    const issues = await runtime.recoveryIssues('session', 'alpha')
+    expect(issues).toHaveLength(1)
+    expect(issues[0]).toMatchObject({ event: 'agent.event', recovery_id: 'old-recovery', generation: 1, last_observed_at: 100000 })
+    expect(issues[0].text).toContain('Recovery stop result pending verification')
+    expect(issues[0].text).toContain('original_worker_unavailable')
+    expect(JSON.stringify(issues)).not.toContain('PRIVATE')
+    expect(host.run).not.toHaveBeenCalled()
+    host.request.mockResolvedValue({ resources: [] })
+    expect(await runtime.recoveryIssues('session', 'alpha')).toEqual([])
+  })
+
   it('owns one timer and stops polling on close', async () => {
     vi.useFakeTimers()
     const { host, runtime } = fixture()
@@ -64,7 +88,7 @@ describe('native loop runtime dispatch evidence', () => {
     runtime.start(); runtime.start()
     await vi.advanceTimersByTimeAsync(1100)
     expect(host.request.mock.calls.filter(([v]: any[]) => v.action === 'loop_list')).toHaveLength(3)
-    runtime.close()
+    await runtime.close()
     const count = host.request.mock.calls.length
     await vi.advanceTimersByTimeAsync(2000)
     runtime.start()
@@ -98,7 +122,14 @@ describe('native loop runtime dispatch evidence', () => {
     let now = Date.now()
     vi.spyOn(Date, 'now').mockImplementation(() => now)
     const normal = host.request.getMockImplementation()!
-    host.request.mockImplementationOnce(normal).mockRejectedValueOnce(new Error('synthetic list failure'))
+    let failed = false
+    host.request.mockImplementation(async (data: any) => {
+      if (data.action === 'loop_list' && !failed) {
+        failed = true
+        throw new Error('synthetic list failure')
+      }
+      return normal(data)
+    })
     await runtime.poll()
     expect(host.run).not.toHaveBeenCalled()
     const calls = host.request.mock.calls.length
@@ -325,6 +356,95 @@ describe('native loop runtime dispatch evidence', () => {
     expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ op: 'unknown', not_started: false, run_id: 'run' }))
     expect(host.request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'abandon' }))
     expect(host.run).toHaveBeenCalledOnce()
+  })
+  it('cancels only the persisted original binding after 301 seconds, retaining unknown capacity', async () => {
+    const { host, runtime } = fixture()
+    const resource = { session_id: 'session', profile: 'old-profile', recovery_id: 'old-recovery', expected_generation: 1,
+      reservation_id: 'old-reservation', run_id: 'old-run', run_marker: 'recovery_v1_old', deadline_at: Date.now() / 1000 - 301,
+      model_run_auth: { version: 1, profile: 'old-profile', owner_id: 'old-owner', run_marker: 'recovery_v1_old', token_path: '/synthetic/PRIVATE' } }
+    host.request.mockImplementation(async (value: any) => value.action === 'recovery_resources' ? { resources: [resource] } : { loops: [] })
+    await runtime.poll()
+    expect(host.abortRecovery).toHaveBeenCalledWith(resource, 'Recovery decision deadline expired')
+    expect((runtime as any).resources.size).toBe(1)
+    expect(host.run).not.toHaveBeenCalled()
+    expect(JSON.stringify(host.emit.mock.calls)).not.toContain('PRIVATE')
+    host.abortRecovery.mockResolvedValue({ outcome: 'exited_proven' })
+    await runtime.poll()
+    expect((runtime as any).resources.size).toBe(0)
+  })
+  it('awaits original exit during close and closes admission before taking the final inventory', async () => {
+    const { host, runtime } = fixture()
+    const resource = { session_id: 'session', profile: 'alpha', recovery_id: 'original', expected_generation: 1, reservation_id: 'reservation' }
+    let saved = [resource]
+    let release!: () => void
+    const exit = new Promise<void>(resolve => { release = resolve })
+    host.request.mockImplementation(async (value: any) => value.action === 'recovery_resources' ? { resources: saved } : {})
+    host.abortRecovery.mockImplementation(async () => { await exit; saved = []; return { outcome: 'exited_proven' } })
+    let closed = false
+    const closing = runtime.close(Date.now() + 3000).then(result => { closed = true; return result })
+    await vi.waitFor(() => expect(host.abortRecovery).toHaveBeenCalledOnce())
+    expect(closed).toBe(false)
+    expect(host.request.mock.calls[0][0]).toEqual({ action: 'recovery_quiesce' })
+    release()
+    await expect(closing).resolves.toEqual({ status: 'drained', unresolved: 0 })
+    expect(host.run).not.toHaveBeenCalled()
+  })
+  it('cancels recovery promptly but retains ordinary in-flight responsibility at the shutdown deadline', async () => {
+    const { host, runtime } = fixture()
+    let release!: () => void
+    const ordinary = new Promise<void>(resolve => { release = resolve })
+    host.run.mockImplementation(async () => { await ordinary })
+    await runtime.poll()
+    await vi.waitFor(() => expect(host.run).toHaveBeenCalledOnce())
+    let quiesced = false, cancelled = false
+    const resource = { session_id: 'other', profile: 'beta', recovery_id: 'original', expected_generation: 1, reservation_id: 'original' }
+    host.request.mockImplementation(async (data: any) => {
+      if (data.action === 'recovery_quiesce') quiesced = true
+      return data.action === 'recovery_resources' ? { resources: quiesced && !cancelled ? [resource] : [] } : {}
+    })
+    host.abortRecovery.mockImplementation(async () => { cancelled = true; return { outcome: 'exited_proven' } })
+    const closing = runtime.close(Date.now() + 400)
+    await vi.waitFor(() => expect(host.abortRecovery).toHaveBeenCalledWith(resource, 'Studio shutdown; recovery decisions revoked'))
+    await expect(closing).resolves.toEqual({ status: 'unresolved', unresolved: 1 })
+    expect((runtime as any).runs.size).toBe(1)
+    release()
+    await vi.waitFor(() => expect((runtime as any).runs.size).toBe(0))
+    await expect(runtime.close(Date.now() + 400)).resolves.toEqual({ status: 'drained', unresolved: 0 })
+  })
+  it('does not call a racing poll drained or admit its returned ordinary loop after quiesce', async () => {
+    const { host, runtime, item } = fixture()
+    let release!: (value: any) => void
+    const listing = new Promise(resolve => { release = resolve })
+    const normal = host.request.getMockImplementation()!
+    host.request.mockImplementation((data: any) => data.action === 'loop_list' ? listing : normal(data))
+    const poll = runtime.poll()
+    await vi.waitFor(() => expect(host.request).toHaveBeenCalledWith(expect.objectContaining({ action: 'loop_list' })))
+    await expect(runtime.close(Date.now() + 300)).resolves.toEqual({ status: 'unresolved', unresolved: 1 })
+    expect(host.run).not.toHaveBeenCalled()
+    release({ loops: [item] })
+    await poll
+    expect(host.run).not.toHaveBeenCalled()
+    await expect(runtime.close(Date.now() + 300)).resolves.toEqual({ status: 'drained', unresolved: 0 })
+  })
+  it('reports unresolved rather than draining on a short remaining shutdown budget', async () => {
+    vi.useFakeTimers()
+    const { host, runtime } = fixture()
+    const resource = { session_id: 'session', profile: 'alpha', recovery_id: 'original', expected_generation: 1, reservation_id: 'reservation' }
+    host.request.mockImplementation(async (value: any) => value.action === 'recovery_resources' ? { resources: [resource] } : {})
+    host.abortRecovery.mockImplementation(() => new Promise(() => {}))
+    const closing = runtime.close(Date.now() + 250)
+    await vi.advanceTimersByTimeAsync(151)
+    await expect(closing).resolves.toEqual({ status: 'unresolved', unresolved: 1 })
+    expect((runtime as any).resources.size).toBe(1)
+  })
+  it('protected rollback does not admit recovery or ordinary scheduling', async () => {
+    const { host, runtime } = fixture(true)
+    vi.stubEnv('HERMES_STUDIO_COMPATIBILITY_ROLLBACK', '1')
+    try {
+      await runtime.poll()
+      expect(host.request).not.toHaveBeenCalled()
+      expect(host.run).not.toHaveBeenCalled()
+    } finally { vi.unstubAllEnvs() }
   })
   it('rejects invalidated owner before dispatch and closes capabilities at shutdown', async () => {
     const { host, runtime } = fixture()

@@ -7,8 +7,10 @@
  */
 
 import { initAllHermesTables } from './schemas'
+import { initKanbanNotificationStore } from '../../repositories/kanban-notification-store'
 
 export function initAllStores(): void {
   // Initialize all tables with centralized schema definitions and migrations
   initAllHermesTables()
+  initKanbanNotificationStore()
 }

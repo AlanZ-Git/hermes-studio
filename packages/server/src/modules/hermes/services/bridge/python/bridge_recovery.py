@@ -16,7 +16,7 @@ def exhausted(state):
 def boot(store,mgr,meta,recovery_only=False):
     state=mgr.state;tick=meta.get('tick');r=meta.get('recovery')
     if r and r['status'] in {'claimed','injecting','started'}:
-        if r['status']=='claimed' and r['attempts']<2:
+        if r['status']=='claimed' and r['attempts']<2 and not r.get('resource'):
             r.update(status='pending',result='restart before recovery dispatch; one retry permitted')
         else:
             r.update(status='failed',result='recovery interrupted; no automatic replay',finished_at=time.time())
@@ -48,6 +48,9 @@ def boot(store,mgr,meta,recovery_only=False):
 
 def operation(store,db,mgr,meta,req):
     state=mgr.state;r=meta.get('recovery');op=req['op'];now=time.time()
+    if op in {'recovery_bind', 'recovery_dispatch', 'recovery_resource_started', 'recovery_cancel', 'recovery_resource_observed'}:
+        from bridge_recovery_resources import operation as resource_operation
+        return resource_operation(store,db,mgr,meta,req)
     valid=(r and r['id']==req.get('recovery_id') and
            meta['generation']==r['generation']==req.get('expected_generation') and
            state and state.status=='paused')
@@ -64,8 +67,18 @@ def operation(store,db,mgr,meta,req):
     elif op=='recovery_claim':
         if r['status']!='pending' or r['attempts']>=2:return store.result(state,meta,authorized=False)
         r.update(status='claimed',attempts=r['attempts']+1,claimed_at=now)
+        if req.get('reservation_id'):
+            r['resource']={'reservation_id':req['reservation_id'], 'profile':req['profile'],
+                           'phase':'reserved', 'outcome':'unknown', 'reserved_at':now,
+                           'cancel_requested':False}
     elif op=='recovery_inject':
         if r['status']!='claimed':return store.result(state,meta,authorized=False)
+        resource=r.get('resource')
+        if resource:
+            if (resource.get('cancel_requested') or not resource.get('model_run_auth')
+                    or resource['reservation_id']!=req.get('reservation_id')):
+                return store.result(state,meta,authorized=False)
+            resource['phase']='dispatching'
         r.update(status='injecting',started_at=now,deadline_at=now+300)
     elif op=='recovery_started':
         if r['status']!='injecting':return store.result(state,meta,authorized=False)
@@ -96,7 +109,7 @@ def operation(store,db,mgr,meta,req):
     elif op=='recovery_failed':
         if r['status'] not in {'claimed','injecting','started'}:return store.result(state,meta,stale=True)
         # Only the caller's positive local proof of no dispatch permits a retry.
-        retry=req.get('not_started') is True and r['status']=='claimed' and r['attempts']<2
+        retry=req.get('not_started') is True and r['status']=='claimed' and r['attempts']<2 and not r.get('resource')
         r.update(status='pending' if retry else 'failed',result=str(req.get('reason','recovery failed'))[:4000],finished_at=now)
     else:raise ValueError('Unsupported recovery operation')
     store.save(db,req['session_id'],mgr.state,meta)

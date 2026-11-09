@@ -1,3 +1,4 @@
+import { compatibilityRollbackProtected } from '../compatibility-rollback'
 import { randomUUID } from 'node:crypto'
 import { logger } from '../../public/logging'
 import type { Socket } from 'socket.io'
@@ -15,12 +16,27 @@ export interface LoopRunHooks {
   loopBeforeDispatch?: () => Promise<void>
   loopDispatchConfirmed?: () => void
   loopProof?: (output: PrimaryAgentBridgeOutput) => void
-  recoveryRegister?: (binding: ModelRunAuth) => void
+  recoveryRegister?: (binding: ModelRunAuth) => void | Promise<void>
   background_notification_kind?: 'kanban'
 }
 
 type Result = Record<string, any>
+export interface RecoveryBinding {
+  session_id: string
+  profile: string
+  recovery_id: string
+  expected_generation: number
+  reservation_id: string
+  run_marker?: string
+  run_id?: string
+  model_run_auth?: ModelRunAuth
+  deadline_at?: number
+  cancel_requested?: boolean
+}
+
 interface LoopHost {
+  abortRecovery: (binding: RecoveryBinding, reason: string) => Promise<Result>
+  observeRecoveryExit: (binding: RecoveryBinding) => Promise<Result>
   sessionMap: Map<string, SessionState>
   request: (payload: Result) => Promise<Result>
   profiles: () => string[]
@@ -42,6 +58,9 @@ export class LoopRuntime {
   private uncertain = new Map<string, { row: HermesSessionRow; binding: Result; retryAt: number; attempts?: number }>()
   private runs = new Map<string, Promise<void>>()
   private capabilities = new Map<string, { row: HermesSessionRow; binding: Result; owner: AuthenticatedUser }>()
+  private recoveryReady = false
+  private resources = new Map<string, RecoveryBinding>()
+  private resourceRetryAt = new Map<string, number>()
   private timer?: ReturnType<typeof setInterval>
   constructor(private readonly host: LoopHost) {}
 
@@ -61,7 +80,7 @@ export class LoopRuntime {
   }
 
   async poll(): Promise<void> {
-    if (this.polling || this.stopped || Date.now() < this.retryAt || this.host.closing()) return
+    if (this.polling || this.stopped || compatibilityRollbackProtected() || Date.now() < this.retryAt || this.host.closing()) return
     this.polling = true
     try {
       const profiles = this.host.profiles()
@@ -71,6 +90,11 @@ export class LoopRuntime {
           this.startupRecovered = true
         } catch { this.recoveryRetryAt = Date.now() + 2000 }
       }
+      try {
+        await this.refreshResources()
+        await this.observeResources()
+        this.recoveryReady = true
+      } catch { this.recoveryReady = false }
       const listed = await this.host.request({ action: 'loop_list', profiles, include_inflight: true })
       const blocked = new Set(this.uncertain.keys())
       for (const [sessionId, pending] of this.uncertain) {
@@ -80,7 +104,7 @@ export class LoopRuntime {
       for (const item of listed.loops || []) {
         if (this.stopped || this.host.closing() || blocked.has(item.session_id) || this.runs.has(item.session_id)) continue
         const recovery = item.recovery?.status === 'pending'
-        if (recovery && !this.startupRecovered) continue
+        if (recovery && (!this.startupRecovered || !this.recoveryReady)) continue
         const row = getSession(item.session_id)
         if (!isHermesLoopSession(row) || !row?.user_id || (row.profile || 'default') !== item.route?.profile) continue
         try { this.authorize(row) } catch { continue }
@@ -104,6 +128,55 @@ export class LoopRuntime {
     } catch {
       this.retryAt = Date.now() + 2000
     } finally { this.polling = false }
+  }
+
+  private async refreshResources(): Promise<void> {
+    const result = await this.host.request({ action: 'recovery_resources' })
+    if (!Array.isArray(result.resources)) throw new Error('Recovery enumeration incomplete')
+    this.resources = new Map(result.resources.map((binding: RecoveryBinding) => [binding.reservation_id || `${binding.profile}:${binding.recovery_id}`, binding]))
+  }
+
+  async recoveryIssues(sessionId: string, profile: string): Promise<Result[]> {
+    const result = await this.host.request({ action: 'recovery_resources' })
+    if (!Array.isArray(result.resources)) throw new Error('Recovery enumeration incomplete')
+    return result.resources.filter((binding: Result) => binding.session_id === sessionId && binding.profile === profile
+      && (binding.cancel_requested || binding.outcome === 'unknown'))
+      .map((binding: Result) => this.recoveryIssue(binding, binding.evidence?.reason || binding.reason || 'original_exit_unproven',
+        binding.last_observed_at ? binding.last_observed_at * 1000 : undefined))
+  }
+
+  private recoveryIssue(binding: Result, reason: string, observedAt?: number): Result {
+    return { event: 'agent.event', session_id: binding.session_id, kind: 'recovery.resource',
+      recovery_id: binding.recovery_id, generation: binding.expected_generation,
+      text: `Recovery stop result pending verification: ${reason}. ${observedAt ? `Last checked ${new Date(observedAt).toISOString()}. ` : ''}Capacity remains reserved; no automatic replay.`,
+      last_observed_at: observedAt }
+  }
+
+  private async observeResources(cancelReason?: string): Promise<void> {
+    for (const [id, binding] of this.resources) {
+      const expired = binding.deadline_at !== undefined && binding.deadline_at * 1000 <= Date.now()
+      if (!cancelReason && (this.resourceRetryAt.get(id) || 0) > Date.now()
+        && (!expired || binding.cancel_requested)) continue
+      const cancel = cancelReason || expired || binding.cancel_requested
+      if (cancel && binding.run_marker) this.capabilities.delete(binding.run_marker)
+      try {
+        const result = cancel
+          ? await this.host.abortRecovery(binding, cancelReason || 'Recovery decision deadline expired')
+          : await this.host.observeRecoveryExit(binding)
+        if (['exited_proven', 'not_dispatched_proven'].includes(result.outcome)) {
+          this.resources.delete(id)
+          this.resourceRetryAt.delete(id)
+        } else {
+          this.resourceRetryAt.set(id, Date.now() + 2000)
+          this.host.emit(binding.session_id, 'loop.updated', { session_id: binding.session_id,
+            recovery_id: binding.recovery_id, generation: binding.expected_generation,
+            recovery_exit: result.outcome, reason: result.reason, last_observed_at: Date.now() })
+          if (cancel || result.outcome === 'unknown') {
+            this.host.emit(binding.session_id, 'agent.event', this.recoveryIssue(binding, result.reason || 'original_exit_unproven', Date.now()))
+          }
+        }
+      } catch { this.resourceRetryAt.set(id, Date.now() + 2000) }
+    }
   }
 
   private async reconcile(pending: { row: HermesSessionRow; binding: Result; retryAt: number; attempts?: number }): Promise<void> {
@@ -156,20 +229,31 @@ export class LoopRuntime {
       if (!(recovery ? claim.authorized : claim.claimed)) return
       claimed = true
       if (!recovery && claim.generation !== base.generation) throw new Error('Loop claim generation mismatch')
-      if (recovery) base.generation = claim.generation
+      if (recovery) {
+        base.generation = claim.generation
+        base.reservation_id = claim.reservation_id
+        if (!base.reservation_id) throw new Error('Durable recovery reservation missing')
+      }
       const input = recovery
         ? `Recovery verification only. Never replay the interrupted business task or perform external writes or dispatch. Inspect saved conversation and existing evidence. Missing evidence requires hold. Submit one bound resume/finish/hold proposal with evidence using POST /api/studio/chat-run/loop-recovery and header x-webui-recovery-run equal to the current run marker, with session_id, profile and recovery=${JSON.stringify({ recovery_id: item.recovery.id, expected_generation: item.generation })}. Resume only schedules future supervision. Interrupted record: ${JSON.stringify(item.recovery)}`
         : String(claim.prompt || '')
       const hooks = {
         loopAuthorize: () => { this.authorize(row) },
-        recoveryRegister: recovery ? (auth: ModelRunAuth) => {
+        recoveryRegister: recovery ? async (auth: ModelRunAuth) => {
           marker = auth.run_marker
+          const registered = await request('recovery_bind', { recovery_auth: auth })
+          if (!registered.authorized) throw new Error('Recovery resource binding rejected')
+          this.resources.set(base.reservation_id, { ...base, model_run_auth: auth, run_marker: marker } as RecoveryBinding)
           this.capabilities.set(marker, { row, binding: { recovery_id: item.recovery.id, expected_generation: item.generation }, owner })
         } : undefined,
         loopBeforeDispatch: async () => {
           this.authorize(row)
           const gate = await request(recovery ? 'recovery_inject' : 'inject')
           if (!gate.authorized) throw new Error('Loop generation invalidated')
+          if (recovery) {
+            const resource = this.resources.get(base.reservation_id)
+            if (resource) resource.deadline_at = gate.recovery?.deadline_at
+          }
           this.authorize(row)
         },
         loopDispatchConfirmed: () => { dispatched = true },
@@ -178,7 +262,10 @@ export class LoopRuntime {
           if (name === 'run.started') {
             runId = event.run_id
             base.run_id = runId
-            updates = updates.then(() => request(recovery ? 'recovery_started' : 'started', { run_id: runId }))
+            updates = updates.then(async () => {
+              if (recovery) await request('recovery_resource_started', { run_id: runId })
+              return request(recovery ? 'recovery_started' : 'started', { run_id: runId })
+            })
             void updates.catch(() => {})
           }
           if (['run.completed', 'run.failed', 'abort.completed'].includes(name)) terminal = { ...event, name }
@@ -224,10 +311,35 @@ export class LoopRuntime {
     }
   }
 
-  close(): void {
+  async close(deadline = Date.now() + 5000): Promise<{ status: 'drained' | 'unresolved'; unresolved: number }> {
     this.stopped = true
     if (this.timer) clearInterval(this.timer)
     this.timer = undefined
     this.capabilities.clear()
+    let enumerated = false
+    const remaining = async (work: Promise<void>) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([work, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Recovery drain deadline')), Math.max(0, deadline - Date.now() - 100))
+        })])
+      } finally { if (timer) clearTimeout(timer) }
+    }
+    try {
+      await remaining(this.host.request({ action: 'recovery_quiesce' }).then(() => undefined))
+      await remaining(this.refreshResources())
+      enumerated = true
+      await remaining(this.observeResources('Studio shutdown; recovery decisions revoked'))
+      while ((this.resources.size || this.polling || this.runs.size) && Date.now() + 150 < deadline) {
+        await remaining(this.refreshResources())
+        await remaining(this.observeResources('Studio shutdown; recovery decisions revoked'))
+        if (this.resources.size || this.polling || this.runs.size) {
+          await new Promise(resolve => setTimeout(resolve, Math.min(20, Math.max(0, deadline - Date.now() - 150))))
+        }
+      }
+    } catch { /* Unsettled responsibility remains in LoopStore for the next owner. */ }
+    const unresolved = (enumerated ? this.resources.size : Math.max(1, this.resources.size))
+      + this.runs.size + (this.polling ? 1 : 0)
+    return { status: unresolved ? 'unresolved' : 'drained', unresolved }
   }
 }
