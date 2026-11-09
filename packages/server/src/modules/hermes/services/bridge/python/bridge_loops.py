@@ -41,7 +41,14 @@ class LoopStore:
         raw=get('loop:'+sid);meta=get(META+sid)
         return LoopState.from_json(raw) if raw else None,json.loads(meta) if meta else {'generation':0,'tick':None}
 
-    def save(self,db,sid,state,meta):
+    def save(self,db,sid,state,meta,transition_reason=None):
+        previous,_=self.read(db,sid)
+        if state and (transition_reason or not previous or (previous.status,previous.paused_reason,previous.last_stop_reason)!=(state.status,state.paused_reason,state.last_stop_reason)):
+            reason=transition_reason or (state.paused_reason if state.status=='paused' else state.last_stop_reason)
+            if not reason:reason='manual-resume' if previous and previous.status=='paused' and state.status=='active' else 'loop-'+state.status
+            meta.setdefault('status_events',[]).append({'id':uuid.uuid4().hex,'timestamp':time.time(),
+                'status':state.status,'reason':reason,'ticks_fired':state.ticks_fired,
+                'total':state.times or state.max_ticks,'period':state.cadence_label(),'generation':meta['generation']})
         for key,value in [('loop:'+sid,state.to_json() if state else None),(META+sid,json.dumps(meta))]:
             if value is None:continue
             db.execute('INSERT INTO state_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,value))
@@ -56,6 +63,8 @@ class LoopStore:
         return StagedManager()
 
     def command(self,sid,arg,profile):
+        if arg.strip().split(None,1)[:1] and arg.strip().split(None,1)[0].lower()=='maintenance-drain':
+            return {'session_id':sid,'handled':True,'ok':False,'created':False,'command':'loop','action':'loop','message':'/loop maintenance-drain is obsolete and unsupported'}
         from hermes_cli.loops import dispatch_loop_command
         with self.transaction() as db:
             state,meta=self.read(db,sid);mgr=self.manager(sid,state)
@@ -75,7 +84,7 @@ class LoopStore:
                 meta.pop('startup_failure',None)
                 if meta.get('recovery') and recovery.unresolved(meta):
                     meta['recovery'].update(status='held' if action=='pause' else 'superseded',result='new user control invalidated recovery',finished_at=time.time())
-            self.save(db,sid,state,meta)
+            self.save(db,sid,state,meta,transition_reason='loop-created' if result['created'] else None)
             output=result['output']
             running=meta.get('tick')
             if running:output+='\nCurrent wakeup still running; pause/stop only prevent subsequent wakeups. Use the existing abort action to interrupt.'
@@ -92,7 +101,7 @@ class LoopStore:
                 out=[]
                 for key,_ in rows:
                     s,m=self.read(db,key[len(META):])
-                    if s and (s.status=='active' or recovery.unresolved(m) or req.get('include_inflight') and m.get('tick')):out.append({'session_id':key[len(META):],'route':s.route,'next_due_at':s.next_due_at,'awaiting_response':s.awaiting_response,'current_tick':m.get('tick'),'generation':m['generation'],'recovery':public_recovery(m.get('recovery'))})
+                    if s and (s.status=='active' or recovery.unresolved(m) or req.get('include_inflight') and m.get('tick') or req.get('include_events') and m.get('status_events')):out.append({'session_id':key[len(META):],'route':s.route,'next_due_at':s.next_due_at,'awaiting_response':s.awaiting_response,'current_tick':m.get('tick'),'generation':m['generation'],'recovery':public_recovery(m.get('recovery')),'status':s.status,'status_events':m.get('status_events',[]) if req.get('include_events') else []})
                 return {'loops':out}
         # Native --until may call a judge: evaluate outside the writer transaction,
         # then exact-snapshot CAS below. Controls never wait for the model/judge.
@@ -100,12 +109,26 @@ class LoopStore:
         if op=='complete':
             with self.transaction() as db:
                 state,meta=self.read(db,sid)
-                snapshot=(state.to_json() if state else None,json.dumps(meta,sort_keys=True))
+                snapshot=(state.to_json() if state else None,json.dumps({k:v for k,v in meta.items() if k!='status_events'},sort_keys=True))
                 if not state or (state.route or {}).get('profile')!=req.get('profile') or not self.matches(meta,req):return self.result(state,meta,stale=True)
             if meta['generation']==req['generation']:
                 mgr=self.manager(sid,state);decision=mgr.complete_tick(req.get('response',''));candidate=mgr.state
         with self.transaction() as db:
             state,meta=self.read(db,sid);mgr=self.manager(sid,state)
+            if op=='event_ack':
+                authorized=bool(state and (state.route or {}).get('profile')==req.get('profile'))
+                if authorized:
+                    meta['status_events']=[e for e in meta.get('status_events',[]) if e['id']!=req.get('event_id')]
+                    self.save(db,sid,state,meta)
+                return {'acknowledged':authorized}
+            if op=='receipt':
+                tick=meta.get('tick') if req.get('receipt_op')=='started' else meta.get('claim_fences',{}).get(req.get('tick_id'))
+                matched=bool(state and (state.route or {}).get('profile')==req.get('profile')
+                    and tick and tick.get('id')==req.get('tick_id') and tick.get('generation')==req.get('generation')
+                    and tick.get('profile')==req.get('profile') and tick.get('run_id')==req.get('run_id')
+                    and req.get('run_id') and (tick.get('phase')=='started' if req.get('receipt_op')=='started'
+                        else req.get('receipt_op')=='complete' and tick.get('outcome')=='complete'))
+                return self.result(state,meta,receipt_confirmed=matched)
             if op in {'claim','reconcile_claim','inject','started','complete','unknown','abandon','interrupted','failed'}:
                 if not state or (state.route or {}).get('profile')!=req.get('profile'):
                     return self.result(state,meta,stale=True,claimed=False,authorized=False)
@@ -142,7 +165,7 @@ class LoopStore:
                     if meta['tick']['phase']!='injecting':return self.result(state,meta,stale=True)
                     meta['tick']['phase']='started';meta['tick']['run_id']=req['run_id']
                 else:
-                    if op=='complete' and meta['generation']==req['generation'] and snapshot!=(state.to_json() if state else None,json.dumps(meta,sort_keys=True)):
+                    if op=='complete' and meta['generation']==req['generation'] and snapshot!=(state.to_json() if state else None,json.dumps({k:v for k,v in meta.items() if k!='status_events'},sort_keys=True)):
                         return self.result(state,meta,stale=True)
                     if meta['generation']==req['generation']:
                         if op=='complete':mgr=self.manager(sid,candidate)
@@ -236,4 +259,4 @@ class LoopStore:
 
     @staticmethod
     def result(state,meta,**extra):
-        return {'loop_state':json.loads(state.to_json()) if state else None,'generation':meta['generation'],'current_tick':meta.get('tick'),'recovery':public_recovery(meta.get('recovery')),'startup_failure':meta.get('startup_failure'),**extra}
+        return {'loop_state':json.loads(state.to_json()) if state else None,'generation':meta['generation'],'current_tick':meta.get('tick'),'recovery':public_recovery(meta.get('recovery')),'startup_failure':meta.get('startup_failure'),'status_events':meta.get('status_events',[]),**extra}

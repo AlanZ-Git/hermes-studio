@@ -4,7 +4,7 @@ import { logger } from '../../public/logging'
 import type { Socket } from 'socket.io'
 import type { AuthenticatedUser } from '../../public/auth'
 import type { PrimaryAgentBridgeOutput } from '../../public/chat-agent-runtime'
-import { getSession, getSessionDetail, type HermesSessionRow } from '../../repositories/session-store'
+import { addLoopStatusMessage, getSession, getSessionDetail, type HermesSessionRow } from '../../repositories/session-store'
 import { getOrCreateSession } from './compression'
 import { isHermesLoopSession } from './loop-driver'
 import type { ModelRunAuth } from './model-run-source'
@@ -21,6 +21,40 @@ export interface LoopRunHooks {
 }
 
 type Result = Record<string, any>
+function formatLoopStatus(event: Result): string {
+  const reason = String(event.reason)
+  const exhausted = /exhausted|completed the requested/i.test(reason)
+    || event.status === 'paused' && event.total > 0 && event.ticks_fired >= event.total
+  let explanation: string
+  if (reason === 'loop-created' || reason === 'loop-active') explanation = '新建监督组：按本组明确设置的周期与预算安排后续唤醒。New loop configured; no previous work is replayed.'
+  else if (reason === 'manual-resume') explanation = '已手动恢复后续监督，不重放旧任务、不重置已用次数。Resume schedules future wakeups only; it does not replay work or reset the count.'
+  else if (reason.startsWith('user-paused')) explanation = '用户主动暂停了后续监督；正在进行的业务任务不因此中止。User paused future supervision.'
+  else if (reason.startsWith('startup-failed')) explanation = '启动确认多次失败，后续监督已暂停；这不能证明业务执行失败。请检查桥接连接和已有运行记录，确认安全后再恢复。Repeated startup confirmation failures; inspect transport and saved runs.'
+  else if (reason.startsWith('execution-unknown')) explanation = '执行结果尚未确认：缺少可核对的完整完成凭据，不能认定失败或完成。请核对已保存回复与运行记录，不要重放本轮业务。An unknown result is neither a proven failure nor a proven completion.'
+  else if (reason.startsWith('dispatch-unknown')) explanation = '无法确认是否已派发本轮业务；保留次数并暂停后续监督。须通过绑定恢复核验已有运行证据，不能直接恢复或重放。Dispatch is uncertain; bound recovery is required before resuming.'
+  else if (reason.startsWith('user-interrupted')) explanation = '本轮运行被中断；已用次数保留。请核对部分结果及仍在进行的业务，准备好后再恢复后续监督。The run was interrupted; inspect partial results.'
+  else if (reason.startsWith('execution-failed')) explanation = '本轮运行报告失败，后续监督已暂停；请检查完整错误和已保存结果，解决问题后再恢复。The run reported failure; inspect the full error and saved result.'
+  else if (/recovery/i.test(reason)) explanation = '恢复核验暂缓或尚未解决，证据不足时不继续监督、不重放业务。请查看恢复记录并完成所需人工核验。Recovery is held or unresolved; resolve the recorded requirement first.'
+  else if (/human|waiting|approval|unachievable/i.test(reason)) explanation = '等待人工处理：请处理所列审批、阻塞条件或调整目标，再决定是否恢复后续监督。Human action is required before future supervision continues.'
+  else if (/agent signaled|stop condition met/i.test(reason)) explanation = '监督正常完成：收到 LOOP_COMPLETE 或已满足停止条件，不再安排后续唤醒；这不代替业务成果核验。Normal completion stopped future wakeups.'
+  else if (/cleared|stopped|cancel/i.test(reason) || event.status === 'cleared') explanation = '用户明确停止了后续监督，不会再唤醒；已进行的业务不因此中止。User explicitly stopped future supervision.'
+  else if (exhausted) explanation = '监督次数已耗尽，不再安排后续唤醒；这不表示业务任务已完成。The supervision budget is exhausted, not proof of business completion.'
+  else explanation = '监督状态已改变；请按下列原始原因核对运行记录和所需操作，不要据此重放业务。Inspect the raw reason and saved evidence before taking action.'
+  if (exhausted && !explanation.includes('监督次数已耗尽')) explanation += '\n监督次数已耗尽，不能恢复旧组。'
+  const action = exhausted || ['done', 'cleared'].includes(event.status)
+    ? '如仍需监督，请明确新建 /loop 并设置新预算；旧组不会恢复。Explicitly set a new /loop with a new budget if needed.'
+    : event.status === 'active'
+      ? '后续监督已启用；如需暂停使用 /loop pause，停止使用 /loop stop。Future supervision is active.'
+      : /dispatch-unknown|recovery/i.test(reason)
+        ? '先解决绑定恢复/人工核验要求；未解决前保持暂停，不自动恢复。Resolve bound recovery/human requirements; no automatic resume.'
+        : '核对结果并解决人工/恢复要求后，可用 /loop resume 仅恢复未来唤醒；不重置次数、不重放业务。Use /loop resume only when ready; future wakeups only.'
+  const scope = event.status === 'paused'
+    ? 'Only future supervision is paused; this does not halt the business task. 仅暂停后续监督，不表示业务任务已停止。'
+    : event.status === 'active' ? '后续监督生效，不重放历史业务。'
+      : 'Future supervision has stopped; this does not halt the business task. 仅停止后续监督，不表示业务任务已停止。'
+  return `[loop status event]\nState at ${new Date(event.timestamp * 1000).toISOString()}: ${event.status}\nTicks: ${event.ticks_fired}/${event.total}\nPeriod: ${event.period ?? 'unavailable (legacy event; not reconstructed)'}\nReason: ${reason}\n${explanation}\n${scope}\n${action}\n此为历史状态变化；按时间排序，最新一条状态事件为当前已知状态。This is a retained state change; a later loop status event supersedes it.`
+}
+
 export interface RecoveryBinding {
   session_id: string
   profile: string
@@ -95,21 +129,24 @@ export class LoopRuntime {
         await this.observeResources()
         this.recoveryReady = true
       } catch { this.recoveryReady = false }
-      const listed = await this.host.request({ action: 'loop_list', profiles, include_inflight: true })
+      const listed = await this.host.request({ action: 'loop_list', profiles, include_inflight: true, include_events: true })
       const blocked = new Set(this.uncertain.keys())
       for (const [sessionId, pending] of this.uncertain) {
         if (this.runs.has(sessionId) || pending.retryAt > Date.now()) continue
         await this.reconcile(pending)
       }
       for (const item of listed.loops || []) {
-        if (this.stopped || this.host.closing() || blocked.has(item.session_id) || this.runs.has(item.session_id)) continue
-        const recovery = item.recovery?.status === 'pending'
-        if (recovery && (!this.startupRecovered || !this.recoveryReady)) continue
+        if (this.stopped || this.host.closing()) continue
         const row = getSession(item.session_id)
         if (!isHermesLoopSession(row) || !row?.user_id || (row.profile || 'default') !== item.route?.profile) continue
         try { this.authorize(row) } catch { continue }
+        await this.publishStatus(row, item)
+        if (blocked.has(item.session_id) || this.runs.has(item.session_id)) continue
+        const recovery = item.recovery?.status === 'pending'
+        if (recovery && (!this.startupRecovered || !this.recoveryReady)) continue
         const state = getOrCreateSession(this.host.sessionMap, row.id)
         if (state.isWorking || state.queue.length) continue
+        if (item.status && item.status !== 'active' && !item.current_tick && !recovery) continue
         if (item.current_tick) {
           if (item.current_tick.phase !== 'unknown') {
             const pending = { row: { ...row }, binding: { action: 'loop_operation', session_id: row.id,
@@ -179,6 +216,39 @@ export class LoopRuntime {
     }
   }
 
+  private async publishStatus(row: HermesSessionRow, result: Result): Promise<void> {
+    try { await this.deliverStatus(row, result) }
+    catch (error) {
+      // The native outbox retains unacknowledged events; delivery cannot revoke execution proof.
+      this.log({ session_id: row.id, profile: row.profile }, 'status-delivery-pending', error)
+    }
+  }
+
+  private emitUpdate(sessionId: string, payload: Result): void {
+    try { this.host.emit(sessionId, 'loop.updated', payload) }
+    catch (error) { this.log({ session_id: sessionId }, 'status-emit-pending', error) }
+  }
+
+  private async deliverStatus(row: HermesSessionRow, result: Result): Promise<void> {
+    for (const event of result.status_events || []) {
+      try {
+      this.authorize(row)
+      const content = formatLoopStatus(event)
+      const saved = addLoopStatusMessage(row.id, event.id, content, event.timestamp)
+      const state = this.host.sessionMap.get(row.id)
+      if (state && !state.messages.some(message => String(message.id) === String(saved.id))) state.messages.push(saved)
+      this.host.emit(row.id, 'session.command', { event: 'session.command', session_id: row.id,
+        action: 'loop_event', command: 'loop', type: 'loop', message_id: saved.id,
+        message: saved.content, timestamp: saved.timestamp, loop_event_id: event.id })
+      await this.host.request({ action: 'loop_operation', op: 'event_ack', session_id: row.id,
+        profile: row.profile || 'default', event_id: event.id })
+      } catch (error) {
+        // Keep each failed delivery in the native outbox without blocking later transitions.
+        this.log({ session_id: row.id, profile: row.profile }, 'status-delivery-pending', error)
+      }
+    }
+  }
+
   private async reconcile(pending: { row: HermesSessionRow; binding: Result; retryAt: number; attempts?: number }): Promise<void> {
     try {
       this.authorize(pending.row)
@@ -187,13 +257,14 @@ export class LoopRuntime {
       if (!result.claim_resolution && !pending.binding.recovery_id) throw new Error('Claim reconciliation binding unresolved')
       this.uncertain.delete(pending.row.id)
       this.log(pending.binding, result.claim_resolution || 'recovery-failed', undefined, result)
-      this.host.emit(pending.row.id, 'loop.updated', { session_id: pending.row.id, ...result })
+      await this.publishStatus(pending.row, result)
+      this.emitUpdate(pending.row.id, { session_id: pending.row.id, ...result })
     } catch (error) {
       pending.attempts = (pending.attempts || 0) + 1
       const delay = Math.min(30_000, 1000 * 2 ** Math.min(pending.attempts, 5))
       pending.retryAt = Date.now() + delay
       this.log(pending.binding, 'receipt-uncertain', error)
-      this.host.emit(pending.row.id, 'loop.updated', { session_id: pending.row.id,
+      this.emitUpdate(pending.row.id, { session_id: pending.row.id,
         claim_resolution: 'receipt-uncertain', tick_id: pending.binding.tick_id, generation: pending.binding.generation,
         reason: `Bound reconciliation pending; no business replay; retry in ${delay / 1000}s` })
     }
@@ -222,7 +293,18 @@ export class LoopRuntime {
     let claimed = false, dispatched = false, runId: string | undefined, marker: string | undefined
     let proof: PrimaryAgentBridgeOutput | undefined, terminal: Result | undefined
     let updates: Promise<unknown> = Promise.resolve()
-    const request = (op: string, extra: Result = {}) => this.host.request({ ...base, op, ...extra })
+    const request = async (op: string, extra: Result = {}): Promise<Result> => {
+      try { return await this.host.request({ ...base, op, ...extra }) }
+      catch (error) {
+        if (recovery || !['started', 'complete'].includes(op)) throw error
+        this.authorize(row)
+        // A lost acknowledgement is not a failed write; read only this tick/run.
+        const receipt = await this.host.request({ ...base, ...extra, op: 'receipt', receipt_op: op })
+        if (receipt.receipt_confirmed !== true) throw error
+        this.log(base, `${op}-receipt-confirmed`, error, receipt)
+        return receipt
+      }
+    }
     try {
       const owner = this.authorize(row)
       const claim = await request(recovery ? 'recovery_claim' : 'claim')
@@ -277,7 +359,7 @@ export class LoopRuntime {
       } else {
         await this.host.run(this.host.socket(row.id), {
           ...hooks, session_id: row.id, source: 'cli', input,
-          display_input: recovery ? 'Recovery verification — no replay' : '[loop]', display_role: 'command', storage_message: input,
+          display_input: recovery ? 'Recovery verification — no replay' : input, display_role: 'command', storage_message: input,
           model: row.model || undefined, provider: row.provider || undefined, autonomous: true, background_delegation_enabled: false,
         }, row.profile || 'default')
       }
@@ -296,14 +378,20 @@ export class LoopRuntime {
       const outcome = recovery ? normal ? 'recovery_commit' : 'recovery_failed'
         : normal ? 'complete' : !dispatched ? 'abandon' : proof?.result?.interrupted || terminal?.name === 'abort.completed' ? 'interrupted' : proof?.error || terminal?.name === 'run.failed' ? 'failed' : 'unknown'
       const result = await request(outcome, { response: commandResult?.response ?? terminal?.output ?? '', not_started: !dispatched, reason: 'No proven normal completion' })
-      this.host.emit(row.id, 'loop.updated', { session_id: row.id, ...result })
+      await this.publishStatus(row, result)
+      this.emitUpdate(row.id, { session_id: row.id, ...result })
     } catch (error) {
       this.log(base, claimed ? 'execution-receipt-error' : 'claim-error', error)
       if (claimed) {
-        try { await updates.catch(() => {}); await request(recovery ? 'recovery_failed' : dispatched ? 'unknown' : 'abandon', { not_started: !dispatched, reason: 'Loop execution receipt or proof unavailable' }) }
+        try {
+          await updates.catch(() => {})
+          const result = await request(recovery ? 'recovery_failed' : dispatched ? 'unknown' : 'abandon', { not_started: !dispatched, reason: 'Loop execution receipt or proof unavailable' })
+          await this.publishStatus(row, result)
+          this.emitUpdate(row.id, { session_id: row.id, ...result })
+        }
         catch { this.uncertain.set(row.id, { row, binding: { ...base }, retryAt: 0 }) }
       } else this.uncertain.set(row.id, { row, binding: { ...base }, retryAt: 0 })
-      this.host.emit(row.id, 'loop.updated', { session_id: row.id, tick_id: base.tick_id, generation: base.generation,
+      this.emitUpdate(row.id, { session_id: row.id, tick_id: base.tick_id, generation: base.generation,
         claim_resolution: this.uncertain.has(row.id) ? 'receipt-uncertain' : 'settled-without-replay' })
     } finally {
       if (marker) this.capabilities.delete(marker)

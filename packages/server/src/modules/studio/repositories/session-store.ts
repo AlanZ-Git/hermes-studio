@@ -930,6 +930,24 @@ export function getSessionDetail(id: string): HermesSessionDetailRow | null {
 
 // --- Message CRUD ---
 
+export function addLoopStatusMessage(sessionId: string, eventId: string, content: string, timestamp: number): HermesMessageRow {
+  const db = getDb()!
+  const marker = `loop_event_${eventId}`
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    let row = db.prepare(`SELECT * FROM ${MESSAGES_TABLE} WHERE session_id = ? AND run_marker = ?`).get(sessionId, marker) as Record<string, unknown> | undefined
+    if (!row) {
+      const inserted = db.prepare(`INSERT INTO ${MESSAGES_TABLE} (session_id, role, content, run_marker, timestamp) VALUES (?, 'command', ?, ?, ?)`).run(sessionId, content, marker, timestamp)
+      row = db.prepare(`SELECT * FROM ${MESSAGES_TABLE} WHERE id = ?`).get(inserted.lastInsertRowid) as Record<string, unknown>
+    }
+    db.exec('COMMIT')
+    return mapMessageRow(row)
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}
+
 export function addMessage(msg: {
   session_id: string
   role: string
