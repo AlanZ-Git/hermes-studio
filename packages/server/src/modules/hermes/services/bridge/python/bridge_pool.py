@@ -1142,21 +1142,33 @@ class AgentPool:
         background_delegation_enabled: bool | None = None,
         model_run_auth: Any = None,
     ) -> dict[str, Any]:
-        session = self.get_or_create(
-            session_id,
-            profile=profile,
-            model=model,
-            provider=provider,
-            background_delegation_enabled=background_delegation_enabled,
-            model_run_auth=model_run_auth,
-        )
-        session_cwd_bound = _bind_session_workspace_cwd(session.session_id, workspace)
-        # Never construct or borrow a token for an independent estimate.
-        try:
-            context_info = self._estimate_context_info(session.agent, messages or [], instructions)
-        finally:
-            if session_cwd_bound:
-                _clear_session_workspace_cwd()
+        # Estimation prepares context, not a future chat reservation. In particular,
+        # Kanban revalidation runs on a separate maintenance worker before chat.
+        # Serialize acquisition/cleanup with start_chat, retaining any pre-existing
+        # admission or chat-start reservation; chat must acquire its own lease.
+        with self._lock:
+            temporary = (session_id not in self._session_admissions
+                         and not self._model_run_chat_started)
+            session_cwd_bound = False
+            try:
+                session = self.get_or_create(
+                    session_id,
+                    profile=profile,
+                    model=model,
+                    provider=provider,
+                    background_delegation_enabled=background_delegation_enabled,
+                    model_run_auth=model_run_auth,
+                )
+                session_cwd_bound = _bind_session_workspace_cwd(session.session_id, workspace)
+                # Never construct or borrow a token for an independent estimate.
+                context_info = self._estimate_context_info(session.agent, messages or [], instructions)
+            finally:
+                try:
+                    if session_cwd_bound:
+                        _clear_session_workspace_cwd()
+                finally:
+                    if temporary:
+                        self._release_idle_admission(session_id)
         print(
             "[hermes_bridge] context estimate "
             f"session={session_id} profile={profile or 'default'} "
