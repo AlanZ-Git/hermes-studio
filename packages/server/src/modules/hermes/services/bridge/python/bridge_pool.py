@@ -1406,18 +1406,18 @@ class AgentPool:
                 return []
             results = []
             for session_id in sorted(loaded_session_ids):
-                temporary = session_id not in self._sessions
                 try:
                     with self._lock:
-                        admission = self._admit_session(session_id, os.environ.get('HERMES_AGENT_BRIDGE_WORKER_PROFILE', 'default'))
-                        with self._notification_fence(session_id, admission) as fence:
-                            results.extend(self._claim_kanban_notifications_locked({session_id}, fence))
+                        temporary = session_id not in self._session_admissions
+                        try:
+                            admission = self._admit_session(session_id, os.environ.get('HERMES_AGENT_BRIDGE_WORKER_PROFILE', 'default'))
+                            with self._notification_fence(session_id, admission) as fence:
+                                results.extend(self._claim_kanban_notifications_locked({session_id}, fence))
+                        finally:
+                            if temporary or self._model_run_auth_closed:
+                                self._release_idle_admission(session_id)
                 except Exception as exc:
                     print(f'[hermes_bridge] fenced notification refused: {exc}', file=sys.stderr, flush=True)
-                finally:
-                    if temporary:
-                        with self._lock:
-                            self._release_session_admission(session_id)
             return results
 
     def _claim_kanban_notifications_locked(self, loaded_session_ids: set[str], fence) -> list[dict[str, Any]]:
@@ -1649,7 +1649,7 @@ class AgentPool:
         if identity is None:
             return {'current': False}
         with self._notification_lock, self._lock:
-            temporary = session_id not in self._sessions
+            temporary = session_id not in self._session_admissions
             try:
                 admission = self._admit_session(session_id, os.environ.get('HERMES_AGENT_BRIDGE_WORKER_PROFILE', 'default'))
                 with self._notification_fence(session_id, admission) as fence:
@@ -1657,8 +1657,8 @@ class AgentPool:
                     return self._background_notification_status(delegation_id, claim_id, identity=identity,
                         db_identity=db_identity, session_id=session_id, receipt=receipt)
             finally:
-                if temporary:
-                    self._release_session_admission(session_id)
+                if temporary or self._model_run_auth_closed:
+                    self._release_idle_admission(session_id)
 
     def _background_notification_status(self, delegation_id: str, claim_id: str, *,
                                        identity=None, db_identity=None, session_id=None, receipt=None) -> dict[str, Any]:
